@@ -1,6 +1,6 @@
 [package]
 name = "triskelion"
-version = "0.9.2"
+version = "0.9.3"
 edition = "2024"
 license = "GPL-2.0-only"
 description = "Lock-free wineserver replacement for amphetamine"

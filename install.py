@@ -272,8 +272,76 @@ def configure_verbose():
         log("INFO", "Verbose diagnostics: on (use --no-verbose to disable)")
 
 
+def check_dependencies():
+    """Verify all required dependencies before building."""
+    ok = True
+
+    # Rust 1.85+ (edition 2024)
+    try:
+        out = subprocess.run(["rustc", "--version"], capture_output=True, text=True)
+        if out.returncode == 0:
+            # "rustc 1.93.1 (01f6ddf75 ...)" -> "1.93.1"
+            ver = out.stdout.split()[1]
+            parts = ver.split(".")
+            major, minor = int(parts[0]), int(parts[1])
+            if major < 1 or (major == 1 and minor < 85):
+                log("ERROR", f"Rust {ver} is too old. Need 1.85+ (edition 2024).")
+                log("ERROR", "Update with: rustup update stable")
+                ok = False
+            else:
+                log("INFO", f"Rust {ver}")
+        else:
+            log("ERROR", "rustc not found. Install Rust: https://rustup.rs")
+            ok = False
+    except FileNotFoundError:
+        log("ERROR", "rustc not found. Install Rust: https://rustup.rs")
+        ok = False
+
+    # Git
+    try:
+        out = subprocess.run(["git", "--version"], capture_output=True, text=True)
+        if out.returncode != 0:
+            log("ERROR", "git not found. Install git.")
+            ok = False
+    except FileNotFoundError:
+        log("ERROR", "git not found. Install git.")
+        ok = False
+
+    # Steam (native)
+    steam_root = Path.home() / ".steam" / "root"
+    if not steam_root.exists():
+        log("ERROR", "Steam not found at ~/.steam/root")
+        log("ERROR", "Install Steam natively (not Flatpak).")
+        ok = False
+
+    # Proton (Wine binaries)
+    steam_common = Path.home() / ".steam" / "root" / "steamapps" / "common"
+    proton_found = False
+
+    proton_exp = steam_common / "Proton - Experimental" / "files" / "bin" / "wine64"
+    if proton_exp.exists():
+        log("INFO", f"Found Proton Experimental")
+        proton_found = True
+    elif steam_common.exists():
+        for entry in steam_common.iterdir():
+            if entry.name.startswith("Proton") and (entry / "files" / "bin" / "wine64").exists():
+                log("INFO", f"Found {entry.name}")
+                proton_found = True
+                break
+
+    if not proton_found:
+        log("ERROR", "Proton not found. amphetamine requires Proton's Wine binaries.")
+        log("ERROR", "Install 'Proton Experimental' from your Steam Library.")
+        ok = False
+
+    return ok
+
+
 def main():
     configure_verbose()
+
+    if not check_dependencies():
+        return 1
 
     clone_wine()
 
