@@ -1,0 +1,12 @@
+# Build artifacts
+target/
+
+# Runtime
+*.pyc
+__pycache__/
+
+# Binary (built by cargo build --release)
+triskelion
+
+# Editor / tooling
+.claude/
