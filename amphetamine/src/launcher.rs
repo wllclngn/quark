@@ -148,29 +148,35 @@ pub fn run(verb: &str, args: &[String]) -> i32 {
     let trace = std::env::var("AMPHETAMINE_TRACE_OPCODES").is_ok()
         || Path::new("/tmp/amphetamine/TRACE_OPCODES").exists();
 
+    let shader_cache_enabled = self_exe.parent()
+        .map(|dir| dir.join("shader_cache_enabled").exists())
+        .unwrap_or(false);
+
     let env_vars = build_env_vars(
         &wine_dir, &steam_dir, &pfx, &self_exe,
-        &dxvk_deployed, &vkd3d_deployed, trace,
+        &dxvk_deployed, &vkd3d_deployed, trace, shader_cache_enabled,
     );
     let t_total_setup = t_start.elapsed();
 
-    // Write timing data (verbose only)
+    // Write timing + diagnostics (verbose only)
     if crate::log::is_verbose() {
-        if let Err(e) = std::fs::create_dir_all("/tmp/amphetamine") {
-            log_warn!("Cannot create /tmp/amphetamine: {e}");
-        }
-        let timing = format!(
-            "{{\"discover_ms\":{},\"prefix_ms\":{},\"dxvk_ms\":{},\"steam_ms\":{},\"total_setup_ms\":{},\"cache_hit\":{}}}",
-            t_discover.as_millis(), t_prefix.as_millis(),
-            t_dxvk.as_millis(), t_steam.as_millis(), t_total_setup.as_millis(),
-            all_valid,
-        );
-        if let Err(e) = std::fs::write("/tmp/amphetamine/launcher_timing.json", &timing) {
-            log_warn!("Cannot write timing data: {e}");
-        }
         log_verbose!("timing: discover={}ms prefix={}ms dxvk={}ms steam={}ms total={}ms",
             t_discover.as_millis(), t_prefix.as_millis(),
             t_dxvk.as_millis(), t_steam.as_millis(), t_total_setup.as_millis());
+
+        let game_exe = if verb == "waitforexitandrun" || verb == "run" {
+            args.first().map(|s| s.as_str())
+        } else {
+            None
+        };
+
+        write_launch_prom(
+            &compat_data, &wine_dir, &steam_dir, &pfx, &self_exe,
+            game_exe, &env_vars,
+            t_discover, t_prefix, t_dxvk, t_steam, t_total_setup,
+            wine_valid, dxvk_valid, vkd3d_valid, steam_valid,
+            shader_cache_enabled,
+        );
     }
 
     // Phase 6: Launch
@@ -678,7 +684,7 @@ fn deploy_steam_client(steam_dir: &Path, pfx: &Path) {
 
 fn build_env_vars(
     wine_dir: &Path, steam_dir: &Path, pfx: &Path, self_exe: &Path,
-    dxvk: &[&str], vkd3d: &[&str], trace: bool,
+    dxvk: &[&str], vkd3d: &[&str], trace: bool, shader_cache_enabled: bool,
 ) -> Vec<(&'static str, String)> {
     let cur_path = std::env::var("PATH").unwrap_or_default();
     let cur_ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
@@ -745,11 +751,6 @@ fn build_env_vars(
     ];
 
     // Shader cache optimization — opt-in via install.py prompt.
-    // Flag file is written by configure_shader_cache() in install.py.
-    let shader_cache_enabled = self_exe.parent()
-        .map(|dir| dir.join("shader_cache_enabled").exists())
-        .unwrap_or(false);
-
     if shader_cache_enabled {
         let shader_cache = pfx.join("shader_cache");
         let _ = std::fs::create_dir_all(&shader_cache);
@@ -787,6 +788,112 @@ fn build_env_vars(
     }
 
     vars
+}
+
+// ---------------------------------------------------------------------------
+// Prometheus launch diagnostics
+// ---------------------------------------------------------------------------
+
+fn write_launch_prom(
+    compat_data: &str, wine_dir: &Path, steam_dir: &Path, pfx: &Path,
+    self_exe: &Path, game_exe: Option<&str>, env_vars: &[(&str, String)],
+    t_discover: std::time::Duration, t_prefix: std::time::Duration,
+    t_dxvk: std::time::Duration, t_steam: std::time::Duration,
+    t_total: std::time::Duration,
+    wine_valid: bool, dxvk_valid: bool, vkd3d_valid: bool, steam_valid: bool,
+    shader_cache_enabled: bool,
+) {
+    use crate::log::{PromWriter, filename_timestamp, kernel_version,
+                     cpu_count, total_ram_bytes, gpu_vendor, distro_name};
+
+    let mut w = PromWriter::new();
+    w.timestamp_header();
+
+    // ---- System ----
+    w.separator();
+    w.header("amphetamine_system_info", "System identification", "gauge");
+    w.info("amphetamine_system_info", "kernel", &kernel_version());
+    w.info("amphetamine_system_info", "distro", &distro_name());
+    w.info("amphetamine_system_info", "gpu_vendor", gpu_vendor());
+
+    w.header("amphetamine_system_cpu_count", "Online CPU count", "gauge");
+    w.gauge("amphetamine_system_cpu_count", cpu_count());
+
+    w.header("amphetamine_system_ram_bytes", "Total system RAM", "gauge");
+    w.gauge("amphetamine_system_ram_bytes", total_ram_bytes());
+
+    // ---- Steam ----
+    w.separator();
+    w.header("amphetamine_steam_compat_data_path", "Steam compat data path", "gauge");
+    w.info("amphetamine_steam_compat_data_path", "path", compat_data);
+
+    let app_id = std::path::Path::new(compat_data)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
+    w.header("amphetamine_steam_app_id", "Steam application ID", "gauge");
+    w.info("amphetamine_steam_app_id", "app_id", app_id);
+
+    if let Some(exe) = game_exe {
+        w.header("amphetamine_game_executable", "Game executable path", "gauge");
+        w.info("amphetamine_game_executable", "path", exe);
+    }
+
+    // ---- Paths ----
+    w.separator();
+    w.header("amphetamine_wine_dir", "Wine installation directory", "gauge");
+    w.info("amphetamine_wine_dir", "path", &wine_dir.display().to_string());
+
+    w.header("amphetamine_steam_dir", "Steam installation directory", "gauge");
+    w.info("amphetamine_steam_dir", "path", &steam_dir.display().to_string());
+
+    w.header("amphetamine_wineserver", "Wineserver binary path", "gauge");
+    w.info("amphetamine_wineserver", "path", &self_exe.display().to_string());
+
+    w.header("amphetamine_wineprefix", "Wine prefix path", "gauge");
+    w.info("amphetamine_wineprefix", "path", &pfx.display().to_string());
+
+    // ---- Cache ----
+    w.separator();
+    w.header("amphetamine_cache_hit", "Component cache hit (1=hit, 0=miss)", "gauge");
+    w.gauge_labeled("amphetamine_cache_hit", "component", "wine", wine_valid as u64);
+    w.gauge_labeled("amphetamine_cache_hit", "component", "dxvk", dxvk_valid as u64);
+    w.gauge_labeled("amphetamine_cache_hit", "component", "vkd3d", vkd3d_valid as u64);
+    w.gauge_labeled("amphetamine_cache_hit", "component", "steam", steam_valid as u64);
+
+    // ---- Timing ----
+    w.separator();
+    w.header("amphetamine_setup_duration_ms", "Setup phase duration in milliseconds", "gauge");
+    w.gauge_labeled("amphetamine_setup_duration_ms", "phase", "discover", t_discover.as_millis() as u64);
+    w.gauge_labeled("amphetamine_setup_duration_ms", "phase", "prefix", t_prefix.as_millis() as u64);
+    w.gauge_labeled("amphetamine_setup_duration_ms", "phase", "dxvk_vkd3d", t_dxvk.as_millis() as u64);
+    w.gauge_labeled("amphetamine_setup_duration_ms", "phase", "steam_client", t_steam.as_millis() as u64);
+    w.gauge_labeled("amphetamine_setup_duration_ms", "phase", "total", t_total.as_millis() as u64);
+
+    // ---- Shader cache ----
+    w.separator();
+    w.header("amphetamine_shader_cache_enabled", "Per-game shader cache enabled", "gauge");
+    w.gauge("amphetamine_shader_cache_enabled", shader_cache_enabled as u64);
+
+    w.header("amphetamine_shader_cache_gpu_vendor", "GPU vendor for shader cache", "gauge");
+    w.info("amphetamine_shader_cache_gpu_vendor", "vendor", gpu_vendor());
+
+    // ---- Environment variables ----
+    w.separator();
+    w.header("amphetamine_env_var", "Environment variable set for game", "gauge");
+    for (k, v) in env_vars {
+        w.gauge_labeled2("amphetamine_env_var", "name", k, "value", v, 1);
+    }
+
+    // Write file
+    let log_dir = crate::log::log_dir();
+    let ts = filename_timestamp();
+    let filename = format!("launch-{ts}.prom");
+
+    match w.write_to(&log_dir, &filename, "launch-latest.prom") {
+        Ok(p) => log_verbose!("launch diagnostics: {}", p.display()),
+        Err(e) => log_warn!("cannot write launch diagnostics: {e}"),
+    }
 }
 
 // ---------------------------------------------------------------------------

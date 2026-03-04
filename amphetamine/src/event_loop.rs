@@ -43,6 +43,10 @@ pub struct EventLoop {
     total_requests: u64,
     pending_waits: Vec<PendingWait>,
     request_buf: Vec<u8>,
+    start_time: Instant,
+    peak_clients: usize,
+    process_init_count: u64,
+    thread_init_count: u64,
 }
 
 impl EventLoop {
@@ -75,6 +79,10 @@ impl EventLoop {
             total_requests: 0,
             pending_waits: Vec::new(),
             request_buf: Vec::with_capacity(512),
+            start_time: Instant::now(),
+            peak_clients: 0,
+            process_init_count: 0,
+            thread_init_count: 0,
         }
     }
 
@@ -192,6 +200,9 @@ impl EventLoop {
             let fd = client.fd;
             epoll_add(self.epoll_fd, fd, libc::EPOLLIN as u32);
             self.clients.insert(fd, client);
+            if self.clients.len() > self.peak_clients {
+                self.peak_clients = self.clients.len();
+            }
         }
     }
 
@@ -275,6 +286,7 @@ impl RequestHandler for EventLoop {
             .and_then(|c| c.take_inflight_fd());
 
         let pid = self.state.create_process();
+        self.process_init_count += 1;
 
         // Extract VARARG startup info: skip fixed struct, then skip
         // handles_size + jobs_size bytes to get startup_info + env
@@ -364,6 +376,7 @@ impl RequestHandler for EventLoop {
         });
 
         let tid = self.state.create_thread(target_pid, client_fd as RawFd, 0);
+        self.thread_init_count += 1;
         let handle = if let Some(ppid) = caller_pid {
             if let Some(parent) = self.state.processes.get_mut(&ppid) {
                 parent.handles.allocate(tid as u64, 0x001F03FF) // THREAD_ALL_ACCESS
@@ -405,6 +418,7 @@ impl RequestHandler for EventLoop {
 
         let slot = self.shm.alloc_slot(req.unix_tid as thread_id_t);
         let tid = self.state.create_thread(pid, client_fd as RawFd, slot);
+        self.thread_init_count += 1;
 
         if let Some(client) = self.clients.get_mut(&(client_fd as RawFd)) {
             client.thread_id = tid;
@@ -1031,6 +1045,7 @@ impl Drop for EventLoop {
     fn drop(&mut self) {
         if self.total_requests > 0 && crate::log::is_verbose() {
             self.dump_opcode_stats();
+            self.write_session_prom();
         }
         unsafe {
             libc::close(self.timer_fd);
@@ -1072,6 +1087,52 @@ impl EventLoop {
                 let _ = writeln!(f, "{count:>8}  {name}");
             }
             eprintln!("[triskelion] stats written to {log_path}");
+        }
+    }
+
+    fn write_session_prom(&self) {
+        use crate::log::{PromWriter, filename_timestamp};
+
+        let mut w = PromWriter::new();
+        w.timestamp_header();
+
+        // ---- Session overview ----
+        let uptime = self.start_time.elapsed();
+        w.separator();
+        w.header("amphetamine_session_uptime_seconds", "Wineserver session duration", "gauge");
+        w.gauge("amphetamine_session_uptime_seconds", uptime.as_secs());
+
+        w.header("amphetamine_session_total_requests", "Total protocol requests processed", "gauge");
+        w.gauge("amphetamine_session_total_requests", self.total_requests);
+
+        w.header("amphetamine_session_peak_clients", "Peak concurrent client connections", "gauge");
+        w.gauge("amphetamine_session_peak_clients", self.peak_clients as u64);
+
+        w.header("amphetamine_session_process_inits", "Total process initializations", "gauge");
+        w.gauge("amphetamine_session_process_inits", self.process_init_count);
+
+        w.header("amphetamine_session_thread_inits", "Total thread initializations", "gauge");
+        w.gauge("amphetamine_session_thread_inits", self.thread_init_count);
+
+        // ---- Per-opcode counts ----
+        w.separator();
+        w.header("amphetamine_opcode_count", "Per-opcode request count", "gauge");
+        for (idx, &count) in self.opcode_counts.iter().enumerate() {
+            if count > 0 {
+                let name = RequestCode::from_i32(idx as i32)
+                    .map(|c| c.as_str())
+                    .unwrap_or("unknown");
+                w.gauge_labeled("amphetamine_opcode_count", "opcode", name, count);
+            }
+        }
+
+        let log_dir = crate::log::log_dir();
+        let ts = filename_timestamp();
+        let filename = format!("session-{ts}.prom");
+
+        match w.write_to(&log_dir, &filename, "session-latest.prom") {
+            Ok(p) => eprintln!("[triskelion] session diagnostics: {}", p.display()),
+            Err(e) => eprintln!("[triskelion] cannot write session diagnostics: {e}"),
         }
     }
 }

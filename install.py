@@ -256,7 +256,21 @@ def configure_shader_cache():
         log("INFO", "Shader cache optimization disabled")
 
 
+def configure_verbose():
+    """Handle --verbose flag: write/remove verbose_enabled flag file."""
+    flag = STEAM_COMPAT_DIR / "verbose_enabled"
+    if "--verbose" in sys.argv:
+        STEAM_COMPAT_DIR.mkdir(parents=True, exist_ok=True)
+        flag.write_text("1")
+        log("INFO", "Verbose diagnostics enabled (~/.cache/amphetamine/*.prom)")
+    else:
+        if flag.exists():
+            flag.unlink()
+
+
 def main():
+    configure_verbose()
+
     clone_wine()
 
     ret = build_triskelion()
