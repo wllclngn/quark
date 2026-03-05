@@ -814,6 +814,12 @@ fn build_env_vars(
         vars.push(("SteamVirtualGamepadInfo", gamepad_info));
     }
 
+    // Native Wayland: Wine 9.0+ has a Wayland driver but requires explicit
+    // opt-in. If the session has WAYLAND_DISPLAY set, enable it.
+    if std::env::var("WAYLAND_DISPLAY").is_ok() {
+        vars.push(("WINE_ENABLE_WAYLAND", "1".into()));
+    }
+
     // Shader cache optimization — opt-in via install.py prompt.
     if shader_cache_enabled {
         let shader_cache = pfx.join("shader_cache");

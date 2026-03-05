@@ -107,6 +107,11 @@ First launch sets up the prefix (~1500 symlinks + files via getdents64/hardlinks
 
 ## Install
 
+### Dependencies
+
+- **Proton Experimental** — Install via Steam (Steam → Settings → Compatibility → enable Proton, or install any game that uses Proton). amphetamine replaces Proton's launcher and wineserver but uses its Wine toolchain, prefix template, DXVK, VKD3D-Proton, and Steam client bridge.
+- **Rust** (1.85+, 2024 edition)
+
 ```bash
 # Arch Linux
 pacman -S rust
