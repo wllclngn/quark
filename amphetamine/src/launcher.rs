@@ -25,6 +25,15 @@ const BASE_OVERRIDES: &[(&str, &str)] = &[
     ("dotnetfx35setup.exe", "b"),
     ("beclient.dll", "b,n"),
     ("beclient_x64.dll", "b,n"),
+    // XInput: use Wine builtins — routes through winebus.sys for HID enumeration
+    ("xinput1_1.dll", "b"),
+    ("xinput1_2.dll", "b"),
+    ("xinput1_3.dll", "b"),
+    ("xinput1_4.dll", "b"),
+    ("xinput9_1_0.dll", "b"),
+    ("xinputuap.dll", "b"),
+    // winebth.sys crashes winedevice.exe — disable it (matches Proton)
+    ("winebth.sys", "d"),
 ];
 
 // Steam client files: (source_name in legacycompat/, dest_name in prefix)
@@ -203,6 +212,10 @@ pub fn run(verb: &str, args: &[String]) -> i32 {
         }
 
         log_info!("launching: {game_exe}");
+
+        // Clean stale crash dumps — engines like Godot read their crash dir
+        // on startup and may enter recovery paths if old dumps exist.
+        clean_crash_dumps(&pfx);
 
         // Save data protection: snapshot before launch
         let save_backup = snapshot_save_data(&pfx);
@@ -1292,4 +1305,47 @@ fn copy_save_recursive(src: &Path, dst: &Path) {
             let _ = std::fs::copy(&src_path, &dst_path);
         }
     }
+}
+
+/// Remove .dmp and .mdmp crash dumps from the prefix before launch.
+/// Engines (Godot, Unity, Unreal) read their crash directories on startup
+/// and may enter recovery/report paths that interfere with normal launch.
+fn clean_crash_dumps(pfx: &Path) {
+    let user_dir = pfx.join("drive_c/users/steamuser");
+    if !user_dir.exists() {
+        return;
+    }
+
+    let mut removed = 0u32;
+    for scan_dir in SAVE_SCAN_DIRS {
+        let dir = user_dir.join(scan_dir);
+        if dir.is_dir() {
+            removed += remove_dumps_recursive(&dir);
+        }
+    }
+    if removed > 0 {
+        log_info!("cleaned {removed} stale crash dump(s)");
+    }
+}
+
+fn remove_dumps_recursive(dir: &Path) -> u32 {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    let mut removed = 0u32;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            removed += remove_dumps_recursive(&path);
+        } else if let Some(ext) = path.extension() {
+            let ext = ext.to_string_lossy();
+            if ext.eq_ignore_ascii_case("dmp") || ext.eq_ignore_ascii_case("mdmp") {
+                if std::fs::remove_file(&path).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+    }
+    removed
 }
