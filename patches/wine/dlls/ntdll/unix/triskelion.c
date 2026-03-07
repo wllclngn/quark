@@ -1,16 +1,21 @@
-// triskelion.c -- Shared memory message queue bypass for Wine
+// triskelion.c -- Shared memory message queue bypass + ntsync for Wine
 //
-// Modeled after fsync (dlls/ntdll/unix/fsync.c). Intercepts GetMessage
-// and PostMessage at the server_call_unlocked level, checking a shared
-// memory ring buffer before falling through to the wineserver socket.
+// Two independent fast paths, both intercepted at server_call_unlocked:
 //
-// Same-process posted messages never touch the wineserver. Cross-process
-// and non-posted messages fall through to the normal path.
+// 1. Message queue bypass: GetMessage/PostMessage via shared memory ring
+//    buffer. Same-process posted messages never touch the wineserver.
 //
-// Integration:
-//   1. Add triskelion.c to dlls/ntdll/Makefile.in (SOURCES)
-//   2. Add triskelion_try_bypass() call in server_call_unlocked()
-//   3. Set WINE_TRISKELION=1 to enable
+// 2. ntsync: NT sync primitives (mutex, semaphore, event, wait) routed
+//    to /dev/ntsync ioctls. Eliminates wineserver roundtrip for the
+//    hottest sync paths. Uses a shadow table: server still manages
+//    handles, we shadow each sync object with an ntsync fd.
+//
+// Integration (applied by install.py):
+//   - triskelion.c added to dlls/ntdll/Makefile.in (SOURCES)
+//   - triskelion_try_bypass() called in server_call_unlocked() (pre-hook)
+//   - triskelion_post_call() called after server_call_unlocked() (post-hook)
+//   - Set WINE_TRISKELION=1 to enable message bypass
+//   - ntsync auto-enables when /dev/ntsync exists
 
 #if 0
 #pragma makedep unix
@@ -37,6 +42,29 @@
 #ifdef HAVE_LINUX_FUTEX_H
 # include <linux/futex.h>
 #endif
+#include <sys/ioctl.h>
+
+// ntsync kernel interface — inline definitions so we don't require the header
+// at compile time. These match linux/ntsync.h from kernel 6.14+.
+#ifndef NTSYNC_IOC_CREATE_SEM
+struct ntsync_sem_args   { uint32_t count; uint32_t max; };
+struct ntsync_mutex_args { uint32_t owner; uint32_t count; };
+struct ntsync_event_args { uint32_t manual; uint32_t signaled; };
+struct ntsync_wait_args  { uint64_t timeout; uint64_t objs; uint32_t count; uint32_t index;
+                           uint32_t flags; uint32_t owner; uint32_t alert; uint32_t pad; };
+#define NTSYNC_IOC_CREATE_SEM   _IOW ('N', 0x80, struct ntsync_sem_args)
+#define NTSYNC_IOC_WAIT_ANY     _IOWR('N', 0x82, struct ntsync_wait_args)
+#define NTSYNC_IOC_WAIT_ALL     _IOWR('N', 0x83, struct ntsync_wait_args)
+#define NTSYNC_IOC_CREATE_MUTEX _IOW ('N', 0x84, struct ntsync_mutex_args)
+#define NTSYNC_IOC_CREATE_EVENT _IOW ('N', 0x87, struct ntsync_event_args)
+#define NTSYNC_IOC_SEM_RELEASE  _IOWR('N', 0x81, uint32_t)
+#define NTSYNC_IOC_MUTEX_UNLOCK _IOWR('N', 0x85, struct ntsync_mutex_args)
+#define NTSYNC_IOC_EVENT_SET    _IOR ('N', 0x88, uint32_t)
+#define NTSYNC_IOC_EVENT_RESET  _IOR ('N', 0x89, uint32_t)
+#define NTSYNC_IOC_EVENT_PULSE  _IOR ('N', 0x8a, uint32_t)
+#define NTSYNC_WAIT_REALTIME    0x1
+#endif
+#define NTSYNC_MAX_WAIT_COUNT 64
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -71,8 +99,7 @@ struct triskelion_message {
     int32_t  x;
     int32_t  y;
     uint32_t time;
-    uint32_t sender_tid;
-    uint32_t _pad;
+    uint32_t _pad[2];
 };
 
 struct triskelion_cacheline_u64 {
@@ -88,20 +115,16 @@ struct triskelion_ring {
 
 struct triskelion_queue {
     struct triskelion_ring posted;
-    struct triskelion_ring sent;
     _Atomic uint32_t wake_bits;
-    _Atomic uint32_t changed_bits;
-    _Atomic uint32_t wake_mask;
-    _Atomic uint32_t changed_mask;
+    _Atomic uint32_t post_lock; // spinlock for ring_push (multiple producers)
     uint32_t thread_id;
-    uint8_t _reserved[44];
+    uint8_t _reserved[52];
 };
 
 #define TRISKELION_HEADER_SIZE sizeof(struct triskelion_header)
 #define TRISKELION_QUEUE_SIZE  sizeof(struct triskelion_queue)
 
 #define QS_POSTMESSAGE_BIT 0x0008
-#define QS_SENDMESSAGE_BIT 0x0040
 
 // Global state (process-wide)
 static int triskelion_enabled = -1;
@@ -243,16 +266,16 @@ static int triskelion_shm_open(void)
     shm_size = TRISKELION_HEADER_SIZE + TRISKELION_MAX_THREADS * TRISKELION_QUEUE_SIZE;
 
     // Try open existing first (triskelion server may have created it)
-    fd = shm_open(shm_name, O_RDWR, 0644);
+    fd = shm_open(shm_name, O_RDWR, 0600);
     if (fd == -1)
     {
         // Remove stale segment from a crashed prior run, then create fresh
         shm_unlink(shm_name);
-        fd = shm_open(shm_name, O_CREAT | O_EXCL | O_RDWR, 0644);
+        fd = shm_open(shm_name, O_CREAT | O_EXCL | O_RDWR, 0600);
         if (fd == -1 && errno == EEXIST)
         {
             // Race: another process created it between unlink and open
-            fd = shm_open(shm_name, O_RDWR, 0644);
+            fd = shm_open(shm_name, O_RDWR, 0600);
         }
         if (fd == -1) return 0;
         if (ftruncate(fd, shm_size) == -1)
@@ -313,9 +336,8 @@ static struct triskelion_queue *triskelion_claim_slot(uint32_t tid)
     tls_queue = q;
 
     // Store queue pointer in TEB for win32u peek_message fast path.
-    // glReserved2 is unused in Wine; win32u reads it to check the ring
-    // BEFORE check_queue_bits, avoiding the server call skip when our
-    // ring has pending messages.
+    // glReserved2 is unused in Wine; win32u reads it to detect pending
+    // messages in the shm ring before falling back to the server.
     NtCurrentTeb()->glReserved2 = (PVOID)q;
 
     // Register in process-local map
@@ -326,11 +348,15 @@ static struct triskelion_queue *triskelion_claim_slot(uint32_t tid)
         local_map[local_map_count].slot = slot;
         local_map_count++;
     }
-    else if (local_map_count == MAX_LOCAL_THREADS)
+    else
     {
-        fprintf(stderr, "[triskelion] local_map full (%d threads), "
-                "new threads fall through to wineserver\n", MAX_LOCAL_THREADS);
-        local_map_count++; // suppress further warnings
+        static int warned = 0;
+        if (!warned)
+        {
+            fprintf(stderr, "[triskelion] local_map full (%d threads), "
+                    "new threads fall through to wineserver\n", MAX_LOCAL_THREADS);
+            warned = 1;
+        }
     }
     pthread_mutex_unlock(&local_map_lock);
 
@@ -370,7 +396,7 @@ static struct triskelion_queue *get_queue_by_tid(uint32_t target_tid)
     return NULL;
 }
 
-// SPSC ring: pop (consumer)
+// Ring pop: single consumer (owning thread only)
 static int ring_pop(struct triskelion_ring *ring, struct triskelion_message *out)
 {
     uint64_t rp = atomic_load_explicit(&ring->read_pos.val, memory_order_relaxed);
@@ -383,7 +409,8 @@ static int ring_pop(struct triskelion_ring *ring, struct triskelion_message *out
     return 1;
 }
 
-// SPSC ring: push (producer)
+// Ring push: multiple producers possible (any thread can PostMessage to any queue).
+// Caller MUST hold queue->post_lock.
 static int ring_push(struct triskelion_ring *ring, const struct triskelion_message *msg)
 {
     uint64_t wp = atomic_load_explicit(&ring->write_pos.val, memory_order_relaxed);
@@ -394,6 +421,18 @@ static int ring_push(struct triskelion_ring *ring, const struct triskelion_messa
     ring->buf[wp & TRISKELION_RING_MASK] = *msg;
     atomic_store_explicit(&ring->write_pos.val, wp + 1, memory_order_release);
     return 1;
+}
+
+static inline void spin_lock(_Atomic uint32_t *lock)
+{
+    while (atomic_exchange_explicit(lock, 1, memory_order_acquire))
+        while (atomic_load_explicit(lock, memory_order_relaxed))
+            ; // spin on cached value
+}
+
+static inline void spin_unlock(_Atomic uint32_t *lock)
+{
+    atomic_store_explicit(lock, 0, memory_order_release);
 }
 
 // Try to bypass get_message via shared memory.
@@ -467,14 +506,18 @@ static unsigned int try_bypass_send_message(void *req_ptr)
     tmsg.x          = 0;
     tmsg.y          = 0;
     tmsg.time       = 0;
-    tmsg.sender_tid = tls_queue ? tls_queue->thread_id : 0;
-    tmsg._pad       = 0;
+    tmsg._pad[0]    = 0;
+    tmsg._pad[1]    = 0;
 
+    spin_lock(&target->post_lock);
     if (!ring_push(&target->posted, &tmsg))
+    {
+        spin_unlock(&target->post_lock);
         return STATUS_NOT_IMPLEMENTED; // ring full, fall through to server
+    }
+    spin_unlock(&target->post_lock);
 
     atomic_fetch_or_explicit(&target->wake_bits, QS_POSTMESSAGE_BIT, memory_order_release);
-    atomic_fetch_or_explicit(&target->changed_bits, QS_POSTMESSAGE_BIT, memory_order_release);
     triskelion_futex_wake(&target->wake_bits);
 
     req->u.reply.reply_header.error = 0;
@@ -482,16 +525,369 @@ static unsigned int try_bypass_send_message(void *req_ptr)
     return STATUS_SUCCESS;
 }
 
+// =========================================================================
+// ntsync: kernel-native NT sync via /dev/ntsync
+//
+// Shadow table approach: the server still manages handles. We mirror each
+// sync object (semaphore, mutex, event) with an ntsync kernel fd.
+// Signal/release/wait bypass the server entirely via ioctl.
+// Create goes to server first (to get handle), then we shadow in post-hook.
+// Named objects (cross-process) are NOT shadowed — they fall through.
+// =========================================================================
+
+#define NTSYNC_TYPE_SEM   1
+#define NTSYNC_TYPE_MUTEX 2
+#define NTSYNC_TYPE_EVENT 3
+
+struct ntsync_shadow {
+    int fd;    // ntsync object fd, -1 = unused
+    int type;  // NTSYNC_TYPE_*
+};
+
+// Shadow table indexed by (handle >> 2). Handles are multiples of 4.
+#define NTSYNC_TABLE_SIZE 4096
+static struct ntsync_shadow ntsync_table[NTSYNC_TABLE_SIZE];
+static int ntsync_dev_fd = -1;
+static pthread_mutex_t ntsync_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// Per-thread: saved create params for the post-hook (server overwrites
+// request fields with reply data, so we stash them here before the call).
+enum ntsync_pending_op {
+    NTSYNC_PENDING_NONE = 0,
+    NTSYNC_PENDING_CREATE_SEM,
+    NTSYNC_PENDING_CREATE_MUTEX,
+    NTSYNC_PENDING_CREATE_EVENT,
+    NTSYNC_PENDING_CLOSE,
+};
+struct ntsync_pending {
+    int op;
+    union {
+        struct { uint32_t initial; uint32_t max; } sem;
+        struct { uint32_t owned; } mutex;
+        struct { uint32_t manual_reset; uint32_t initial_state; } event;
+        struct { obj_handle_t handle; } close;
+    };
+};
+static __thread struct ntsync_pending tls_ntsync;
+
+// NT epoch (1601-01-01) to Unix epoch (1970-01-01) in 100ns ticks
+#define TICKS_1601_TO_1970 116444736000000000LL
+
+static void ntsync_init_once(void)
+{
+    ntsync_dev_fd = open("/dev/ntsync", O_CLOEXEC | O_RDONLY);
+    if (ntsync_dev_fd >= 0)
+        memset(ntsync_table, 0xff, sizeof(ntsync_table)); // fd = -1 for all
+}
+
+static int ntsync_init(void)
+{
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, ntsync_init_once);
+    return ntsync_dev_fd >= 0;
+}
+
+static inline int handle_to_idx(obj_handle_t handle)
+{
+    unsigned int idx = handle >> 2;
+    return (idx < NTSYNC_TABLE_SIZE) ? (int)idx : -1;
+}
+
+static void ntsync_shadow_add(obj_handle_t handle, int fd, int type)
+{
+    int idx = handle_to_idx(handle);
+    if (idx < 0) { close(fd); return; }
+
+    pthread_mutex_lock(&ntsync_lock);
+    if (ntsync_table[idx].fd >= 0)
+        close(ntsync_table[idx].fd);
+    ntsync_table[idx].fd = fd;
+    ntsync_table[idx].type = type;
+    pthread_mutex_unlock(&ntsync_lock);
+}
+
+// Copy shadow entry under lock. Caller gets a snapshot — safe from concurrent remove.
+static inline int ntsync_shadow_get(obj_handle_t handle, struct ntsync_shadow *out)
+{
+    int idx = handle_to_idx(handle);
+    if (idx < 0) return 0;
+
+    pthread_mutex_lock(&ntsync_lock);
+    if (ntsync_table[idx].fd < 0) {
+        pthread_mutex_unlock(&ntsync_lock);
+        return 0;
+    }
+    *out = ntsync_table[idx];
+    pthread_mutex_unlock(&ntsync_lock);
+    return 1;
+}
+
+static void ntsync_shadow_remove(obj_handle_t handle)
+{
+    int idx = handle_to_idx(handle);
+    if (idx < 0) return;
+
+    pthread_mutex_lock(&ntsync_lock);
+    if (ntsync_table[idx].fd >= 0)
+    {
+        close(ntsync_table[idx].fd);
+        ntsync_table[idx].fd = -1;
+    }
+    pthread_mutex_unlock(&ntsync_lock);
+}
+
+// Check if a create request has a name (named = shared cross-process).
+// Named objects must NOT be shadowed — different processes need the same
+// kernel object, which our per-process shadow table can't provide.
+static int create_request_is_named(struct __server_request_info *req)
+{
+    const struct object_attributes *attr;
+    if (req->data_count < 1 || req->data[0].size < sizeof(*attr))
+        return 0;
+    attr = (const struct object_attributes *)req->data[0].ptr;
+    return attr->name_len > 0;
+}
+
+static uint32_t get_wine_tid(void)
+{
+    return (uint32_t)(uintptr_t)NtCurrentTeb()->ClientId.UniqueThread;
+}
+
+// --- Bypass functions for signal/release/wait (pre-hook) ---
+
+static unsigned int try_bypass_release_semaphore(void *req_ptr)
+{
+    struct __server_request_info *req = req_ptr;
+    struct release_semaphore_request *sreq = &req->u.req.release_semaphore_request;
+    struct release_semaphore_reply *reply = &req->u.reply.release_semaphore_reply;
+    struct ntsync_shadow shadow;
+    uint32_t count;
+
+    if (!ntsync_init()) return STATUS_NOT_IMPLEMENTED;
+
+    if (!ntsync_shadow_get(sreq->handle, &shadow) || shadow.type != NTSYNC_TYPE_SEM)
+        return STATUS_NOT_IMPLEMENTED;
+
+    count = sreq->count;
+    if (ioctl(shadow.fd, NTSYNC_IOC_SEM_RELEASE, &count) < 0)
+        return STATUS_NOT_IMPLEMENTED;
+
+    reply->prev_count = count;
+    req->u.reply.reply_header.error = 0;
+    req->u.reply.reply_header.reply_size = 0;
+    return STATUS_SUCCESS;
+}
+
+static unsigned int try_bypass_release_mutex(void *req_ptr)
+{
+    struct __server_request_info *req = req_ptr;
+    struct release_mutex_request *mreq = &req->u.req.release_mutex_request;
+    struct release_mutex_reply *reply = &req->u.reply.release_mutex_reply;
+    struct ntsync_shadow shadow;
+    struct ntsync_mutex_args args;
+
+    if (!ntsync_init()) return STATUS_NOT_IMPLEMENTED;
+
+    if (!ntsync_shadow_get(mreq->handle, &shadow) || shadow.type != NTSYNC_TYPE_MUTEX)
+        return STATUS_NOT_IMPLEMENTED;
+
+    args.owner = get_wine_tid();
+    args.count = 0;
+    if (ioctl(shadow.fd, NTSYNC_IOC_MUTEX_UNLOCK, &args) < 0)
+        return STATUS_NOT_IMPLEMENTED;
+
+    reply->prev_count = args.count;
+    req->u.reply.reply_header.error = 0;
+    req->u.reply.reply_header.reply_size = 0;
+    return STATUS_SUCCESS;
+}
+
+static unsigned int try_bypass_event_op(void *req_ptr)
+{
+    struct __server_request_info *req = req_ptr;
+    struct event_op_request *ereq = &req->u.req.event_op_request;
+    struct event_op_reply *reply = &req->u.reply.event_op_reply;
+    struct ntsync_shadow shadow;
+    unsigned long ioctl_cmd;
+    uint32_t signaled = 0;
+
+    if (!ntsync_init()) return STATUS_NOT_IMPLEMENTED;
+
+    if (!ntsync_shadow_get(ereq->handle, &shadow) || shadow.type != NTSYNC_TYPE_EVENT)
+        return STATUS_NOT_IMPLEMENTED;
+
+    switch (ereq->op)
+    {
+    case SET_EVENT:   ioctl_cmd = NTSYNC_IOC_EVENT_SET;   break;
+    case RESET_EVENT: ioctl_cmd = NTSYNC_IOC_EVENT_RESET; break;
+    case PULSE_EVENT: ioctl_cmd = NTSYNC_IOC_EVENT_PULSE; break;
+    default: return STATUS_NOT_IMPLEMENTED;
+    }
+
+    if (ioctl(shadow.fd, ioctl_cmd, &signaled) < 0)
+        return STATUS_NOT_IMPLEMENTED;
+
+    reply->state = signaled;
+    req->u.reply.reply_header.error = 0;
+    req->u.reply.reply_header.reply_size = 0;
+    return STATUS_SUCCESS;
+}
+
+static unsigned int try_bypass_select(void *req_ptr)
+{
+    struct __server_request_info *req = req_ptr;
+    struct select_request *sreq = &req->u.req.select_request;
+    struct select_reply *reply = &req->u.reply.select_reply;
+    const union select_op *op;
+    struct ntsync_wait_args args;
+    uint32_t objs[NTSYNC_MAX_WAIT_COUNT];
+    int count, i;
+
+    if (!ntsync_init()) return STATUS_NOT_IMPLEMENTED;
+
+    // data[0] = apc_result, data[1] = select_op
+    if (req->data_count < 2) return STATUS_NOT_IMPLEMENTED;
+
+    op = (const union select_op *)req->data[1].ptr;
+
+    // Only handle basic waits — no signal-and-wait, no keyed events
+    if (op->op != SELECT_WAIT && op->op != SELECT_WAIT_ALL)
+        return STATUS_NOT_IMPLEMENTED;
+
+    // Alertable waits involve APCs — too complex for bypass
+    if (sreq->flags & SELECT_ALERTABLE)
+        return STATUS_NOT_IMPLEMENTED;
+
+    count = ((int)sreq->size - (int)sizeof(int)) / (int)sizeof(obj_handle_t);
+    if (count <= 0 || count > NTSYNC_MAX_WAIT_COUNT)
+        return STATUS_NOT_IMPLEMENTED;
+
+    // Resolve all handles to ntsync fds. If ANY handle isn't shadowed
+    // (e.g. file, process, thread objects), fall through to server.
+    for (i = 0; i < count; i++)
+    {
+        struct ntsync_shadow shadow;
+        if (!ntsync_shadow_get(op->wait.handles[i], &shadow))
+            return STATUS_NOT_IMPLEMENTED;
+        objs[i] = (uint32_t)shadow.fd;
+    }
+
+    // Convert timeout
+    memset(&args, 0, sizeof(args));
+    if (sreq->timeout == TIMEOUT_INFINITE)
+    {
+        args.timeout = UINT64_MAX;
+        args.flags = 0;
+    }
+    else if (sreq->timeout < 0)
+    {
+        // Relative: negate and convert 100ns ticks → nanoseconds
+        args.timeout = (uint64_t)(-sreq->timeout) * 100;
+        args.flags = 0;
+    }
+    else
+    {
+        // Absolute: convert NT epoch → Unix epoch nanoseconds
+        int64_t unix_100ns = (int64_t)sreq->timeout - TICKS_1601_TO_1970;
+        if (unix_100ns < 0) unix_100ns = 0;
+        args.timeout = (uint64_t)unix_100ns * 100;
+        args.flags = NTSYNC_WAIT_REALTIME;
+    }
+
+    args.objs = (uint64_t)(uintptr_t)objs;
+    args.count = (uint32_t)count;
+    args.owner = get_wine_tid();
+    args.alert = 0;
+
+    if (ioctl(ntsync_dev_fd,
+              op->op == SELECT_WAIT_ALL ? NTSYNC_IOC_WAIT_ALL : NTSYNC_IOC_WAIT_ANY,
+              &args) < 0)
+    {
+        if (errno == ETIMEDOUT)
+        {
+            reply->signaled = STATUS_TIMEOUT;
+            reply->apc_handle = 0;
+            req->u.reply.reply_header.error = STATUS_TIMEOUT;
+            req->u.reply.reply_header.reply_size = 0;
+            return STATUS_TIMEOUT;
+        }
+        return STATUS_NOT_IMPLEMENTED;
+    }
+
+    reply->signaled = args.index;
+    reply->apc_handle = 0;
+    req->u.reply.reply_header.error = 0;
+    req->u.reply.reply_header.reply_size = 0;
+    return STATUS_SUCCESS;
+}
+
+// Save create params in TLS before server call (request fields get
+// overwritten by reply). Returns STATUS_NOT_IMPLEMENTED so the server
+// handles the actual object creation and handle allocation.
+static void ntsync_pre_create(struct __server_request_info *req, int code)
+{
+    if (!ntsync_init()) return;
+
+    switch (code)
+    {
+    case REQ_create_semaphore:
+        if (create_request_is_named(req)) break;
+        tls_ntsync.op = NTSYNC_PENDING_CREATE_SEM;
+        tls_ntsync.sem.initial = req->u.req.create_semaphore_request.initial;
+        tls_ntsync.sem.max = req->u.req.create_semaphore_request.max;
+        return;
+
+    case REQ_create_mutex:
+        if (create_request_is_named(req)) break;
+        tls_ntsync.op = NTSYNC_PENDING_CREATE_MUTEX;
+        tls_ntsync.mutex.owned = req->u.req.create_mutex_request.owned;
+        return;
+
+    case REQ_create_event:
+        if (create_request_is_named(req)) break;
+        tls_ntsync.op = NTSYNC_PENDING_CREATE_EVENT;
+        tls_ntsync.event.manual_reset = req->u.req.create_event_request.manual_reset;
+        tls_ntsync.event.initial_state = req->u.req.create_event_request.initial_state;
+        return;
+
+    case REQ_close_handle:
+        tls_ntsync.op = NTSYNC_PENDING_CLOSE;
+        tls_ntsync.close.handle = req->u.req.close_handle_request.handle;
+        return;
+    }
+
+    tls_ntsync.op = NTSYNC_PENDING_NONE;
+}
+
 // Main bypass dispatch. Called from server_call_unlocked before the socket I/O.
 // Returns STATUS_NOT_IMPLEMENTED to fall through to the normal path.
 unsigned int triskelion_try_bypass(void *req_ptr)
 {
     struct __server_request_info *req = req_ptr;
-    int code;
+    int code = req->u.req.request_header.req;
 
+    // ntsync: save create params + handle close ops (always, independent of
+    // WINE_TRISKELION message bypass). The post-hook does the actual shadow.
+    tls_ntsync.op = NTSYNC_PENDING_NONE;
+    ntsync_pre_create(req, code);
+
+    // ntsync: bypass signal/release/wait operations
+    switch (code)
+    {
+    case REQ_release_semaphore:
+        return try_bypass_release_semaphore(req_ptr);
+    case REQ_release_mutex:
+        return try_bypass_release_mutex(req_ptr);
+    case REQ_event_op:
+        return try_bypass_event_op(req_ptr);
+    case REQ_select:
+        return try_bypass_select(req_ptr);
+    default:
+        break;
+    }
+
+    // Message queue bypass (requires WINE_TRISKELION=1)
     if (!do_triskelion()) return STATUS_NOT_IMPLEMENTED;
-
-    code = req->u.req.request_header.req;
 
     switch (code)
     {
@@ -502,4 +898,67 @@ unsigned int triskelion_try_bypass(void *req_ptr)
     default:
         return STATUS_NOT_IMPLEMENTED;
     }
+}
+
+// Post-call hook. Called from server_call_unlocked AFTER the server processes
+// the request. Creates ntsync shadow objects for newly created sync handles
+// and cleans up shadows on close.
+void triskelion_post_call(void *req_ptr, unsigned int ret)
+{
+    struct __server_request_info *req = req_ptr;
+    int fd;
+
+    if (tls_ntsync.op == NTSYNC_PENDING_NONE) return;
+
+    switch (tls_ntsync.op)
+    {
+    case NTSYNC_PENDING_CREATE_SEM:
+        if (ret != STATUS_SUCCESS) break;
+        {
+            struct ntsync_sem_args args = {
+                .count = tls_ntsync.sem.initial,
+                .max = tls_ntsync.sem.max,
+            };
+            fd = ioctl(ntsync_dev_fd, NTSYNC_IOC_CREATE_SEM, &args);
+            if (fd >= 0)
+                ntsync_shadow_add(req->u.reply.create_semaphore_reply.handle, fd, NTSYNC_TYPE_SEM);
+        }
+        break;
+
+    case NTSYNC_PENDING_CREATE_MUTEX:
+        if (ret != STATUS_SUCCESS) break;
+        {
+            struct ntsync_mutex_args args = {
+                .owner = tls_ntsync.mutex.owned ? get_wine_tid() : 0,
+                .count = tls_ntsync.mutex.owned ? 1u : 0u,
+            };
+            fd = ioctl(ntsync_dev_fd, NTSYNC_IOC_CREATE_MUTEX, &args);
+            if (fd >= 0)
+                ntsync_shadow_add(req->u.reply.create_mutex_reply.handle, fd, NTSYNC_TYPE_MUTEX);
+        }
+        break;
+
+    case NTSYNC_PENDING_CREATE_EVENT:
+        if (ret != STATUS_SUCCESS) break;
+        {
+            struct ntsync_event_args args = {
+                .manual = tls_ntsync.event.manual_reset,
+                .signaled = tls_ntsync.event.initial_state,
+            };
+            fd = ioctl(ntsync_dev_fd, NTSYNC_IOC_CREATE_EVENT, &args);
+            if (fd >= 0)
+                ntsync_shadow_add(req->u.reply.create_event_reply.handle, fd, NTSYNC_TYPE_EVENT);
+        }
+        break;
+
+    case NTSYNC_PENDING_CLOSE:
+        if (ret != STATUS_SUCCESS) break;
+        ntsync_shadow_remove(tls_ntsync.close.handle);
+        break;
+
+    default:
+        break;
+    }
+
+    tls_ntsync.op = NTSYNC_PENDING_NONE;
 }

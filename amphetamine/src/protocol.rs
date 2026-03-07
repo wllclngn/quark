@@ -8,6 +8,7 @@
 // from protocol.def and server_protocol.h. Never edit those manually.
 
 #![allow(non_camel_case_types)]
+#![allow(dead_code)] // Wine protocol types — used as handlers are implemented
 
 pub type obj_handle_t = u32;
 pub type user_handle_t = u32;
@@ -74,15 +75,3 @@ pub const QS_HOTKEY: u32 = 0x0080;
 pub const QS_ALLPOSTMESSAGE: u32 = 0x0100;
 pub const QS_RAWINPUT: u32 = 0x0400;
 
-// Sync primitive types (from protocol.def fsync/esync)
-#[repr(u32)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SyncType {
-    Semaphore = 1,
-    AutoEvent = 2,
-    ManualEvent = 3,
-    Mutex = 4,
-    AutoServer = 5,
-    ManualServer = 6,
-    Queue = 7,
-}

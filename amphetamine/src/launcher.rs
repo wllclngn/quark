@@ -1,8 +1,8 @@
 // amphetamine launcher -- full Proton replacement.
 //
-// Steam calls: ./proton <verb> <appid> [args...]
+// Steam calls: ./proton <verb> <exe> [args...]
 // amphetamine sets up the prefix, deploys DXVK/VKD3D, bridges Steam client,
-// then launches wine64 with WINESERVER=triskelion. One binary. Full stack.
+// then launches wine with WINESERVER=triskelion. One binary. Full stack.
 //
 // Optimization: after first launch, the .triskelion_deployed cache records
 // what was deployed and from where. Subsequent launches skip all file ops
@@ -67,14 +67,27 @@ pub fn run(verb: &str, args: &[String]) -> i32 {
     // Phase 1: Locate everything
     let wine_dir = find_wine();
     let steam_dir = find_steam_dir();
-    let wine_bin = wine_dir.join("bin");
-    let wine64 = wine_bin.join("wine64");
+    let wine64 = wine_binary(&wine_dir);
 
     if !wine64.exists() {
-        log_error!("wine64 not found at {}", wine64.display());
+        log_error!("wine not found at {}", wine64.display());
         log_error!("Need Wine binaries. Set TRISKELION_WINE_DIR or install Proton.");
         return 1;
     }
+
+    // When using non-Proton Wine, we still need
+    // Proton's tree for DXVK, VKD3D-Proton, and steam.exe bridge files.
+    let proton_dir = find_proton_files();
+
+    let dxvk_src_dir = if wine_dir.join("lib/wine/dxvk").exists() {
+        wine_dir.clone()
+    } else if let Some(ref proton) = proton_dir {
+        log_info!("DXVK/VKD3D: sourcing from Proton ({})", proton.display());
+        proton.clone()
+    } else {
+        log_warn!("DXVK/VKD3D: no source found — games needing D3D translation may fail");
+        wine_dir.clone()
+    };
 
     let compat_data = std::env::var("STEAM_COMPAT_DATA_PATH").unwrap_or_default();
     if compat_data.is_empty() {
@@ -104,8 +117,8 @@ pub fn run(verb: &str, args: &[String]) -> i32 {
     // Per-component cache — only redeploy what actually changed
     let cache = DeployCache::load(&pfx);
     let wine_hash = dir_hash(&wine_dir);
-    let dxvk_hash = dir_hash(&wine_dir.join("lib/wine/dxvk"));
-    let vkd3d_hash = dir_hash(&wine_dir.join("lib/wine/vkd3d-proton"));
+    let dxvk_hash = dir_hash(&dxvk_src_dir.join("lib/wine/dxvk"));
+    let vkd3d_hash = dir_hash(&dxvk_src_dir.join("lib/wine/vkd3d-proton"));
     let steam_hash = dir_hash(&steam_dir.join("legacycompat"));
 
     let wine_valid = cache.as_ref().is_some_and(|c| c.wine_hash == wine_hash);
@@ -125,12 +138,12 @@ pub fn run(verb: &str, args: &[String]) -> i32 {
     let dxvk_deployed = if dxvk_valid {
         DXVK_DLLS.to_vec()
     } else {
-        deploy_dxvk(&wine_dir, &pfx)
+        deploy_dxvk(&dxvk_src_dir, &pfx)
     };
     let vkd3d_deployed = if vkd3d_valid {
         VKD3D_DLLS.to_vec()
     } else {
-        deploy_vkd3d(&wine_dir, &pfx)
+        deploy_vkd3d(&dxvk_src_dir, &pfx)
     };
     let t_dxvk = t3.elapsed();
 
@@ -139,6 +152,9 @@ pub fn run(verb: &str, args: &[String]) -> i32 {
     if !steam_valid {
         deploy_steam_client(&steam_dir, &pfx);
     }
+    // Ensure steam.exe bridge exists in prefix system32.
+    // Proton's template includes it.
+    deploy_steam_exe(proton_dir.as_deref(), &pfx);
     let t_steam = t4.elapsed();
 
     // Registry keys run outside cache gate — has its own idempotency check
@@ -162,7 +178,7 @@ pub fn run(verb: &str, args: &[String]) -> i32 {
         .unwrap_or(false);
 
     let env_vars = build_env_vars(
-        &wine_dir, &steam_dir, &pfx, &self_exe,
+        &wine_dir, proton_dir.as_deref(), &steam_dir, &pfx, &self_exe,
         &dxvk_deployed, &vkd3d_deployed, trace, shader_cache_enabled,
     );
     let custom_env = parse_env_config(&self_exe);
@@ -246,7 +262,9 @@ pub fn run(verb: &str, args: &[String]) -> i32 {
             None
         } else if crate::log::is_verbose() {
             let log_dir = crate::log::log_dir();
-            let _ = std::fs::create_dir_all(&log_dir);
+            if let Err(e) = std::fs::create_dir_all(&log_dir) {
+                log_warn!("Cannot create log dir {}: {e}", log_dir.display());
+            }
             let ts = crate::log::filename_timestamp();
             let path = log_dir.join(format!("stderr-{ts}.log"));
             match std::fs::File::create(&path) {
@@ -354,8 +372,8 @@ impl DeployCache {
     }
 }
 
-/// Quick hash of a directory: combine dev+ino+mtime of the path itself.
-/// Changes when Proton updates (new inode or mtime on files/ dir).
+/// Quick hash of a directory's metadata: combine dev+ino+mtime of the dir entry.
+/// Detects directory replacement (new inode) or direct modification (mtime change).
 fn dir_hash(path: &Path) -> u64 {
     use std::os::unix::fs::MetadataExt;
     let meta = match std::fs::metadata(path) {
@@ -427,6 +445,8 @@ fn setup_prefix(wine_dir: &Path, pfx: &Path, wine64: &Path, self_exe: &Path) {
         cmd.args(["wineboot", "--init"]);
         cmd.env("WINEPREFIX", pfx.as_os_str());
         cmd.env("WINESERVER", self_exe.as_os_str());
+        cmd.env("WINEDEBUG", "-all");
+        cmd.env("DISPLAY", ""); // suppress GUI dialog
         match cmd.status() {
             Ok(s) if !s.success() => log_error!("wineboot --init failed with exit code {}", s.code().unwrap_or(-1)),
             Err(e) => log_error!("Failed to run wineboot: {e}"),
@@ -588,14 +608,22 @@ fn copy_dir_fast(src: &Path, dst: &Path) -> u32 {
                     true // doesn't exist at all
                 };
                 if needs_fix {
-                    std::fs::remove_file(&dst_path).ok();
+                    if let Err(e) = std::fs::remove_file(&dst_path) {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            log_warn!("Cannot remove {}: {e}", dst_path.display());
+                        }
+                    }
                     // Canonicalize resolves the relative symlink in the source tree
                     // to an absolute path pointing at the real file in Proton
                     if let Ok(real_target) = std::fs::canonicalize(&src_path) {
-                        std::os::unix::fs::symlink(&real_target, &dst_path).ok();
+                        if let Err(e) = std::os::unix::fs::symlink(&real_target, &dst_path) {
+                            log_warn!("Symlink failed {}: {e}", dst_path.display());
+                        }
                     } else if let Ok(target) = std::fs::read_link(&src_path) {
                         // Dead symlink in template — copy as-is
-                        std::os::unix::fs::symlink(&target, &dst_path).ok();
+                        if let Err(e) = std::os::unix::fs::symlink(&target, &dst_path) {
+                            log_warn!("Symlink failed {}: {e}", dst_path.display());
+                        }
                     }
                     count += 1;
                 }
@@ -696,7 +724,7 @@ fn deploy_dlls(
     deployed
 }
 
-/// Check if dst exists and matches src by size and mtime.
+/// Check if dst exists and is up-to-date relative to src (same size, dst mtime >= src mtime).
 fn file_matches(src: &Path, dst: &Path) -> bool {
     let Ok(src_meta) = std::fs::metadata(src) else { return false };
     let Ok(dst_meta) = std::fs::metadata(dst) else { return false };
@@ -751,12 +779,45 @@ fn deploy_steam_client(steam_dir: &Path, pfx: &Path) {
     }
 }
 
+/// Ensure steam.exe exists in the prefix's system32 and syswow64.
+/// Proton's prefix template includes it.
+/// Sources from Proton's Wine DLL dir if available.
+fn deploy_steam_exe(proton_dir: Option<&Path>, pfx: &Path) {
+    let sys32 = pfx.join("drive_c/windows/system32");
+    let syswow64 = pfx.join("drive_c/windows/syswow64");
+
+    for (subdir, dst_dir) in [
+        ("x86_64-windows", &sys32),
+        ("i386-windows", &syswow64),
+    ] {
+        let dst = dst_dir.join("steam.exe");
+        if dst.exists() {
+            continue;
+        }
+        // Try sourcing from Proton's Wine DLLs
+        if let Some(proton) = proton_dir {
+            let src = proton.join(format!("lib/wine/{subdir}/steam.exe"));
+            if src.exists() {
+                if let Err(e) = std::fs::create_dir_all(dst_dir) {
+                    log_warn!("Cannot create {}: {e}", dst_dir.display());
+                }
+                if let Err(e) = std::fs::copy(&src, &dst) {
+                    log_warn!("steam.exe: failed to copy to {}: {e}", dst_dir.display());
+                } else {
+                    log_info!("steam.exe: deployed to {}", dst_dir.display());
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Environment construction
 // ---------------------------------------------------------------------------
 
 fn build_env_vars(
-    wine_dir: &Path, steam_dir: &Path, pfx: &Path, self_exe: &Path,
+    wine_dir: &Path, proton_dir: Option<&Path>, steam_dir: &Path,
+    pfx: &Path, self_exe: &Path,
     dxvk: &[&str], vkd3d: &[&str], trace: bool, shader_cache_enabled: bool,
 ) -> Vec<(&'static str, String)> {
     let cur_path = std::env::var("PATH").unwrap_or_default();
@@ -766,21 +827,49 @@ fn build_env_vars(
     let wine_lib = wine_dir.join("lib");
     let wine_dll = wine_dir.join("lib/wine");
     let wine_vkd3d = wine_dir.join("lib/vkd3d");
-    let proton_native = wine_dir.join("lib/x86_64-linux-gnu");
     let steam_linux64 = steam_dir.join("linux64");
 
-    // WINEDLLPATH: vkd3d before wine (so vkd3d-proton shadows Wine's stubs)
-    let dll_path = format!("{}:{}", wine_vkd3d.display(), wine_dll.display());
+    // WINEDLLPATH: vkd3d → wine DLLs → Proton DLLs (for steam.exe bridge etc.)
+    let mut dll_parts: Vec<String> = Vec::new();
+    if wine_vkd3d.exists() {
+        dll_parts.push(wine_vkd3d.display().to_string());
+    }
+    dll_parts.push(wine_dll.display().to_string());
+    if let Some(proton) = proton_dir {
+        let proton_vkd3d = proton.join("lib/vkd3d");
+        let proton_dll = proton.join("lib/wine");
+        if proton_vkd3d.exists() {
+            dll_parts.push(proton_vkd3d.display().to_string());
+        }
+        if proton_dll.exists() && proton_dll != wine_dll {
+            dll_parts.push(proton_dll.display().to_string());
+        }
+    }
+    let dll_path = dll_parts.join(":");
 
     // LD_LIBRARY_PATH: Proton native libs + Steam client + Wine lib
     let mut ld_parts: Vec<String> = Vec::new();
-    if proton_native.exists() {
-        ld_parts.push(proton_native.display().to_string());
+    // Proton's native libs (x86_64-linux-gnu) for runtime support
+    if let Some(proton) = proton_dir {
+        let proton_native = proton.join("lib/x86_64-linux-gnu");
+        if proton_native.exists() {
+            ld_parts.push(proton_native.display().to_string());
+        }
+    }
+    let wine_native = wine_dir.join("lib/x86_64-linux-gnu");
+    if wine_native.exists() {
+        ld_parts.push(wine_native.display().to_string());
     }
     if steam_linux64.exists() {
         ld_parts.push(steam_linux64.display().to_string());
     }
     ld_parts.push(wine_lib.display().to_string());
+    if let Some(proton) = proton_dir {
+        let proton_lib = proton.join("lib");
+        if proton_lib.exists() && proton_lib != wine_lib {
+            ld_parts.push(proton_lib.display().to_string());
+        }
+    }
     if !cur_ld.is_empty() {
         ld_parts.push(cur_ld);
     }
@@ -821,21 +910,15 @@ fn build_env_vars(
         ("VKD3D_CONFIG", "shader_cache".into()),
     ];
 
-    // Sync primitive priority: ntsync > fsync > esync
-    // ntsync (Linux 6.14+): kernel-native NT sync via /dev/ntsync ioctls.
-    //   Wine's ntdll talks to /dev/ntsync directly (client-side), bypassing
-    //   the wineserver. triskelion also uses ntsync server-side for select waits.
-    // fsync/esync: Wine userspace sync that bypasses the wineserver. triskelion
-    //   rejects these with STATUS_NOT_IMPLEMENTED to force server-based sync,
-    //   so only enable them as a last resort when ntsync isn't available.
-    if Path::new("/dev/ntsync").exists() {
+    // Sync: ntsync auto-enables when /dev/ntsync exists. Our triskelion.c
+    // patches (compiled into Wine's ntdll) handle all sync ops via kernel
+    // ioctls — works with ANY Wine, including Proton.
+    // fsync/esync remain as fallback for non-ntsync operations.
+    if std::path::Path::new("/dev/ntsync").exists() {
         vars.push(("WINE_NTSYNC", "1".into()));
-        vars.push(("WINEFSYNC", "0".into()));
-        vars.push(("WINEESYNC", "0".into()));
-    } else {
-        vars.push(("WINEFSYNC", "1".into()));
-        vars.push(("WINEESYNC", "1".into()));
     }
+    vars.push(("WINEFSYNC", "1".into()));
+    vars.push(("WINEESYNC", "1".into()));
 
     // Steam Input: SDL 2.30+ reads SteamVirtualGamepadInfo to configure
     // virtual gamepads. Steam sets SteamVirtualGamepadInfo_Proton before
@@ -854,7 +937,9 @@ fn build_env_vars(
     // Shader cache optimization — opt-in via install.py prompt.
     if shader_cache_enabled {
         let shader_cache = pfx.join("shader_cache");
-        let _ = std::fs::create_dir_all(&shader_cache);
+        if let Err(e) = std::fs::create_dir_all(&shader_cache) {
+            log_warn!("Cannot create shader cache dir: {e}");
+        }
         let shader_cache_str = shader_cache.display().to_string();
 
         // DXVK: compiled SPIR-V cache (DXBC/DXSO → SPIR-V translation results)
@@ -912,7 +997,7 @@ fn parse_env_config(self_exe: &Path) -> Vec<(String, String)> {
             continue;
         }
         let Some(eq_pos) = line.find('=') else {
-            eprintln!("[amphetamine] env_config: ignoring malformed line: {line}");
+            log_warn!("env_config: ignoring malformed line: {line}");
             continue;
         };
         let key = line[..eq_pos].trim();
@@ -924,7 +1009,7 @@ fn parse_env_config(self_exe: &Path) -> Vec<(String, String)> {
     }
 
     if !vars.is_empty() {
-        eprintln!("[amphetamine] env_config: loaded {} custom variable(s)", vars.len());
+        log_info!("env_config: loaded {} custom variable(s)", vars.len());
     }
 
     vars
@@ -1048,25 +1133,45 @@ fn write_launch_prom(
 // Discovery
 // ---------------------------------------------------------------------------
 
+/// Check if a Wine directory has a usable Wine binary.
+/// Wine 10.0+ unified to just "wine"; older builds use "wine64".
+fn has_wine_bin(dir: &Path) -> bool {
+    dir.join("bin/wine64").exists() || dir.join("bin/wine").exists()
+}
+
+/// Get the Wine binary path from a Wine directory.
+/// Prefers wine64 (Proton/older) then wine (Wine 10.0+).
+fn wine_binary(dir: &Path) -> PathBuf {
+    let w64 = dir.join("bin/wine64");
+    if w64.exists() { w64 } else { dir.join("bin/wine") }
+}
+
 /// Find Wine binaries. Priority:
 /// 1. TRISKELION_WINE_DIR env var (explicit override)
-/// 2. Proton Experimental (Steam-installed, has everything)
-/// 3. Any Proton version
-/// 4. System Wine
+/// 2. amphetamine local build (~/.local/share/amphetamine/wine-build/) — ntsync + triskelion patches, ABI-safe
+/// 3. Proton Experimental (Steam-installed, battle-tested with triskelion)
+/// 4. Any Proton version
+/// 5. System Wine (fallback)
 fn find_wine() -> PathBuf {
     if let Ok(dir) = std::env::var("TRISKELION_WINE_DIR") {
         let p = PathBuf::from(dir);
-        if p.join("bin/wine64").exists() {
+        if has_wine_bin(&p) {
             return p;
         }
     }
 
     let home = std::env::var("HOME").unwrap_or_default();
 
+    // amphetamine locally-built Wine (ntsync + triskelion patches, ABI-safe)
+    let local_build = PathBuf::from(&home).join(".local/share/amphetamine/wine-build");
+    if has_wine_bin(&local_build) {
+        return local_build;
+    }
+
     // Proton Experimental
     let proton_exp = PathBuf::from(&home)
         .join(".steam/root/steamapps/common/Proton - Experimental/files");
-    if proton_exp.join("bin/wine64").exists() {
+    if has_wine_bin(&proton_exp) {
         return proton_exp;
     }
 
@@ -1077,19 +1182,49 @@ fn find_wine() -> PathBuf {
             let name = entry.file_name().to_string_lossy().to_string();
             if name.starts_with("Proton") {
                 let files = entry.path().join("files");
-                if files.join("bin/wine64").exists() {
+                if has_wine_bin(&files) {
                     return files;
                 }
             }
         }
     }
 
-    // System Wine
-    if Path::new("/usr/bin/wine64").exists() {
+    // System Wine (fallback)
+    if has_wine_bin(&PathBuf::from("/usr")) {
         return PathBuf::from("/usr");
     }
 
     PathBuf::from("/nonexistent/wine")
+}
+
+/// Find Proton's files directory for DXVK/VKD3D/steam client sourcing.
+/// When using system Wine, we still need Proton's tree
+/// for DXVK, VKD3D-Proton, and Steam client bridge DLLs.
+fn find_proton_files() -> Option<PathBuf> {
+    let home = std::env::var("HOME").unwrap_or_default();
+
+    // Proton Experimental
+    let proton_exp = PathBuf::from(&home)
+        .join(".steam/root/steamapps/common/Proton - Experimental/files");
+    if proton_exp.join("lib/wine").exists() {
+        return Some(proton_exp);
+    }
+
+    // Any Proton version
+    let common = PathBuf::from(&home).join(".steam/root/steamapps/common");
+    if let Ok(entries) = std::fs::read_dir(&common) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("Proton") {
+                let files = entry.path().join("files");
+                if files.join("lib/wine").exists() {
+                    return Some(files);
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// Find Steam installation directory.
@@ -1148,7 +1283,11 @@ fn snapshot_save_data(pfx: &Path) -> Option<PathBuf> {
     let backup_dir = pfx.parent()?.join("save_backup");
 
     // Remove old backup — we only keep the latest snapshot
-    let _ = std::fs::remove_dir_all(&backup_dir);
+    if backup_dir.exists() {
+        if let Err(e) = std::fs::remove_dir_all(&backup_dir) {
+            log_warn!("save backup: cannot remove old backup: {e}");
+        }
+    }
 
     let mut total_files = 0u32;
     let mut total_bytes = 0u64;
@@ -1198,7 +1337,9 @@ fn snapshot_save_data(pfx: &Path) -> Option<PathBuf> {
 
     // Write manifest for diagnostics
     let manifest = format!("{total_files} files, {total_bytes} bytes\n");
-    let _ = std::fs::write(backup_dir.join("manifest.txt"), manifest);
+    if let Err(e) = std::fs::write(backup_dir.join("manifest.txt"), manifest) {
+        log_warn!("save backup: cannot write manifest: {e}");
+    }
 
     log_info!("save data snapshot: {total_files} files, {total_bytes} bytes");
 
@@ -1247,7 +1388,9 @@ fn restore_save_data(pfx: &Path, backup_dir: &Path) {
         log_warn!("{restored} save files were missing after game exit — restored from backup");
     } else {
         // All good — clean up backup
-        let _ = std::fs::remove_dir_all(backup_dir);
+        if let Err(e) = std::fs::remove_dir_all(backup_dir) {
+            log_warn!("save backup: cleanup failed: {e}");
+        }
     }
 }
 
@@ -1275,10 +1418,13 @@ fn restore_missing_files(backup: &Path, original: &Path) -> (u32, u32) {
             } else {
                 // File existed pre-launch but is now gone — restore it
                 if let Some(parent) = original_file.parent() {
-                    let _ = std::fs::create_dir_all(parent);
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        log_warn!("save restore: cannot create dir {}: {e}", parent.display());
+                    }
                 }
-                if std::fs::copy(&backup_file, &original_file).is_ok() {
-                    restored += 1;
+                match std::fs::copy(&backup_file, &original_file) {
+                    Ok(_) => restored += 1,
+                    Err(e) => log_warn!("save restore: failed to restore {}: {e}", original_file.display()),
                 }
             }
         }
@@ -1345,7 +1491,10 @@ fn count_save_data_stats(pfx: &Path) -> (u32, u64) {
 /// Recursive copy for save data (actual copies, not hardlinks).
 /// Save data is small (KB to low MB) so std::fs::copy is fine.
 fn copy_save_recursive(src: &Path, dst: &Path) {
-    let _ = std::fs::create_dir_all(dst);
+    if let Err(e) = std::fs::create_dir_all(dst) {
+        log_warn!("save backup: cannot create dir {}: {e}", dst.display());
+        return;
+    }
 
     let entries = match std::fs::read_dir(src) {
         Ok(e) => e,
@@ -1358,8 +1507,8 @@ fn copy_save_recursive(src: &Path, dst: &Path) {
 
         if src_path.is_dir() {
             copy_save_recursive(&src_path, &dst_path);
-        } else {
-            let _ = std::fs::copy(&src_path, &dst_path);
+        } else if let Err(e) = std::fs::copy(&src_path, &dst_path) {
+            log_warn!("save backup: failed to copy {}: {e}", src_path.display());
         }
     }
 }

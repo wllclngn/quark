@@ -160,9 +160,6 @@ impl Registry {
         Some((name_bytes, val.data_type, val.data.as_slice()))
     }
 
-    pub fn close_key(&mut self, hkey: u32) {
-        self.open_keys.remove(&hkey);
-    }
 }
 
 // Parse a UTF-16LE key path (e.g. "\Registry\Machine\Software") into segments.

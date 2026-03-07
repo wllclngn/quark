@@ -19,7 +19,6 @@ const NTSYNC_IOC_WAIT_ANY:     u64 = 0xC0284E82; // _IOWR('N', 0x82, 40)
 const NTSYNC_IOC_WAIT_ALL:     u64 = 0xC0284E83; // _IOWR('N', 0x83, 40)
 const NTSYNC_IOC_CREATE_MUTEX: u64 = 0x40084E84; // _IOW ('N', 0x84, 8)
 const NTSYNC_IOC_MUTEX_UNLOCK: u64 = 0xC0084E85; // _IOWR('N', 0x85, 8)
-const NTSYNC_IOC_MUTEX_KILL:   u64 = 0x40044E86; // _IOW ('N', 0x86, 4)
 const NTSYNC_IOC_CREATE_EVENT: u64 = 0x40084E87; // _IOW ('N', 0x87, 8)
 const NTSYNC_IOC_EVENT_SET:    u64 = 0x80044E88; // _IOR ('N', 0x88, 4)
 const NTSYNC_IOC_EVENT_RESET:  u64 = 0x80044E89; // _IOR ('N', 0x89, 4)
@@ -62,7 +61,7 @@ struct NtsyncWaitArgs {
 pub enum WaitResult {
     Signaled(u32),  // index of signaled object
     Timeout,
-    Error(i32),     // errno
+    Error,
 }
 
 /// A single ntsync kernel object (semaphore, mutex, or event).
@@ -117,15 +116,6 @@ impl NtsyncObj {
         if ret < 0 { Err(errno()) } else { Ok(prev) }
     }
 
-    /// Mark a mutex owner as dead (abandoned).
-    pub fn mutex_kill(&self, owner: u32) -> Result<(), i32> {
-        let mut val = owner;
-        let ret = unsafe {
-            libc::ioctl(self.fd, NTSYNC_IOC_MUTEX_KILL, &mut val as *mut u32)
-        };
-        if ret < 0 { Err(errno()) } else { Ok(()) }
-    }
-
     pub fn fd(&self) -> RawFd { self.fd }
 }
 
@@ -141,8 +131,6 @@ pub struct NtsyncDevice {
 }
 
 impl NtsyncDevice {
-    pub fn fd(&self) -> RawFd { self.fd }
-
     /// Try to open /dev/ntsync. Returns None if device doesn't exist.
     pub fn open() -> Option<Self> {
         let path = b"/dev/ntsync\0";
@@ -217,11 +205,10 @@ impl NtsyncDevice {
         if ret == 0 {
             WaitResult::Signaled(args.index)
         } else {
-            let e = errno();
-            if e == libc::ETIMEDOUT {
+            if errno() == libc::ETIMEDOUT {
                 WaitResult::Timeout
             } else {
-                WaitResult::Error(e)
+                WaitResult::Error
             }
         }
     }

@@ -136,7 +136,9 @@ fn main() {
             fs::write(&out_path, &generated).expect("Failed to write generated protocol");
 
             // Update fallback for future builds without Wine source
-            fs::write(&fallback_path, &generated).ok();
+            if let Err(e) = fs::write(&fallback_path, &generated) {
+                println!("cargo:warning=Cannot update fallback file: {e}");
+            }
 
             // Re-run if sources change
             let protocol_def = wine_root.join("server").join("protocol.def");
@@ -164,9 +166,6 @@ fn main() {
             }
         }
     }
-
-    // Declare custom cfg so rustc doesn't warn about unknown condition
-    println!("cargo::rustc-check-cfg=cfg(has_cachyos_ntsync)");
 
     // Re-run if these change
     println!("cargo:rerun-if-env-changed=WINE_SRC");
@@ -254,13 +253,6 @@ fn generate_from_wine_src(wine_root: &Path) -> String {
     } else {
         vec![]
     };
-
-    // Auto-detect CachyOS ntsync protocol extensions
-    let has_cachyos = requests.iter().any(|r| r.name == "get_linux_sync_device");
-    if has_cachyos {
-        println!("cargo:rustc-cfg=has_cachyos_ntsync");
-        println!("cargo:warning=  CachyOS ntsync protocol opcodes detected — enabling client-side ntsync support");
-    }
 
     // 1. RequestCode enum + from_i32() + as_str()
     let variants: Vec<(String, i32)> = requests.iter().map(|r| (r.name.clone(), r.index)).collect();
@@ -426,12 +418,7 @@ fn parse_field(line: &str, types: &HashMap<&str, (&str, usize, usize)>) -> Optio
             let remainder = parts[1].trim();
             // Check if the second word is part of the type
             let candidate = format!("unsigned {second}");
-            if types.contains_key(candidate.as_str()) {
-                (candidate, remainder.to_string())
-            } else {
-                // Maybe "unsigned int" where remainder is the name
-                (candidate, remainder.to_string())
-            }
+            (candidate, remainder.to_string())
         } else {
             return None;
         }

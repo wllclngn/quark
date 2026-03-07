@@ -7,8 +7,7 @@
 //
 // Design:
 //   - Per-process handle tables (no global lock for same-process lookups)
-//   - Handles are 32-bit indices with generation counters for ABA safety
-//   - Window objects tracked by user_handle_t (separate namespace)
+//   - Handles are 32-bit indices shifted left by 2 (low bits reserved)
 //   - Thread state indexed by thread_id_t
 //   - Thread queues live in shared memory (managed by ShmManager),
 //     not owned by Thread
@@ -16,18 +15,12 @@
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
 use crate::protocol::*;
-use crate::sync::SyncObject;
 
-// Handle entry in a per-process table
 pub struct HandleEntry {
     pub object_id: object_id_t,
-    pub access: u32,
-    pub flags: u32,
 }
 
-// Per-process state
 pub struct Process {
-    pub pid: process_id_t,
     pub handles: HandleTable,
     pub threads: Vec<thread_id_t>,
     pub startup_info: Option<Vec<u8>>,  // raw VARARG bytes (startup_info + env)
@@ -40,9 +33,8 @@ pub struct Process {
 }
 
 impl Process {
-    pub fn new(pid: process_id_t) -> Self {
+    pub fn new(_pid: process_id_t) -> Self {
         Self {
-            pid,
             handles: HandleTable::new(),
             threads: Vec::new(),
             startup_info: None,
@@ -64,15 +56,12 @@ pub struct ProcessInfoHandle {
 // Per-thread state.
 // The message queue lives in shared memory (ShmManager), not here.
 pub struct Thread {
-    pub tid: thread_id_t,
     pub pid: process_id_t,
-    pub client_fd: i32,
-    pub shm_slot: u32,
 }
 
 impl Thread {
-    pub fn new(tid: thread_id_t, pid: process_id_t, client_fd: i32, shm_slot: u32) -> Self {
-        Self { tid, pid, client_fd, shm_slot }
+    pub fn new(pid: process_id_t) -> Self {
+        Self { pid }
     }
 }
 
@@ -94,7 +83,7 @@ impl HandleTable {
         }
     }
 
-    pub fn allocate(&mut self, object_id: object_id_t, access: u32) -> obj_handle_t {
+    pub fn allocate(&mut self, object_id: object_id_t) -> obj_handle_t {
         let idx = if let Some(idx) = self.free_list.pop() {
             idx
         } else {
@@ -106,11 +95,7 @@ impl HandleTable {
             idx
         };
 
-        self.entries[idx as usize] = Some(HandleEntry {
-            object_id,
-            access,
-            flags: 0,
-        });
+        self.entries[idx as usize] = Some(HandleEntry { object_id });
 
         // Windows handles are index * 4 (low 2 bits reserved)
         idx << 2
@@ -134,26 +119,15 @@ impl HandleTable {
         self.entries.get(idx).and_then(|e| e.as_ref())
     }
 
-    pub fn set_info(&mut self, handle: obj_handle_t, flags: u32) -> bool {
-        let idx = (handle >> 2) as usize;
-        if let Some(Some(entry)) = self.entries.get_mut(idx) {
-            entry.flags = flags;
-            true
-        } else {
-            false
-        }
-    }
 }
 
 // Global server state
 pub struct ServerState {
     pub processes: HashMap<process_id_t, Process>,
     pub threads: HashMap<thread_id_t, Thread>,
-    pub sync_objects: HashMap<obj_handle_t, SyncObject>,
     pub process_info_handles: HashMap<u32, ProcessInfoHandle>,
     next_pid: process_id_t,
     next_tid: thread_id_t,
-    next_object_id: object_id_t,
     next_info_handle: u32,
 }
 
@@ -162,11 +136,9 @@ impl ServerState {
         Self {
             processes: HashMap::new(),
             threads: HashMap::new(),
-            sync_objects: HashMap::new(),
             process_info_handles: HashMap::new(),
             next_pid: 1,
             next_tid: 1,
-            next_object_id: 1,
             next_info_handle: 1,
         }
     }
@@ -185,19 +157,14 @@ impl ServerState {
         pid
     }
 
-    pub fn create_thread(&mut self, pid: process_id_t, client_fd: i32, shm_slot: u32) -> thread_id_t {
+    pub fn create_thread(&mut self, pid: process_id_t) -> thread_id_t {
         let tid = self.next_tid;
         self.next_tid += 1;
-        self.threads.insert(tid, Thread::new(tid, pid, client_fd, shm_slot));
+        self.threads.insert(tid, Thread::new(pid));
         if let Some(process) = self.processes.get_mut(&pid) {
             process.threads.push(tid);
         }
         tid
     }
 
-    pub fn alloc_object_id(&mut self) -> object_id_t {
-        let id = self.next_object_id;
-        self.next_object_id += 1;
-        id
-    }
 }

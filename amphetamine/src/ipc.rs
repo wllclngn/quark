@@ -1,7 +1,7 @@
 // Client IPC -- Unix domain socket listener and per-client connection state
 //
 // Wine clients (ntdll/unix/server.c) connect via a Unix domain socket at
-// $WINEPREFIX/server-<hostname>-<hash>/socket. Each connection is a
+// /tmp/.wine-<uid>/server-<dev>-<ino>/socket. Each connection is a
 // Wine thread. Messages are fixed-size request/reply pairs.
 
 use std::collections::VecDeque;
@@ -21,7 +21,10 @@ impl Listener {
     pub fn accept(&self) -> Option<Client> {
         match self.inner.accept() {
             Ok((stream, _)) => {
-                stream.set_nonblocking(true).ok();
+                if let Err(e) = stream.set_nonblocking(true) {
+                    eprintln!("[triskelion] set_nonblocking failed: {e}");
+                    return None;
+                }
                 Some(Client::new(stream.into_raw_fd()))
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => None,
@@ -148,45 +151,6 @@ impl Client {
         let total = HEADER_SIZE + request_size;
         out.clear();
         out.extend(self.recv_buf.drain(..total));
-    }
-
-    // Send an fd to the client via SCM_RIGHTS on the wait_fd channel.
-    // Wine's receive_fd() expects: data = obj_handle_t (4 bytes), ancillary = fd.
-    pub fn send_fd(&self, fd: RawFd, handle: u32) -> bool {
-        let wait_fd = match self.wait_fd {
-            Some(wfd) => wfd,
-            None => return false,
-        };
-
-        let handle_bytes = handle.to_le_bytes();
-        let mut iov = libc::iovec {
-            iov_base: handle_bytes.as_ptr() as *mut _,
-            iov_len: handle_bytes.len(),
-        };
-
-        let cmsg_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
-        let mut cmsg_buf = vec![0u8; cmsg_space];
-
-        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1;
-        msg.msg_control = cmsg_buf.as_mut_ptr() as *mut _;
-        msg.msg_controllen = cmsg_space as _;
-
-        unsafe {
-            let cmsg = libc::CMSG_FIRSTHDR(&msg);
-            (*cmsg).cmsg_level = libc::SOL_SOCKET;
-            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-            (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as _;
-            std::ptr::copy_nonoverlapping(
-                &fd as *const RawFd as *const u8,
-                libc::CMSG_DATA(cmsg),
-                std::mem::size_of::<RawFd>(),
-            );
-
-            let n = libc::sendmsg(wait_fd, &msg, 0);
-            n > 0
-        }
     }
 
     // Write a reply to the client socket.

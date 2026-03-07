@@ -128,16 +128,6 @@ impl ShmManager {
         })
     }
 
-    // Get the shm file name (for clients to open).
-    pub fn shm_name(&self) -> &str {
-        &self.shm_name
-    }
-
-    // Get the slot index for a thread.
-    pub fn get_slot(&self, tid: thread_id_t) -> Option<u32> {
-        self.slot_map.get(&tid).copied()
-    }
-
     fn header(&self) -> &ShmHeader {
         unsafe { &*(self.base as *const ShmHeader) }
     }

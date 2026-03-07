@@ -14,11 +14,33 @@ RUST_DIR = SCRIPT_DIR / "amphetamine"
 PATCHES_DIR = SCRIPT_DIR / "patches" / "wine"
 
 WINE_SRC_DIR = Path.home() / ".local" / "share" / "amphetamine" / "wine-src"
+WINE_OBJ_DIR = Path.home() / ".local" / "share" / "amphetamine" / "wine-obj"
+WINE_BUILD_DIR = Path.home() / ".local" / "share" / "amphetamine" / "wine-build"
 STEAM_COMPAT_DIR = Path.home() / ".local" / "share" / "Steam" / "compatibilitytools.d" / "amphetamine"
 WINE_CLONE_URL = "https://github.com/ValveSoftware/wine.git"
 WINE_CLONE_BRANCH = "proton_10.0"
 
-CACHYOS_WINE_URL = "https://github.com/CachyOS/wine-cachyos.git"
+# Essential build deps for Wine on Arch-based systems.
+# WoW64 mode (--enable-archs=x86_64,i386) uses mingw for 32-bit PE DLLs,
+# so lib32 system packages are NOT required.
+WINE_BUILD_DEPS_ARCH = [
+    # Build tools
+    "base-devel", "mingw-w64-gcc", "autoconf", "bison", "flex", "perl",
+    # Graphics / display
+    "freetype2", "fontconfig", "vulkan-headers", "vulkan-icd-loader",
+    "libx11", "libxext", "libxrandr", "libxinerama", "libxcursor",
+    "libxcomposite", "libxi", "libxxf86vm",
+    "wayland", "wayland-protocols",
+    # Audio
+    "alsa-lib", "libpulse",
+    "gst-plugins-base-libs",
+    # Networking / crypto
+    "gnutls",
+    # Input
+    "sdl2",
+    # Other
+    "libusb", "v4l-utils",
+]
 
 
 def get_version():
@@ -84,18 +106,38 @@ ENV_CONFIG_TEMPLATE = """\
 #
 # --- Sync ---
 # WINE_NTSYNC=1
+# PROTON_NO_FSYNC=1
+# WINEFSYNC_SPINCOUNT=100
 #
 # --- Overlays ---
 # MANGOHUD=1
 # MANGOHUD_CONFIG=fps,frametime,gpu_temp,cpu_temp
+# DXVK_HUD=fps
+#
+# --- Frame rate ---
+# DXVK_FRAME_RATE=0
+#
+# --- Upscaling ---
+# WINE_FULLSCREEN_FSR=1
+# WINE_FULLSCREEN_FSR_STRENGTH=2
 #
 # --- Performance ---
 # DXVK_ASYNC=1
 # mesa_glthread=true
 # RADV_PERFTEST=gpl
+# STAGING_SHARED_MEMORY=1
+# __GL_THREADED_OPTIMIZATIONS=1
 #
-# --- Game-specific ---
+# --- CPU topology ---
+# WINE_CPU_TOPOLOGY=8:0,1,2,3,4,5,6,7
+#
+# --- NVIDIA (DLSS, Reflex, NVAPI) ---
 # PROTON_ENABLE_NVAPI=1
+# DXVK_ENABLE_NVAPI=dxgi
+# PROTON_HIDE_NVIDIA_GPU=0
+#
+# --- Gamescope ---
+# ENABLE_GAMESCOPE_WSI=1
 """
 
 
@@ -172,95 +214,10 @@ def build_triskelion():
     return 0
 
 
-def detect_cachyos_wine():
-    """Detect if CachyOS Proton/Wine is installed."""
-    # Check common CachyOS Proton installation paths
-    cachyos_paths = [
-        Path("/usr/share/steam/compatibilitytools.d/proton-cachyos"),
-        Path.home() / ".steam" / "root" / "compatibilitytools.d" / "proton-cachyos",
-        Path.home() / ".local" / "share" / "Steam" / "compatibilitytools.d" / "proton-cachyos",
-    ]
-    for p in cachyos_paths:
-        if p.exists():
-            log("INFO", f"CachyOS Wine detected: {p}")
-            return True
-
-    # Check via pacman (CachyOS is Arch-based)
-    try:
-        ret = subprocess.run(
-            ["pacman", "-Q", "proton-cachyos"],
-            capture_output=True, text=True
-        )
-        if ret.returncode == 0:
-            log("INFO", f"CachyOS Wine detected: {ret.stdout.strip()}")
-            return True
-    except FileNotFoundError:
-        pass
-
-    return False
-
-
-def get_cachyos_latest_branch():
-    """Find the latest cachyos_10.0_*/main branch from remote."""
-    try:
-        result = subprocess.run(
-            ["git", "ls-remote", "--heads", CACHYOS_WINE_URL],
-            capture_output=True, text=True, timeout=30
-        )
-        if result.returncode != 0:
-            return None
-
-        branches = []
-        for line in result.stdout.splitlines():
-            ref = line.split("\t")[1] if "\t" in line else ""
-            ref = ref.replace("refs/heads/", "")
-            if ref.startswith("cachyos_10.0_") and ref.endswith("/main"):
-                branches.append(ref)
-
-        if branches:
-            branches.sort()
-            return branches[-1]  # Latest by date
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
-    return None
-
-
-def clone_wine(use_cachyos=False):
-    # Check if existing source matches desired type
-    marker = WINE_SRC_DIR / ".amphetamine_source"
+def clone_wine():
     if (WINE_SRC_DIR / "dlls").exists():
-        current_source = marker.read_text().strip() if marker.exists() else "valve"
-        if use_cachyos and current_source != "cachyos":
-            log("INFO", "Switching wine source from Valve to CachyOS...")
-            shutil.rmtree(WINE_SRC_DIR)
-        elif not use_cachyos and current_source == "cachyos":
-            log("INFO", "Switching wine source from CachyOS to Valve...")
-            shutil.rmtree(WINE_SRC_DIR)
-        else:
-            log("INFO", f"Wine source exists: {WINE_SRC_DIR} ({current_source})")
-            return
-
-    if use_cachyos:
-        branch = get_cachyos_latest_branch()
-        if not branch:
-            log("WARN", "Could not find CachyOS Wine branch, falling back to Valve Wine")
-            use_cachyos = False
-        else:
-            log("INFO", f"Cloning CachyOS Wine ({branch}) to {WINE_SRC_DIR}")
-            WINE_SRC_DIR.parent.mkdir(parents=True, exist_ok=True)
-            ret = subprocess.run([
-                "git", "clone", "--depth", "1", "-b", branch,
-                CACHYOS_WINE_URL, str(WINE_SRC_DIR),
-            ]).returncode
-            if ret != 0:
-                log("ERROR", "CachyOS Wine clone failed, falling back to Valve Wine")
-                if WINE_SRC_DIR.exists():
-                    shutil.rmtree(WINE_SRC_DIR)
-                use_cachyos = False
-            else:
-                marker.write_text("cachyos")
-                log("INFO", "CachyOS Wine clone complete")
-                return
+        log("INFO", f"Wine source exists: {WINE_SRC_DIR}")
+        return
 
     log("INFO", f"Cloning Valve Wine ({WINE_CLONE_BRANCH}) to {WINE_SRC_DIR}")
     WINE_SRC_DIR.parent.mkdir(parents=True, exist_ok=True)
@@ -271,7 +228,6 @@ def clone_wine(use_cachyos=False):
     if ret != 0:
         log("ERROR", "git clone failed (GitHub may be down, retry later)")
         return
-    marker.write_text("valve")
     log("INFO", "Clone complete")
 
 
@@ -303,31 +259,63 @@ def patch_makefile_in():
 def patch_server_c():
     path = WINE_SRC_DIR / "dlls" / "ntdll" / "unix" / "server.c"
     text = path.read_text()
-    if "triskelion_try_bypass" in text:
+    patched = False
+
+    # Pre-hook: triskelion_try_bypass before server call
+    if "triskelion_try_bypass" not in text:
+        anchor = '    FTRACE_BLOCK_START("req %s", req->name)'
+        if anchor not in text:
+            log("ERROR", f"Anchor not found in {path}: {anchor!r}")
+            sys.exit(1)
+        text = text.replace(anchor, SERVER_BYPASS + anchor)
+        patched = True
+
+    # Post-hook: triskelion_post_call after server call (ntsync shadow creation)
+    if "triskelion_post_call" not in text:
+        # Insert before the final "return ret;" in server_call_unlocked
+        post_anchor = "    FTRACE_BLOCK_END()\n    return ret;\n}"
+        if post_anchor not in text:
+            log("ERROR", f"Anchor not found in {path}: FTRACE_BLOCK_END return")
+            sys.exit(1)
+        text = text.replace(post_anchor,
+            "    FTRACE_BLOCK_END()\n"
+            "    /* triskelion: shadow newly created sync objects with ntsync */\n"
+            "    triskelion_post_call( req_ptr, ret );\n"
+            "    return ret;\n}")
+        patched = True
+
+    if patched:
+        path.write_text(text)
+        log("INFO", "Patched server.c: triskelion_try_bypass + triskelion_post_call")
+    else:
         log("INFO", "server.c already patched")
-        return
-    anchor = '    FTRACE_BLOCK_START("req %s", req->name)'
-    if anchor not in text:
-        log("ERROR", f"Anchor not found in {path}: {anchor!r}")
-        sys.exit(1)
-    text = text.replace(anchor, SERVER_BYPASS + anchor)
-    path.write_text(text)
-    log("INFO", "Patched server.c: added triskelion_try_bypass call")
 
 
 def patch_unix_private_h():
     path = WINE_SRC_DIR / "dlls" / "ntdll" / "unix" / "unix_private.h"
     text = path.read_text()
-    if "triskelion_try_bypass" in text:
+    patched = False
+
+    if "triskelion_try_bypass" not in text:
+        anchor = "extern unsigned int server_call_unlocked( void *req_ptr );"
+        if anchor not in text:
+            log("ERROR", f"Anchor not found in {path}: {anchor!r}")
+            sys.exit(1)
+        text = text.replace(anchor, anchor +
+            "\nextern unsigned int triskelion_try_bypass( void *req_ptr );")
+        patched = True
+
+    if "triskelion_post_call" not in text:
+        anchor2 = "extern unsigned int triskelion_try_bypass( void *req_ptr );"
+        text = text.replace(anchor2, anchor2 +
+            "\nextern void triskelion_post_call( void *req_ptr, unsigned int ret );")
+        patched = True
+
+    if patched:
+        path.write_text(text)
+        log("INFO", "Patched unix_private.h: triskelion declarations")
+    else:
         log("INFO", "unix_private.h already patched")
-        return
-    anchor = "extern unsigned int server_call_unlocked( void *req_ptr );"
-    if anchor not in text:
-        log("ERROR", f"Anchor not found in {path}: {anchor!r}")
-        sys.exit(1)
-    text = text.replace(anchor, anchor + "\nextern unsigned int triskelion_try_bypass( void *req_ptr );")
-    path.write_text(text)
-    log("INFO", "Patched unix_private.h: added triskelion_try_bypass declaration")
 
 
 def patch_win32u_message():
@@ -345,16 +333,8 @@ def patch_win32u_message():
     text = text.replace(func_anchor, func_anchor + WIN32U_FUNCTION)
 
     # Modification B: prepend triskelion check to peek_message condition
-    # Valve Wine:  "if (!filter->waited && NtGetTickCount() ..."
-    # CachyOS Wine: "if ((using_server_or_ntsync() || !filter->waited) && NtGetTickCount() ..."
-    valve_anchor = "!filter->waited && NtGetTickCount() - thread_info->last_getmsg_time < 3000"
-    cachyos_anchor = "(using_server_or_ntsync() || !filter->waited) && NtGetTickCount() - thread_info->last_getmsg_time < 3000"
-
-    if cachyos_anchor in text:
-        original_condition = cachyos_anchor
-    elif valve_anchor in text:
-        original_condition = valve_anchor
-    else:
+    original_condition = "!filter->waited && NtGetTickCount() - thread_info->last_getmsg_time < 3000"
+    if original_condition not in text:
         log("ERROR", f"Anchor not found in {path}: peek_message condition")
         sys.exit(1)
 
@@ -370,10 +350,15 @@ def configure_shader_cache():
     """Ask the user whether to enable per-game Vulkan shader cache optimization."""
     flag = STEAM_COMPAT_DIR / "shader_cache_enabled"
 
+    if flag.exists():
+        log("INFO", "Shader cache optimization: enabled (use install.py to reconfigure)")
+        return
+
     print()
     print("  Shader cache optimization: amphetamine can configure per-game Vulkan")
-    print("  shader caches (10 GB, organized per-prefix). This prevents compiled")
-    print("  shaders from being evicted between sessions and reduces stutter.")
+    print("  shader caches (organized per-prefix, 10 GB cap — actual usage is")
+    print("  typically 50-500 MB per game). This prevents compiled shaders from")
+    print("  being evicted between sessions and reduces stutter.")
     print()
     print("  If you already manage shader cache settings yourself, say no.")
     print()
@@ -413,13 +398,124 @@ def configure_custom_env():
 
 
 def check_ntsync():
-    """Check if the kernel supports ntsync and inform the user."""
-    ntsync_available = Path("/dev/ntsync").exists()
-    if ntsync_available:
-        log("INFO", "ntsync: /dev/ntsync available (kernel-native NT sync)")
+    """Check if the kernel supports ntsync."""
+    if Path("/dev/ntsync").exists():
+        log("INFO", "ntsync: /dev/ntsync available — kernel-native NT sync enabled")
+        log("INFO", "  triskelion.c patches handle ntsync via ioctls (no external deps)")
     else:
-        log("INFO", "ntsync: not available (using CAS + futex fallback)")
-        log("INFO", "ntsync requires Linux 6.14+. Sync will work fine without it.")
+        log("INFO", "ntsync: not available (using fsync fallback)")
+        log("INFO", "  ntsync requires Linux 6.14+. Sync works fine without it.")
+
+
+def install_wine_build_deps():
+    """Install Wine build dependencies via pacman (Arch-based only)."""
+    try:
+        subprocess.run(["pacman", "--version"], capture_output=True)
+    except FileNotFoundError:
+        log("ERROR", "pacman not found — Wine build currently requires Arch-based system")
+        log("INFO", "Install Wine build deps manually, then re-run with --build-wine")
+        return False
+
+    missing = []
+    for pkg in WINE_BUILD_DEPS_ARCH:
+        ret = subprocess.run(["pacman", "-Q", pkg], capture_output=True, text=True)
+        if ret.returncode != 0:
+            missing.append(pkg)
+
+    if not missing:
+        log("INFO", "Wine build deps: all installed")
+        return True
+
+    log("INFO", f"Wine build deps: {len(missing)} packages needed")
+    for pkg in missing:
+        print(f"    {pkg}")
+
+    if not prompt_yn(f"\n  Install {len(missing)} packages via pacman?"):
+        log("WARN", "Wine build cancelled — missing dependencies")
+        return False
+
+    ret = subprocess.run(
+        ["sudo", "pacman", "-S", "--needed", "--noconfirm"] + missing,
+    ).returncode
+    if ret != 0:
+        log("ERROR", "Failed to install dependencies")
+        return False
+
+    log("INFO", "Wine build deps installed")
+    return True
+
+
+def build_wine():
+    """Configure, build, and install Wine from patched source.
+    Produces a locally-built Wine at ~/.local/share/amphetamine/wine-build/
+    with ntsync + triskelion patches baked in. ABI-safe because everything
+    is compiled on the user's machine with their toolchain."""
+    if not (WINE_SRC_DIR / "configure.ac").exists():
+        log("ERROR", f"Wine source not found at {WINE_SRC_DIR}")
+        return False
+
+    # Check if already built
+    wine_bin = WINE_BUILD_DIR / "bin" / "wine"
+    wine64_bin = WINE_BUILD_DIR / "bin" / "wine64"
+    if wine_bin.exists() or wine64_bin.exists():
+        log("INFO", f"Wine already built: {WINE_BUILD_DIR}")
+        if not prompt_yn("  Rebuild Wine from source?"):
+            return True
+
+    if not install_wine_build_deps():
+        return False
+
+    # Generate configure script if not present
+    configure = WINE_SRC_DIR / "configure"
+    if not configure.exists():
+        log("INFO", "Generating configure script...")
+        ret = subprocess.run(["autoreconf", "-fi"], cwd=WINE_SRC_DIR).returncode
+        if ret != 0:
+            log("ERROR", "autoreconf failed")
+            return False
+
+    # Out-of-tree build
+    WINE_OBJ_DIR.mkdir(parents=True, exist_ok=True)
+    WINE_BUILD_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Configure
+    log("INFO", "Configuring Wine...")
+    configure_cmd = [
+        str(configure),
+        f"--prefix={WINE_BUILD_DIR}",
+        "--enable-archs=x86_64,i386",
+        "--with-wayland",
+        "--with-vulkan",
+        "--with-gstreamer",
+        "--with-pulse",
+        "--with-alsa",
+        "--without-oss",
+        "--disable-tests",
+    ]
+    ret = subprocess.run(configure_cmd, cwd=WINE_OBJ_DIR).returncode
+    if ret != 0:
+        log("ERROR", "Wine configure failed — check output above for missing deps")
+        return False
+
+    # Build
+    import multiprocessing
+    jobs = multiprocessing.cpu_count()
+    log("INFO", f"Building Wine with {jobs} threads...")
+    ret = subprocess.run(["make", f"-j{jobs}"], cwd=WINE_OBJ_DIR).returncode
+    if ret != 0:
+        log("ERROR", "Wine build failed")
+        return False
+
+    # Install
+    log("INFO", f"Installing Wine to {WINE_BUILD_DIR}...")
+    ret = subprocess.run(["make", "install"], cwd=WINE_OBJ_DIR).returncode
+    if ret != 0:
+        log("ERROR", "Wine install failed")
+        return False
+
+    log("INFO", f"Wine built: {WINE_BUILD_DIR}")
+    log("INFO", "amphetamine will auto-detect this build and enable ntsync")
+    return True
 
 
 def configure_verbose():
@@ -486,7 +582,7 @@ def check_dependencies():
 
     proton_exp = steam_common / "Proton - Experimental" / "files" / "bin" / "wine64"
     if proton_exp.exists():
-        log("INFO", f"Found Proton Experimental")
+        log("INFO", "Found Proton Experimental")
         proton_found = True
     elif steam_common.exists():
         for entry in steam_common.iterdir():
@@ -509,14 +605,10 @@ def main():
     if not check_dependencies():
         return 1
 
-    use_cachyos = detect_cachyos_wine()
-    if use_cachyos:
-        print()
-        log("INFO", "amphetamine has detected CachyOS Wine.")
-        log("INFO", "Compiling triskelion with CachyOS ntsync protocol support...")
-        print()
-
-    clone_wine(use_cachyos=use_cachyos)
+    clone_wine()
+    if not (WINE_SRC_DIR / "dlls").exists():
+        log("ERROR", "Wine source not available — cannot continue")
+        sys.exit(1)
 
     ret = build_triskelion()
     if ret != 0:
@@ -541,10 +633,20 @@ def main():
         patch_win32u_message()
 
         log("INFO", f"Wine source patched: {WINE_SRC_DIR}")
-        log("INFO", f"Next: triskelion configure {WINE_SRC_DIR} --execute && cd {WINE_SRC_DIR} && make -j$(nproc)")
+
+        if "--build-wine" in sys.argv:
+            print()
+            log("INFO", "Building Wine from source with ntsync + triskelion patches...")
+            if build_wine():
+                log("INFO", "ntsync: fully operational (locally-built Wine)")
+            else:
+                log("WARN", "Wine build failed — games will still work using Proton (fsync)")
+        else:
+            log("INFO", "To build Wine with ntsync support:")
+            log("INFO", "  python install.py --build-wine")
     else:
         log("WARN", "Wine source not available, skipping patches")
-        log("WARN", "Binary deployed to Steam -- tracing and profiling will work")
+        log("WARN", "Binary deployed to Steam — games work via Proton Wine (no triskelion bypass)")
 
     return 0
 

@@ -2,17 +2,15 @@
 
 A complete Proton and wineserver replacement for Linux gaming. One Rust binary replaces both Proton's Python launcher and Wine's C wineserver.
 
-amphetamine is a Steam compatibility layer that utilizes triskelion, a lock-free wineserver. Together they replace the entire Proton/wineserver stack for Steam.
-
-amphetamine is made possible by contributions from the CachyOS community within the Linux ecosystem.
+amphetamine is a Steam compatibility layer that utilizes triskelion, a single-threaded wineserver replacement. Together they replace the entire Proton/wineserver stack for Steam.
 
 ## Replacing Proton
 
 | | Proton | amphetamine |
 |---|---|---|
-| Launcher | Python (~2,000 lines) | Rust (1,281 lines, compiled) |
-| Wineserver | Wine's C wineserver (26,000+ lines) | triskelion (6,479 lines Rust, lock-free) |
-| Binary count | 3+ (script, wineserver, toolchain) | 1 (920 KB) |
+| Launcher | Python (~2,000 lines) | Rust (1,557 lines, compiled) |
+| Wineserver | Wine's C wineserver (26,000+ lines) | triskelion (6,448 lines Rust, single-threaded) |
+| Binary count | 3+ (script, wineserver, toolchain) | 1 (942 KB) |
 | Dependencies | Python 3, runtime libraries | libc |
 | Deployment cache | None (re-evaluates every launch) | v3 per-component (wine, dxvk, vkd3d, steam) |
 | Prefix setup | Python shutil (readdir + copy per file) | getdents64 (32 KB bulk reads) + hardlinks |
@@ -45,15 +43,15 @@ Steam
        ├─ Deployment cache (v3 per-component) — cache hit skips all file ops
        └─ wine64 with WINESERVER=triskelion
             ├─ ntsync kernel driver (Linux 6.14+) — native NT semaphore/mutex/event
-            │    └─ Fallback: lock-free CAS + futex wake (older kernels)
-            ├─ Lock-free SPSC ring buffers (shared memory, 256 slots)
+            │    └─ Fallback: CAS + futex wake (older kernels)
+            ├─ Shared-memory ring buffers (256 slots, atomic indices)
             ├─ Handle tables, process/thread state
             ├─ In-memory registry (HashMap values, O(1) lookup)
             ├─ timerfd-driven wait deadlines (kernel-precise)
-            └─ epoll event loop (306 protocol opcodes, 38 handlers)
+            └─ epoll event loop (306 protocol opcodes, 41 handlers)
 ```
 
-## Games Tested (v0.9.0)
+## Games Tested (v0.11.0)
 
 | Game | Engine | Architecture | Status |
 |------|--------|-------------|--------|
@@ -77,7 +75,7 @@ First launch sets up the prefix (~1500 symlinks + files via getdents64/hardlinks
 
 **EAC / BattlEye**: These third-party anti-cheat systems run in user-space on Proton (not kernel-level like on Windows) and require per-game developer opt-in. They run inside the Wine environment and see the Windows-side view of the system — the native Linux wineserver process is outside their scope.
 
-**What amphetmaine not**: A cheat, a bypass, or a modification to game code.
+**What amphetamine is not**: A cheat, a bypass, or a modification to game code.
 
 ## Performance
 
@@ -141,7 +139,7 @@ Requires Rust 2024 edition (rustc 1.85+). Single dependency: `libc`.
 
 ### amphetamine (Proton replacement)
 
-`launcher.rs` — 1,281 lines of Rust that replace Proton's ~2,000-line Python script.
+`launcher.rs` — 1,557 lines of Rust that replace Proton's ~2,000-line Python script.
 
 **Discovery**:
 - Wine: `TRISKELION_WINE_DIR` → Proton Experimental → any Proton → system Wine
@@ -191,7 +189,7 @@ Requires Rust 2024 edition (rustc 1.85+). Single dependency: `libc`.
 
 *Quocunque Jeceris Stabit*
 
-Lock-free wineserver replacement. 920 KB binary, single dependency (libc), 38 handlers across 306 opcodes.
+Single-threaded wineserver replacement. 942 KB binary, single dependency (libc), 41 handlers across 306 opcodes.
 
 | Leg | File | Domain |
 |-----|------|--------|
@@ -199,19 +197,19 @@ Lock-free wineserver replacement. 920 KB binary, single dependency (libc), 38 ha
 | 2: sync | `ntsync.rs` + `sync.rs` | ntsync kernel driver (Linux 6.14+) for native NT semaphore/mutex/event via `/dev/ntsync` ioctls. Fallback: CAS-based atomics with futex wake (`sync.rs`). |
 | 3: objects | `objects.rs` | Handle tables (dense array + free list), process/thread state, Windows handle encoding. |
 
-**Protocol**: 306 opcodes auto-generated from Wine's `protocol.def` by `build.rs` (829 lines). 38 handlers with logic; rest return `STATUS_NOT_IMPLEMENTED`. Adding a handler = one function.
+**Protocol**: 306 opcodes auto-generated from Wine's `protocol.def` by `build.rs` (829 lines). 41 handlers with logic; rest return `STATUS_NOT_IMPLEMENTED`. Adding a handler = one function.
 
 **IPC**: Unix domain socket with SCM_RIGHTS fd passing. Per-client accumulation buffers with request pipelining. Variable-length reply support (VARARG) for startup info and registry.
 
 **Event loop**: epoll hub with timerfd for deadline precision. Stack-allocated `[u8; 64]` replies for fixed-size opcodes. Reusable request buffers via `std::mem::take()`. Deferred replies for select with timeout (arm timerfd, check on expiry).
 
-**Select handler**: Wine's universal wait mechanism. Handles polls, object waits, and deferred sleep with real timeouts. On ntsync-capable kernels, select polls kernel objects via `NTSYNC_IOC_WAIT_ANY`/`WAIT_ALL` ioctls for immediate acquisition. Disables fsync/esync to force server-based sync through select.
+**Select handler**: Wine's universal wait mechanism. Handles polls, object waits, and deferred sleep with real timeouts. On ntsync-capable kernels, select polls kernel objects via `NTSYNC_IOC_WAIT_ANY`/`WAIT_ALL` ioctls for immediate acquisition. fsync/esync enabled as fallback for non-ntsync operations.
 
 ### Shared-Memory Message Bypass
 
 PostMessage/GetMessage bypass the wineserver entirely via shared-memory SPSC ring buffers. Patched into Wine's ntdll and win32u:
 
-- **ntdll**: `triskelion.c` (505 lines C) intercepts PostMessage (push to ring) and GetMessage (pop from ring)
+- **ntdll**: `triskelion.c` (964 lines C) intercepts PostMessage/GetMessage via shared-memory rings, and bypasses wineserver for ntsync sync operations
 - **win32u**: `triskelion_has_posted()` forces server call path when ring has messages
 - **Bridge**: `TEB->glReserved2` passes queue pointer from ntdll to win32u
 
@@ -226,14 +224,14 @@ Wine source resolution: `WINE_SRC` → `~/.local/share/amphetamine/wine-src/` �
 ```
 amphetamine/
   install.py               Build + deploy + Wine patching pipeline
-  amphetamine/              triskelion Rust crate (6,479 lines)
+  amphetamine/              triskelion Rust crate (6,448 lines)
     build.rs                protocol.def codegen (829 lines, 306 opcodes)
     include/
       triskelion_shm.h      C header matching Rust shm layout
     src/
       main.rs               Entry point, signal handling, socket path
-      launcher.rs            Full Proton replacement layer (1,281 lines)
-      event_loop.rs          epoll hub, handler dispatch (1,474 lines)
+      launcher.rs            Full Proton replacement layer (1,557 lines)
+      event_loop.rs          epoll hub, handler dispatch (1,457 lines)
       profile.rs             strace/perf profiling harness (637 lines)
       ipc.rs                 Unix socket IPC with SCM_RIGHTS
       objects.rs             Handle tables, process/thread state
@@ -253,7 +251,7 @@ amphetamine/
       status.rs              Project status reporting
       log.rs                 Logging macros
   patches/
-    wine/dlls/ntdll/unix/triskelion.c      Shared-memory bypass (505 lines C)
+    wine/dlls/ntdll/unix/triskelion.c      Shared-memory bypass + ntsync shadow table (964 lines C)
     wine/dlls/win32u/triskelion_message.c  win32u peek_message integration reference
     APPLY.md                                Patch application guide
   tests/
@@ -268,7 +266,7 @@ amphetamine/
 ~/.local/share/Steam/compatibilitytools.d/amphetamine/
   compatibilitytool.vdf     Steam discovery metadata
   toolmanifest.vdf          Invocation: /proton %verb%
-  proton                    triskelion binary (920 KB)
+  proton                    triskelion binary (942 KB)
 ```
 
 Steam calls `./proton waitforexitandrun <game.exe>`. triskelion's CLI parses it as launcher mode, sets up the environment, launches wine64 with `WINESERVER=$SELF`, and when wine64 calls back to wineserver — it's talking to another instance of itself.

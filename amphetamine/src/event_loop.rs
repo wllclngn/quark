@@ -1,6 +1,6 @@
 // Event loop -- the hub that spins the three legs
 //
-// Uses epoll (io_uring upgrade is Phase 2b, once the socket protocol works).
+// Uses epoll for fd readiness notification.
 // Accepts client connections, reads requests, dispatches to the appropriate
 // leg, writes replies.
 //
@@ -26,8 +26,7 @@ const MAX_OPCODES: usize = 306;
 struct PendingWait {
     client_fd: RawFd,
     deadline: Instant,
-    cookie: u64,
-    // ntsync wait context (empty = legacy timeout-only wait)
+    // ntsync wait context (empty = timeout-only wait, no kernel objects)
     ntsync_fds: Vec<RawFd>,
     wait_all: bool,
     owner: u32,
@@ -368,7 +367,7 @@ impl RequestHandler for EventLoop {
             .and_then(|c| if c.process_id != 0 { Some(c.process_id) } else { None });
         let handle = if let Some(ppid) = parent_pid {
             if let Some(parent) = self.state.processes.get_mut(&ppid) {
-                parent.handles.allocate(pid as u64, 0x001F0FFF) // PROCESS_ALL_ACCESS
+                parent.handles.allocate(pid as u64)
             } else { 0 }
         } else { 0 };
 
@@ -433,11 +432,11 @@ impl RequestHandler for EventLoop {
             self.state.processes.keys().next().copied().unwrap_or(0)
         });
 
-        let tid = self.state.create_thread(target_pid, client_fd as RawFd, 0);
+        let tid = self.state.create_thread(target_pid);
         self.thread_init_count += 1;
         let handle = if let Some(ppid) = caller_pid {
             if let Some(parent) = self.state.processes.get_mut(&ppid) {
-                parent.handles.allocate(tid as u64, 0x001F03FF) // THREAD_ALL_ACCESS
+                parent.handles.allocate(tid as u64)
             } else { 0 }
         } else { 0 };
 
@@ -478,7 +477,7 @@ impl RequestHandler for EventLoop {
             .unwrap_or_else(|| self.state.create_process());
 
         let slot = self.shm.alloc_slot(req.unix_tid as thread_id_t);
-        let tid = self.state.create_thread(pid, client_fd as RawFd, slot);
+        let tid = self.state.create_thread(pid);
         self.thread_init_count += 1;
 
         if let Some(client) = self.clients.get_mut(&(client_fd as RawFd)) {
@@ -534,7 +533,7 @@ impl RequestHandler for EventLoop {
             });
 
         let slot = self.shm.alloc_slot(req.unix_tid as thread_id_t);
-        let tid = self.state.create_thread(pid, client_fd as RawFd, slot);
+        let tid = self.state.create_thread(pid);
 
         if let Some(client) = self.clients.get_mut(&(client_fd as RawFd)) {
             client.thread_id = tid;
@@ -635,24 +634,15 @@ impl RequestHandler for EventLoop {
         reply_fixed(&ReplyHeader { error: 0x00000103, reply_size: 0 }) // STATUS_PENDING
     }
 
-    fn handle_get_queue_status(&mut self, client_fd: i32, buf: &[u8]) -> Reply {
+    fn handle_get_queue_status(&mut self, client_fd: i32, _buf: &[u8]) -> Reply {
         let tid = self.client_thread_id(client_fd as RawFd);
 
         if let Some(queue) = tid.and_then(|t| self.shm.get_queue(t)) {
-            let clear_bits = if buf.len() >= std::mem::size_of::<GetQueueStatusRequest>() {
-                let req: GetQueueStatusRequest = unsafe {
-                    std::ptr::read_unaligned(buf.as_ptr() as *const _)
-                };
-                req.clear_bits
-            } else {
-                0
-            };
-
-            let (wake, changed) = queue.get_status(clear_bits);
+            let wake_bits = queue.wake_bits.load(std::sync::atomic::Ordering::Acquire);
             let reply = GetQueueStatusReply {
                 header: ReplyHeader { error: 0, reply_size: 0 },
-                wake_bits: wake,
-                changed_bits: changed,
+                wake_bits,
+                changed_bits: wake_bits, // no separate changed tracking
             };
             return reply_fixed(&reply);
         }
@@ -660,7 +650,7 @@ impl RequestHandler for EventLoop {
         reply_fixed(&ReplyHeader { error: 0xC0000008, reply_size: 0 }) // STATUS_INVALID_HANDLE
     }
 
-    fn handle_send_message(&mut self, client_fd: i32, buf: &[u8]) -> Reply {
+    fn handle_send_message(&mut self, _client_fd: i32, buf: &[u8]) -> Reply {
         let req = if buf.len() >= std::mem::size_of::<SendMessageRequest>() {
             unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const SendMessageRequest) }
         } else {
@@ -677,19 +667,15 @@ impl RequestHandler for EventLoop {
                 x: 0,
                 y: 0,
                 time: 0,
-                sender_tid: self.client_thread_id(client_fd as RawFd).unwrap_or(0),
-                _pad: 0,
+                _pad: [0; 2],
             };
 
             if req.r#type == MSG_POSTED || req.r#type == MSG_NOTIFY {
                 if queue.post(msg) {
                     return reply_fixed(&ReplyHeader { error: 0, reply_size: 0 });
                 }
-            } else {
-                if queue.send(msg) {
-                    return reply_fixed(&ReplyHeader { error: 0, reply_size: 0 });
-                }
             }
+            // Non-posted message types (SendMessage, etc.) fall through to stub
         }
 
         reply_fixed(&ReplyHeader { error: 0xC0000008, reply_size: 0 }) // STATUS_INVALID_HANDLE
@@ -1001,16 +987,6 @@ impl RequestHandler for EventLoop {
                 };
                 match result {
                     crate::ntsync::WaitResult::Signaled(index) => {
-                        if req.timeout == 0 {
-                            // Poll mode: return signaled immediately
-                            let reply = SelectReply {
-                                header: ReplyHeader { error: 0, reply_size: 0 },
-                                apc_handle: 0,
-                                signaled: index as i32,
-                            };
-                            return reply_fixed(&reply);
-                        }
-                        // Non-poll: return signaled
                         let reply = SelectReply {
                             header: ReplyHeader { error: 0, reply_size: 0 },
                             apc_handle: 0,
@@ -1060,7 +1036,6 @@ impl RequestHandler for EventLoop {
         self.pending_waits.push(PendingWait {
             client_fd: client_fd as RawFd,
             deadline,
-            cookie: req.cookie,
             ntsync_fds,
             wait_all,
             owner,
@@ -1085,7 +1060,7 @@ impl RequestHandler for EventLoop {
             .and_then(|c| if c.process_id != 0 { Some(c.process_id) } else { None });
         let handle = if let Some(pid) = pid {
             if let Some(process) = self.state.processes.get_mut(&pid) {
-                process.handles.allocate(0, 0x001F0003) // EVENT_ALL_ACCESS
+                process.handles.allocate(0)
             } else { 0 }
         } else { 0 };
 
@@ -1180,7 +1155,7 @@ impl RequestHandler for EventLoop {
             .and_then(|c| if c.process_id != 0 { Some(c.process_id) } else { None });
         let handle = if let Some(pid) = pid {
             if let Some(process) = self.state.processes.get_mut(&pid) {
-                process.handles.allocate(0, 0x001F0001) // MUTANT_ALL_ACCESS
+                process.handles.allocate(0)
             } else { 0 }
         } else { 0 };
 
@@ -1217,7 +1192,7 @@ impl RequestHandler for EventLoop {
             .and_then(|c| if c.process_id != 0 { Some(c.process_id) } else { None });
         let handle = if let Some(pid) = pid {
             if let Some(process) = self.state.processes.get_mut(&pid) {
-                process.handles.allocate(0, 0x001F0003) // SEMAPHORE_ALL_ACCESS
+                process.handles.allocate(0)
             } else { 0 }
         } else { 0 };
 
@@ -1301,7 +1276,7 @@ impl RequestHandler for EventLoop {
             .and_then(|c| if c.process_id != 0 { Some(c.process_id) } else { None });
         let handle = if let Some(pid) = pid {
             if let Some(process) = self.state.processes.get_mut(&pid) {
-                process.handles.allocate(0, 0x001F0003)
+                process.handles.allocate(0)
             } else { 0 }
         } else { 0 };
 
@@ -1313,96 +1288,6 @@ impl RequestHandler for EventLoop {
         reply_fixed(&reply)
     }
 
-    // ── CachyOS ntsync client-side protocol handlers ─────────────────────
-
-    #[cfg(has_cachyos_ntsync)]
-    fn handle_get_linux_sync_device(&mut self, client_fd: i32, _buf: &[u8]) -> Reply {
-        use crate::protocol::GetLinuxSyncDeviceReply;
-
-        let pid = self.clients.get(&(client_fd as RawFd))
-            .and_then(|c| if c.process_id != 0 { Some(c.process_id) } else { None });
-        let handle = if let Some(pid) = pid {
-            if let Some(process) = self.state.processes.get_mut(&pid) {
-                process.handles.allocate(0, 0x001F0003)
-            } else { 0 }
-        } else { 0 };
-
-        // Send /dev/ntsync fd to client via wait_fd channel
-        if handle != 0 {
-            if let Some(ntsync) = &self.ntsync {
-                let ntsync_fd = ntsync.fd();
-                if let Some(client) = self.clients.get(&(client_fd as RawFd)) {
-                    client.send_fd(ntsync_fd, handle);
-                }
-            }
-        }
-
-        let reply = GetLinuxSyncDeviceReply {
-            header: ReplyHeader { error: 0, reply_size: 0 },
-            handle,
-            _pad_0: [0; 4],
-        };
-        reply_fixed(&reply)
-    }
-
-    #[cfg(has_cachyos_ntsync)]
-    fn handle_get_linux_sync_obj(&mut self, client_fd: i32, buf: &[u8]) -> Reply {
-        use crate::protocol::GetLinuxSyncObjRequest;
-        use crate::protocol::GetLinuxSyncObjReply;
-
-        let req = if buf.len() >= std::mem::size_of::<GetLinuxSyncObjRequest>() {
-            unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const GetLinuxSyncObjRequest) }
-        } else {
-            return reply_fixed(&ReplyHeader { error: 0xC000000D, reply_size: 0 });
-        };
-
-        // Look up the ntsync object by handle and get its fd + type
-        if let Some((obj, sync_type)) = self.ntsync_objects.get(&req.handle) {
-            let obj_fd = obj.fd();
-
-            // Allocate a new handle for the inproc_sync wrapper
-            let pid = self.clients.get(&(client_fd as RawFd))
-                .and_then(|c| if c.process_id != 0 { Some(c.process_id) } else { None });
-            let new_handle = if let Some(pid) = pid {
-                if let Some(process) = self.state.processes.get_mut(&pid) {
-                    process.handles.allocate(0, 0x001F0003)
-                } else { 0 }
-            } else { 0 };
-
-            if new_handle != 0 {
-                if let Some(client) = self.clients.get(&(client_fd as RawFd)) {
-                    client.send_fd(obj_fd, new_handle);
-                }
-            }
-
-            let reply = GetLinuxSyncObjReply {
-                header: ReplyHeader { error: 0, reply_size: 0 },
-                handle: new_handle,
-                r#type: *sync_type as i32,
-                access: 0x001F0003,
-                _pad_0: [0; 4],
-            };
-            return reply_fixed(&reply);
-        }
-
-        reply_fixed(&ReplyHeader { error: 0xC0000008, reply_size: 0 }) // STATUS_INVALID_HANDLE
-    }
-
-    #[cfg(has_cachyos_ntsync)]
-    fn handle_select_inproc_queue(&mut self, _client_fd: i32, _buf: &[u8]) -> Reply {
-        reply_fixed(&ReplyHeader { error: 0, reply_size: 0 })
-    }
-
-    #[cfg(has_cachyos_ntsync)]
-    fn handle_unselect_inproc_queue(&mut self, _client_fd: i32, _buf: &[u8]) -> Reply {
-        reply_fixed(&ReplyHeader { error: 0, reply_size: 0 })
-    }
-
-    #[cfg(has_cachyos_ntsync)]
-    fn handle_get_inproc_alert_event(&mut self, _client_fd: i32, _buf: &[u8]) -> Reply {
-        // STATUS_NOT_IMPLEMENTED — Wine falls back to server-side alerting
-        reply_fixed(&ReplyHeader { error: 0xC0000002, reply_size: 0 })
-    }
 }
 
 impl Drop for EventLoop {

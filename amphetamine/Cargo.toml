@@ -1,9 +1,9 @@
 [package]
 name = "triskelion"
-version = "0.10.4"
+version = "0.11.0"
 edition = "2024"
 license = "GPL-2.0-only"
-description = "Lock-free wineserver replacement for amphetamine"
+description = "Single-threaded wineserver replacement for amphetamine"
 
 [[bin]]
 name = "triskelion"
@@ -11,5 +11,3 @@ path = "src/main.rs"
 
 [dependencies]
 libc = "0.2"
-
-[build-dependencies]

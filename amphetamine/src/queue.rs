@@ -44,21 +44,6 @@ pub(crate) fn futex_wake(word: &AtomicU32, count: i32) {
     }
 }
 
-// AtomicI32 variant (for Semaphore::count).
-pub(crate) fn futex_wake_i32(word: &std::sync::atomic::AtomicI32, count: i32) {
-    unsafe {
-        libc::syscall(
-            libc::SYS_futex,
-            word as *const std::sync::atomic::AtomicI32 as *const u32,
-            libc::FUTEX_WAKE,
-            count,
-            std::ptr::null::<libc::timespec>(),
-            std::ptr::null::<u32>(),
-            0u32,
-        );
-    }
-}
-
 // A queued Windows message
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -71,8 +56,7 @@ pub struct QueuedMessage {
     pub x: i32,
     pub y: i32,
     pub time: u32,
-    pub sender_tid: thread_id_t,
-    pub _pad: u32,
+    pub _pad: [u32; 2],
 }
 
 const _: () = assert!(std::mem::size_of::<QueuedMessage>() == 48);
@@ -163,29 +147,24 @@ impl MessageRing {
 // Alignment is 64 bytes (inherited from CacheLineU64 in MessageRing).
 #[repr(C)]
 pub struct ThreadQueue {
-    // Posted messages (SPSC ring)
+    // Posted messages (ring buffer)
     pub posted: MessageRing,
 
-    // Sent messages waiting for reply (separate ring)
-    pub sent: MessageRing,
-
-    // Wake/changed bits (atomic -- set by poster, read by receiver)
+    // Wake bits (atomic -- set by poster, read by receiver)
     pub wake_bits: AtomicU32,
-    pub changed_bits: AtomicU32,
 
-    // Queue mask set by SetQueueMask
-    pub wake_mask: AtomicU32,
-    pub changed_mask: AtomicU32,
+    // Spinlock for ring_push (multiple producers can PostMessage to this queue)
+    pub post_lock: AtomicU32,
 
     // Owning thread
     pub thread_id: thread_id_t,
 
-    // Pad to 64-byte boundary for clean alignment in slot arrays
-    _reserved: [u8; 44],
+    // Pad to match triskelion.c layout
+    _reserved: [u8; 52],
 }
 
-// 2 * 12416 (rings) + 5 * 4 (u32 fields) + 44 (reserved) = 24896
-const _: () = assert!(std::mem::size_of::<ThreadQueue>() == 24896);
+// 1 * 12416 (ring) + 3 * 4 (u32 fields) + 52 (reserved) = 12480
+const _: () = assert!(std::mem::size_of::<ThreadQueue>() == 12480);
 // Alignment is 64 from CacheLineU64
 const _: () = assert!(std::mem::align_of::<ThreadQueue>() == 64);
 
@@ -210,49 +189,17 @@ impl ThreadQueue {
         let ok = self.posted.push(msg);
         if ok {
             self.wake_bits.fetch_or(QS_POSTMESSAGE, Ordering::Release);
-            self.changed_bits.fetch_or(QS_POSTMESSAGE, Ordering::Release);
             futex_wake(&self.wake_bits, 1);
         }
         ok
     }
 
-    // Send a message (cross-thread SendMessage).
-    pub fn send(&self, msg: QueuedMessage) -> bool {
-        let ok = self.sent.push(msg);
-        if ok {
-            self.wake_bits.fetch_or(QS_SENDMESSAGE, Ordering::Release);
-            self.changed_bits.fetch_or(QS_SENDMESSAGE, Ordering::Release);
-            futex_wake(&self.wake_bits, 1);
-        }
-        ok
-    }
-
-    // Get the next message (sent messages have priority per Win32 semantics).
+    // Get the next posted message.
     pub fn get(&self) -> Option<QueuedMessage> {
-        if let Some(msg) = self.sent.pop() {
-            if self.sent.is_empty() {
-                self.wake_bits.fetch_and(!QS_SENDMESSAGE, Ordering::Release);
-            }
-            return Some(msg);
+        let msg = self.posted.pop()?;
+        if self.posted.is_empty() {
+            self.wake_bits.fetch_and(!QS_POSTMESSAGE, Ordering::Release);
         }
-
-        if let Some(msg) = self.posted.pop() {
-            if self.posted.is_empty() {
-                self.wake_bits.fetch_and(!QS_POSTMESSAGE, Ordering::Release);
-            }
-            return Some(msg);
-        }
-
-        None
-    }
-
-    pub fn has_messages(&self, mask: u32) -> bool {
-        self.wake_bits.load(Ordering::Acquire) & mask != 0
-    }
-
-    pub fn get_status(&self, clear_bits: u32) -> (u32, u32) {
-        let wake = self.wake_bits.load(Ordering::Acquire);
-        let changed = self.changed_bits.fetch_and(!clear_bits, Ordering::AcqRel);
-        (wake, changed)
+        Some(msg)
     }
 }

@@ -1,15 +1,13 @@
-#![allow(dead_code)]
-
-// triskelion -- lock-free wineserver replacement + proton launcher
+// triskelion -- single-threaded wineserver replacement + proton launcher
 //
 // Multi-mode binary:
 //   ./proton <verb> <exe>   Proton launcher (Steam compatibility tool)
 //   triskelion package      Package a built Wine tree for Steam
 //   triskelion server       Wineserver replacement daemon
 //
-// Three legs of the server, always spinning:
-//   queue   -- per-thread message queues (SPSC ring buffers in shared memory)
-//   sync    -- sync primitive arbitration (futex-backed atomics)
+// Three legs of the server:
+//   queue   -- per-thread message queues (shared-memory ring buffers)
+//   ntsync  -- sync primitives via /dev/ntsync kernel driver
 //   objects -- handle tables, process/thread state
 
 #[macro_use]
@@ -26,7 +24,6 @@ mod packager;
 mod pe_patch;
 mod protocol;
 mod queue;
-mod sync;
 mod ntsync;
 mod objects;
 mod registry;
@@ -116,7 +113,10 @@ fn resolve_socket_path() -> std::path::PathBuf {
     let uid = unsafe { libc::getuid() };
     let base_dir = std::path::PathBuf::from(format!("/tmp/.wine-{uid}"));
     let server_dir = base_dir.join(format!("server-{dev:x}-{ino:x}"));
-    std::fs::create_dir_all(&server_dir).ok();
+    if let Err(e) = std::fs::create_dir_all(&server_dir) {
+        eprintln!("[triskelion] Cannot create server dir {}: {e}", server_dir.display());
+        std::process::exit(1);
+    }
 
     server_dir.join("socket")
 }
