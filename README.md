@@ -24,7 +24,7 @@ Steam calls amphetamine. amphetamine sets up the game prefix, deploys DXVK/VKD3D
 ```
 Steam
   └─ amphetamine (proton binary = triskelion)
-       ├─ Prefix setup from Proton Experimental's template
+       ├─ Prefix setup from Proton's Wine template
        │    ├─ getdents64 bulk directory walking (32 KB buffer, one syscall per batch)
        │    ├─ Hardlinks for regular files (instant, same filesystem)
        │    ├─ Absolute symlinks resolved against Proton tree (1500+ DLL symlinks)
@@ -97,7 +97,7 @@ Steam's `compatibilitytools.d/` infrastructure exists for custom compatibility t
 
 ### Dependencies
 
-- **Proton Experimental** — Install via Steam (Steam → Settings → Compatibility → enable Proton, or install any game that uses Proton). amphetamine replaces Proton's launcher and wineserver but uses its Wine toolchain, prefix template, DXVK, VKD3D-Proton, and Steam client bridge.
+- **Any Proton** (Experimental, 10.0, etc.) — Install via Steam (Steam → Library → search "Proton" → Install). amphetamine replaces Proton's launcher and wineserver but sources Wine binaries, DXVK, VKD3D-Proton, and the Steam client bridge from a Proton installation. These are independent components that Valve bundles inside Proton.
 - **Rust** (1.85+, 2024 edition)
 
 ```bash

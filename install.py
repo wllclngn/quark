@@ -157,10 +157,10 @@ def prompt_yn(question):
 
 
 def build_triskelion():
-    log("INFO", "Building triskelion binary")
+    log("INFO", "Building triskelion...")
     ret = subprocess.run(["cargo", "build", "--release", "-p", "triskelion"], cwd=SCRIPT_DIR).returncode
     if ret != 0:
-        log("ERROR", "cargo build failed")
+        log("ERROR", "Build failed (cargo error)")
         return ret
 
     # Workspace builds go to <repo>/target/, not <crate>/target/
@@ -216,36 +216,36 @@ def build_triskelion():
 
 def clone_wine():
     if (WINE_SRC_DIR / "dlls").exists():
-        log("INFO", f"Wine source exists: {WINE_SRC_DIR}")
+        log("INFO", "Wine source: already cloned")
         return
 
-    log("INFO", f"Cloning Valve Wine ({WINE_CLONE_BRANCH}) to {WINE_SRC_DIR}")
+    log("INFO", f"Cloning Valve Wine ({WINE_CLONE_BRANCH})...")
     WINE_SRC_DIR.parent.mkdir(parents=True, exist_ok=True)
     ret = subprocess.run([
         "git", "clone", "--depth", "1", "-b", WINE_CLONE_BRANCH,
         WINE_CLONE_URL, str(WINE_SRC_DIR),
     ]).returncode
     if ret != 0:
-        log("ERROR", "git clone failed (GitHub may be down, retry later)")
+        log("ERROR", "Clone failed — GitHub may be down, retry later")
         return
-    log("INFO", "Clone complete")
+    log("INFO", f"Clone complete: {WINE_SRC_DIR}")
 
 
 def patch_copy_triskelion_c():
     src = PATCHES_DIR / "dlls" / "ntdll" / "unix" / "triskelion.c"
     dst = WINE_SRC_DIR / "dlls" / "ntdll" / "unix" / "triskelion.c"
     if dst.exists() and filecmp.cmp(src, dst, shallow=False):
-        log("INFO", "triskelion.c already in place")
+        log("INFO", "triskelion.c: already patched")
         return
     shutil.copy2(src, dst)
-    log("INFO", f"Copied triskelion.c -> {dst}")
+    log("INFO", "Patched triskelion.c")
 
 
 def patch_makefile_in():
     path = WINE_SRC_DIR / "dlls" / "ntdll" / "Makefile.in"
     text = path.read_text()
     if "unix/triskelion.c" in text:
-        log("INFO", "Makefile.in already patched")
+        log("INFO", "Makefile.in: already patched")
         return
     anchor = "\tunix/thread.c \\"
     if anchor not in text:
@@ -288,7 +288,7 @@ def patch_server_c():
         path.write_text(text)
         log("INFO", "Patched server.c: triskelion_try_bypass + triskelion_post_call")
     else:
-        log("INFO", "server.c already patched")
+        log("INFO", "server.c: already patched")
 
 
 def patch_unix_private_h():
@@ -315,14 +315,14 @@ def patch_unix_private_h():
         path.write_text(text)
         log("INFO", "Patched unix_private.h: triskelion declarations")
     else:
-        log("INFO", "unix_private.h already patched")
+        log("INFO", "unix_private.h: already patched")
 
 
 def patch_win32u_message():
     path = WINE_SRC_DIR / "dlls" / "win32u" / "message.c"
     text = path.read_text()
     if "triskelion_has_posted" in text:
-        log("INFO", "win32u/message.c already patched")
+        log("INFO", "win32u/message.c: already patched")
         return
 
     # Modification A: insert triskelion_has_posted function after debug channel declarations
@@ -343,7 +343,7 @@ def patch_win32u_message():
         PEEK_MSG_PREFIX + original_condition,
     )
     path.write_text(text)
-    log("INFO", "Patched win32u/message.c: added triskelion_has_posted function + peek_message integration")
+    log("INFO", "Patched win32u/message.c: triskelion_has_posted + peek_message bypass")
 
 
 def configure_shader_cache():
@@ -365,11 +365,11 @@ def configure_shader_cache():
 
     if prompt_yn("  Enable shader cache optimization?"):
         flag.write_text("1")
-        log("INFO", "Shader cache optimization enabled")
+        log("INFO", "Shader cache: enabled")
     else:
         if flag.exists():
             flag.unlink()
-        log("INFO", "Shader cache optimization disabled")
+        log("INFO", "Shader cache: disabled")
 
 
 def configure_custom_env():
@@ -394,7 +394,7 @@ def configure_custom_env():
         log("INFO", f"Custom env config created: {config_file}")
         log("INFO", "  Uncomment variables to enable them")
     else:
-        log("INFO", "Custom env config skipped (you can create it manually later)")
+        log("INFO", "Custom env config: skipped")
 
 
 def check_ntsync():
@@ -412,8 +412,8 @@ def install_wine_build_deps():
     try:
         subprocess.run(["pacman", "--version"], capture_output=True)
     except FileNotFoundError:
-        log("ERROR", "pacman not found — Wine build currently requires Arch-based system")
-        log("INFO", "Install Wine build deps manually, then re-run with --build-wine")
+        log("ERROR", "pacman: not found — Wine build requires Arch-based system")
+        log("ERROR", "  Install deps manually, then re-run with --build-wine")
         return False
 
     missing = []
@@ -438,10 +438,10 @@ def install_wine_build_deps():
         ["sudo", "pacman", "-S", "--needed", "--noconfirm"] + missing,
     ).returncode
     if ret != 0:
-        log("ERROR", "Failed to install dependencies")
+        log("ERROR", "Wine build deps: install failed")
         return False
 
-    log("INFO", "Wine build deps installed")
+    log("INFO", "Wine build deps: installed")
     return True
 
 
@@ -451,14 +451,14 @@ def build_wine():
     with ntsync + triskelion patches baked in. ABI-safe because everything
     is compiled on the user's machine with their toolchain."""
     if not (WINE_SRC_DIR / "configure.ac").exists():
-        log("ERROR", f"Wine source not found at {WINE_SRC_DIR}")
+        log("ERROR", "Wine source: not found")
         return False
 
     # Check if already built
     wine_bin = WINE_BUILD_DIR / "bin" / "wine"
     wine64_bin = WINE_BUILD_DIR / "bin" / "wine64"
     if wine_bin.exists() or wine64_bin.exists():
-        log("INFO", f"Wine already built: {WINE_BUILD_DIR}")
+        log("INFO", "Wine: already built")
         if not prompt_yn("  Rebuild Wine from source?"):
             return True
 
@@ -471,7 +471,7 @@ def build_wine():
         log("INFO", "Generating configure script...")
         ret = subprocess.run(["autoreconf", "-fi"], cwd=WINE_SRC_DIR).returncode
         if ret != 0:
-            log("ERROR", "autoreconf failed")
+            log("ERROR", "autoreconf: failed")
             return False
 
     # Out-of-tree build
@@ -503,18 +503,18 @@ def build_wine():
     log("INFO", f"Building Wine with {jobs} threads...")
     ret = subprocess.run(["make", f"-j{jobs}"], cwd=WINE_OBJ_DIR).returncode
     if ret != 0:
-        log("ERROR", "Wine build failed")
+        log("ERROR", "Wine build: failed")
         return False
 
     # Install
     log("INFO", f"Installing Wine to {WINE_BUILD_DIR}...")
     ret = subprocess.run(["make", "install"], cwd=WINE_OBJ_DIR).returncode
     if ret != 0:
-        log("ERROR", "Wine install failed")
+        log("ERROR", "Wine install: failed")
         return False
 
     log("INFO", f"Wine built: {WINE_BUILD_DIR}")
-    log("INFO", "amphetamine will auto-detect this build and enable ntsync")
+    log("INFO", "  amphetamine will auto-detect this build (ntsync enabled)")
     return True
 
 
@@ -547,53 +547,68 @@ def check_dependencies():
             parts = ver.split(".")
             major, minor = int(parts[0]), int(parts[1])
             if major < 1 or (major == 1 and minor < 85):
-                log("ERROR", f"Rust {ver} is too old. Need 1.85+ (edition 2024).")
-                log("ERROR", "Update with: rustup update stable")
+                log("ERROR", f"Rust: {ver} — requires 1.85+ (edition 2024)")
+                log("ERROR", "  Update: rustup update stable")
                 ok = False
             else:
-                log("INFO", f"Rust {ver}")
+                log("INFO", f"Rust: {ver}")
         else:
-            log("ERROR", "rustc not found. Install Rust: https://rustup.rs")
+            log("ERROR", "Rust: not found")
+            log("ERROR", "  Install from https://rustup.rs")
             ok = False
     except FileNotFoundError:
-        log("ERROR", "rustc not found. Install Rust: https://rustup.rs")
+        log("ERROR", "Rust: not found")
+        log("ERROR", "  Install from https://rustup.rs")
         ok = False
 
     # Git
     try:
         out = subprocess.run(["git", "--version"], capture_output=True, text=True)
-        if out.returncode != 0:
-            log("ERROR", "git not found. Install git.")
+        if out.returncode == 0:
+            log("INFO", "Git: found")
+        else:
+            log("ERROR", "Git: not found")
             ok = False
     except FileNotFoundError:
-        log("ERROR", "git not found. Install git.")
+        log("ERROR", "Git: not found")
         ok = False
 
     # Steam (native)
     steam_root = Path.home() / ".steam" / "root"
-    if not steam_root.exists():
-        log("ERROR", "Steam not found at ~/.steam/root")
-        log("ERROR", "Install Steam natively (not Flatpak).")
+    if steam_root.exists():
+        log("INFO", "Steam: found")
+    else:
+        log("ERROR", "Steam: not found (~/.steam/root)")
+        log("ERROR", "  Install Steam natively (not Flatpak)")
         ok = False
 
-    # Proton (Wine binaries)
+    # Wine runtime (Wine binaries, DXVK, VKD3D-Proton, Steam client bridge).
+    # These are independent components that Valve bundles inside Proton.
+    # A Proton installation is the easiest way to get them all.
     steam_common = Path.home() / ".steam" / "root" / "steamapps" / "common"
     proton_found = False
+    proton_name = None
 
     proton_exp = steam_common / "Proton - Experimental" / "files" / "bin" / "wine64"
     if proton_exp.exists():
-        log("INFO", "Found Proton Experimental")
         proton_found = True
+        proton_name = "Proton Experimental"
     elif steam_common.exists():
         for entry in steam_common.iterdir():
             if entry.name.startswith("Proton") and (entry / "files" / "bin" / "wine64").exists():
-                log("INFO", f"Found {entry.name}")
                 proton_found = True
+                proton_name = entry.name
                 break
 
-    if not proton_found:
-        log("ERROR", "Proton not found. amphetamine requires Proton's Wine binaries.")
-        log("ERROR", "Install 'Proton Experimental' from your Steam Library.")
+    if proton_found:
+        log("INFO", f"Wine runtime: {proton_name}")
+    else:
+        log("ERROR", "Wine runtime: not found")
+        log("ERROR", "  amphetamine needs Wine binaries, DXVK, VKD3D-Proton, and the")
+        log("ERROR", "  Steam client bridge. These ship inside any Proton installation.")
+        log("ERROR", "")
+        log("ERROR", "  Install any Proton from Steam:")
+        log("ERROR", "    Steam → Library → search 'Proton' → Install")
         ok = False
 
     return ok
@@ -607,7 +622,7 @@ def main():
 
     clone_wine()
     if not (WINE_SRC_DIR / "dlls").exists():
-        log("ERROR", "Wine source not available — cannot continue")
+        log("ERROR", "Wine source: not available — cannot continue")
         sys.exit(1)
 
     ret = build_triskelion()
@@ -636,17 +651,17 @@ def main():
 
         if "--build-wine" in sys.argv:
             print()
-            log("INFO", "Building Wine from source with ntsync + triskelion patches...")
+            log("INFO", "Building Wine with shared-memory message bypass...")
             if build_wine():
-                log("INFO", "ntsync: fully operational (locally-built Wine)")
+                log("INFO", "Wine built: PostMessage/GetMessage bypass wineserver via shared memory")
             else:
-                log("WARN", "Wine build failed — games will still work using Proton (fsync)")
+                log("WARN", "Wine build failed — games still work (bypass disabled, all messages route through triskelion)")
         else:
-            log("INFO", "To build Wine with ntsync support:")
+            log("INFO", "Optional: build Wine with shared-memory message bypass:")
             log("INFO", "  python install.py --build-wine")
     else:
-        log("WARN", "Wine source not available, skipping patches")
-        log("WARN", "Binary deployed to Steam — games work via Proton Wine (no triskelion bypass)")
+        log("WARN", "Wine source: not available, skipping patches")
+        log("WARN", "Binary deployed to Steam — games now utilize triskelion to interface with Wine")
 
     return 0
 
