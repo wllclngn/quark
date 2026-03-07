@@ -71,15 +71,21 @@ pub fn run(verb: &str, args: &[String]) -> i32 {
 
     if !wine64.exists() {
         log_error!("wine not found at {}", wine64.display());
-        log_error!("Need Wine binaries. Set TRISKELION_WINE_DIR or install Proton.");
+        log_error!("Need Wine binaries. Install Wine from your package manager.");
         return 1;
     }
 
-    // When using non-Proton Wine, we still need
-    // Proton's tree for DXVK, VKD3D-Proton, and steam.exe bridge files.
+    // Proton's tree is optional — only needed for steam.exe sourcing now.
+    // DXVK/VKD3D are deployed by install.py into amphetamine's own lib/ dir.
     let proton_dir = find_proton_files();
 
-    let dxvk_src_dir = if wine_dir.join("lib/wine/dxvk").exists() {
+    // DXVK/VKD3D source: amphetamine's deploy dir (install.py) → Wine dir → Proton (fallback)
+    let home = std::env::var("HOME").unwrap_or_default();
+    let compat_tool_dir = PathBuf::from(&home)
+        .join(".local/share/Steam/compatibilitytools.d/amphetamine");
+    let dxvk_src_dir = if compat_tool_dir.join("lib/wine/dxvk").exists() {
+        compat_tool_dir
+    } else if wine_dir.join("lib/wine/dxvk").exists() {
         wine_dir.clone()
     } else if let Some(ref proton) = proton_dir {
         log_info!("DXVK/VKD3D: sourcing from Proton ({})", proton.display());
@@ -780,31 +786,45 @@ fn deploy_steam_client(steam_dir: &Path, pfx: &Path) {
 }
 
 /// Ensure steam.exe exists in the prefix's system32 and syswow64.
-/// Proton's prefix template includes it.
-/// Sources from Proton's Wine DLL dir if available.
+/// Sources: cached copy (~/.local/share/amphetamine/steam.exe) → Proton (fallback).
 fn deploy_steam_exe(proton_dir: Option<&Path>, pfx: &Path) {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let cached = PathBuf::from(&home).join(".local/share/amphetamine/steam.exe");
+
     let sys32 = pfx.join("drive_c/windows/system32");
     let syswow64 = pfx.join("drive_c/windows/syswow64");
 
-    for (subdir, dst_dir) in [
-        ("x86_64-windows", &sys32),
-        ("i386-windows", &syswow64),
-    ] {
+    for dst_dir in [&sys32, &syswow64] {
         let dst = dst_dir.join("steam.exe");
         if dst.exists() {
             continue;
         }
-        // Try sourcing from Proton's Wine DLLs
+        // Try cached copy first (installed by install.py)
+        if cached.exists() {
+            if let Err(e) = std::fs::create_dir_all(dst_dir) {
+                log_warn!("Cannot create {}: {e}", dst_dir.display());
+            }
+            if let Err(e) = std::fs::copy(&cached, &dst) {
+                log_warn!("steam.exe: failed to copy to {}: {e}", dst_dir.display());
+            } else {
+                log_info!("steam.exe: deployed to {}", dst_dir.display());
+            }
+            continue;
+        }
+        // Fallback: source from Proton's Wine DLLs
         if let Some(proton) = proton_dir {
-            let src = proton.join(format!("lib/wine/{subdir}/steam.exe"));
-            if src.exists() {
-                if let Err(e) = std::fs::create_dir_all(dst_dir) {
-                    log_warn!("Cannot create {}: {e}", dst_dir.display());
-                }
-                if let Err(e) = std::fs::copy(&src, &dst) {
-                    log_warn!("steam.exe: failed to copy to {}: {e}", dst_dir.display());
-                } else {
-                    log_info!("steam.exe: deployed to {}", dst_dir.display());
+            for subdir in ["x86_64-windows", "i386-windows"] {
+                let src = proton.join(format!("lib/wine/{subdir}/steam.exe"));
+                if src.exists() {
+                    if let Err(e) = std::fs::create_dir_all(dst_dir) {
+                        log_warn!("Cannot create {}: {e}", dst_dir.display());
+                    }
+                    if let Err(e) = std::fs::copy(&src, &dst) {
+                        log_warn!("steam.exe: failed to copy to {}: {e}", dst_dir.display());
+                    } else {
+                        log_info!("steam.exe: deployed to {}", dst_dir.display());
+                    }
+                    break;
                 }
             }
         }
@@ -829,8 +849,15 @@ fn build_env_vars(
     let wine_vkd3d = wine_dir.join("lib/vkd3d");
     let steam_linux64 = steam_dir.join("linux64");
 
-    // WINEDLLPATH: vkd3d → wine DLLs → Proton DLLs (for steam.exe bridge etc.)
+    // WINEDLLPATH: amphetamine patched libs → vkd3d → wine DLLs → Proton DLLs
     let mut dll_parts: Vec<String> = Vec::new();
+    // Our custom-compiled ntdll.so (with triskelion.c + ntsync) takes priority
+    let amphetamine_lib = self_exe.parent().map(|d| d.join("lib"));
+    if let Some(ref lib) = amphetamine_lib {
+        if lib.exists() {
+            dll_parts.push(lib.display().to_string());
+        }
+    }
     if wine_vkd3d.exists() {
         dll_parts.push(wine_vkd3d.display().to_string());
     }
@@ -1148,10 +1175,9 @@ fn wine_binary(dir: &Path) -> PathBuf {
 
 /// Find Wine binaries. Priority:
 /// 1. TRISKELION_WINE_DIR env var (explicit override)
-/// 2. amphetamine local build (~/.local/share/amphetamine/wine-build/) — ntsync + triskelion patches, ABI-safe
-/// 3. Proton Experimental (Steam-installed, battle-tested with triskelion)
-/// 4. Any Proton version
-/// 5. System Wine (fallback)
+/// 2. Proton Experimental (prefix template source — ABI-matched)
+/// 3. Any Proton version
+/// 4. System Wine (fallback — requires fresh prefix via wineboot)
 fn find_wine() -> PathBuf {
     if let Ok(dir) = std::env::var("TRISKELION_WINE_DIR") {
         let p = PathBuf::from(dir);
@@ -1162,13 +1188,7 @@ fn find_wine() -> PathBuf {
 
     let home = std::env::var("HOME").unwrap_or_default();
 
-    // amphetamine locally-built Wine (ntsync + triskelion patches, ABI-safe)
-    let local_build = PathBuf::from(&home).join(".local/share/amphetamine/wine-build");
-    if has_wine_bin(&local_build) {
-        return local_build;
-    }
-
-    // Proton Experimental
+    // Proton Experimental (prefix template source — DLLs match prefix symlinks)
     let proton_exp = PathBuf::from(&home)
         .join(".steam/root/steamapps/common/Proton - Experimental/files");
     if has_wine_bin(&proton_exp) {
@@ -1189,7 +1209,7 @@ fn find_wine() -> PathBuf {
         }
     }
 
-    // System Wine (fallback)
+    // System Wine (fallback — fresh prefixes built via wineboot)
     if has_wine_bin(&PathBuf::from("/usr")) {
         return PathBuf::from("/usr");
     }
@@ -1197,9 +1217,8 @@ fn find_wine() -> PathBuf {
     PathBuf::from("/nonexistent/wine")
 }
 
-/// Find Proton's files directory for DXVK/VKD3D/steam client sourcing.
-/// When using system Wine, we still need Proton's tree
-/// for DXVK, VKD3D-Proton, and Steam client bridge DLLs.
+/// Find Proton's files directory for steam.exe sourcing (fallback).
+/// DXVK/VKD3D are now deployed directly by install.py.
 fn find_proton_files() -> Option<PathBuf> {
     let home = std::env::var("HOME").unwrap_or_default();
 

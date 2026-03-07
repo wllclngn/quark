@@ -19,15 +19,15 @@ amphetamine is a Steam compatibility layer that utilizes triskelion, a lock-free
 
 ## Execution Stack
 
-Steam calls amphetamine. amphetamine sets up the game prefix, deploys DXVK/VKD3D-Proton for both 32-bit and 64-bit, bridges the Steam client, injects runtime registry keys, and launches wine64 with triskelion as the wineserver. Games run.
+Steam calls amphetamine. amphetamine sets up the game prefix, deploys DXVK/VKD3D-Proton (downloaded from GitHub, both 32-bit and 64-bit), bridges the Steam client, injects runtime registry keys, and launches Wine with triskelion as the wineserver. Games run.
 
 ```
 Steam
   └─ amphetamine (proton binary = triskelion)
-       ├─ Prefix setup from Proton's Wine template
+       ├─ Prefix setup from Wine template
        │    ├─ getdents64 bulk directory walking (32 KB buffer, one syscall per batch)
        │    ├─ Hardlinks for regular files (instant, same filesystem)
-       │    ├─ Absolute symlinks resolved against Proton tree (1500+ DLL symlinks)
+       │    ├─ Absolute symlinks resolved against Wine tree (1500+ DLL symlinks)
        │    └─ Repair mode: fixes broken symlinks and replaces stale files
        ├─ DXVK deployment (d3d9/10/11 → Vulkan)
        │    ├─ 64-bit → system32
@@ -49,18 +49,6 @@ Steam
             └─ epoll event loop (306 protocol opcodes, 41 handlers)
 ```
 
-## Games Tested (v0.11.0)
-
-| Game | Engine | Architecture | Status |
-|------|--------|-------------|--------|
-| Halls of Torment | Godot 4.3 (Vulkan) | 64-bit | Running. Sub-second cached launch. |
-| TMNT: Shredder's Revenge | FNA / .NET (SDL2) | 64-bit | Running. Needed VC++ registry keys. |
-| Balatro | Love2D | 64-bit | Near-instantaneous launch. |
-| Wedding Witch | Custom | 64-bit | Steady. |
-| Duke Nukem 3D: 20th Anniversary | Build engine (D3D) | 32-bit | Running. First 32-bit game tested. |
-
-First launch sets up the prefix (~1500 symlinks + files via getdents64/hardlinks). Every launch after hits the deployment cache and skips straight to wine64.
-
 ## Anti-Cheat Compliance
 
 amphetamine does not interfere with VAC, EAC, or BattlEye. Triskelion runs as a separate native Linux process — it communicates with Wine via Unix domain sockets and never appears in the game's memory maps. No game memory modification, no DLL hooking, no import table patching.
@@ -75,7 +63,7 @@ Steam's `compatibilitytools.d/` infrastructure exists for custom compatibility t
 
 - **getdents64 bulk reads** — Prefix setup reads directories via `SYS_getdents64` with 32 KB buffers. One syscall returns hundreds of directory entries. Replaces per-entry `readdir()`.
 
-- **Hardlinks over copies** — Regular files in the prefix are hardlinked from the Proton template (same filesystem, near-zero cost). Copy is the cross-device fallback.
+- **Hardlinks over copies** — Regular files in the prefix are hardlinked from the Wine template (same filesystem, near-zero cost). Copy is the cross-device fallback.
 
 - **Per-component deployment cache** — v3 cache stores 4 independent hashes: wine, dxvk, vkd3d, steam. Each component invalidates independently. A DXVK update does not force a full prefix rebuild.
 
@@ -97,14 +85,16 @@ Steam's `compatibilitytools.d/` infrastructure exists for custom compatibility t
 
 ### Dependencies
 
-- **Any Proton** (Experimental, 10.0, etc.) — Install via Steam (Steam → Library → search "Proton" → Install). amphetamine replaces Proton's launcher and wineserver but sources Wine binaries, DXVK, VKD3D-Proton, and the Steam client bridge from a Proton installation. These are independent components that Valve bundles inside Proton.
+- **Wine** — System Wine from your package manager (runtime for games)
 - **Rust** (1.85+, 2024 edition)
+- **gcc, git** — Only needed if building ntsync support (optional)
+- **Proton** (optional) — Only used for steam.exe extraction (one-time, cached)
 
 ```bash
 # Arch Linux
-pacman -S rust
+pacman -S wine rust
 
-# Or via rustup
+# Or Rust via rustup
 rustup default stable
 ```
 
@@ -112,7 +102,11 @@ rustup default stable
 ./install.py
 ```
 
-Builds triskelion, deploys to Steam's `~/.local/share/Steam/compatibilitytools.d/amphetamine/`, and patches Wine source for shared-memory message bypass.
+The installer:
+1. Builds and deploys triskelion to `~/.local/share/Steam/compatibilitytools.d/amphetamine/`
+2. Prompts to build ntsync support (clones Wine source, compiles patched ntdll.so with gcc)
+3. Downloads DXVK and VKD3D-proton directly from GitHub releases
+4. Caches steam.exe from Proton (one-time extraction)
 
 Then select "amphetamine" as the compatibility tool for any game in Steam.
 
@@ -132,19 +126,19 @@ Requires Rust 2024 edition (rustc 1.85+). Single dependency: `libc`.
 `launcher.rs` — 1,557 lines of Rust that replace Proton's ~2,000-line Python script.
 
 **Discovery**:
-- Wine: `TRISKELION_WINE_DIR` → Proton Experimental → any Proton → system Wine
+- Wine: `TRISKELION_WINE_DIR` → system Wine → Proton Experimental → any Proton (fallback)
 - Steam: `STEAM_COMPAT_CLIENT_INSTALL_PATH` → `~/.steam/root` → `~/.local/share/Steam`
 
 **Prefix setup**:
-- Copies Proton's `default_pfx/` template using `getdents64` (Linux kernel syscall for bulk directory entry reads — one syscall fills a 32 KB buffer with hundreds of entries)
+- Copies Wine's `default_pfx/` template using `getdents64` (Linux kernel syscall for bulk directory entry reads — one syscall fills a 32 KB buffer with hundreds of entries)
 - Regular files: hardlink first (instant, shares disk blocks), copy fallback for cross-device
-- Symlinks: resolved via `canonicalize()` against the Proton source tree, written as absolute symlinks (Proton's relative symlinks like `../../../../../lib/wine/...` break when copied to the game prefix)
+- Symlinks: resolved via `canonicalize()` against the Wine source tree, written as absolute symlinks (relative symlinks like `../../../../../lib/wine/...` break when copied to the game prefix)
 - Repair mode: detects broken symlinks and regular-files-that-should-be-symlinks from previous deploys, replaces them
 
 **DLL deployment**:
 - DXVK: `d3d11.dll`, `d3d10core.dll`, `d3d9.dll`, `dxgi.dll` — both 64-bit (system32) and 32-bit (syswow64)
 - VKD3D-Proton: `d3d12.dll`, `d3d12core.dll` — both 64-bit and 32-bit
-- Removes destination before copy (hardlinked files from Proton are read-only; unlinking is a directory op, always allowed)
+- Sourced from amphetamine's lib/ dir (downloaded by install.py), with Wine/Proton fallback
 - Conditional: skips files that match by size and mtime
 
 **Steam client bridge**:
@@ -301,7 +295,7 @@ triskelion server                           # wineserver daemon
 triskelion <verb> <exe>                     # Proton launcher
 triskelion package <wine_dir>               # package as Steam compat tool
 triskelion configure <wine_dir> [--execute] # Wine ./configure with 631 --disable-* flags
-triskelion clone                            # clone Valve Wine (proton_10.0)
+triskelion clone                            # clone upstream Wine
 triskelion status                           # project status
 triskelion analyze                          # Wine DLL surface area
 triskelion profile <app_id>                 # strace profiling

@@ -500,7 +500,9 @@ impl RequestHandler for EventLoop {
             tid,
             server_start,
             session_id: 0,
+            inproc_device: 0,
             info_size: 0,
+            _pad_0: [0; 4],
         };
         reply_fixed(&reply)
     }
@@ -839,8 +841,9 @@ impl RequestHandler for EventLoop {
             session_id: 0,
             exit_code: 0,
             priority: 8, // NORMAL_PRIORITY_CLASS
+            base_priority: 8,
+            disable_boost: 0,
             machine: 0x8664,
-            _pad_0: [0; 2],
         };
         reply_fixed(&reply)
     }
@@ -860,7 +863,7 @@ impl RequestHandler for EventLoop {
             affinity: u64::MAX,
             exit_code: 0,
             priority: 0,
-            last: 0,
+            base_priority: 0,
             suspend_count: 0,
             flags: 0,
             desc_len: 0,
@@ -902,15 +905,8 @@ impl RequestHandler for EventLoop {
     fn handle_flush_key(&mut self, _client_fd: i32, _buf: &[u8]) -> Reply {
         let reply = FlushKeyReply {
             header: ReplyHeader { error: 0, reply_size: 0 },
-            timestamp_counter: 0,
-            total: 0,
-            branch_count: 0,
         };
         reply_fixed(&reply)
-    }
-
-    fn handle_flush_key_done(&mut self, _client_fd: i32, _buf: &[u8]) -> Reply {
-        reply_fixed(&ReplyHeader { error: 0, reply_size: 0 })
     }
 
     // ---- Sync primitives (critical -- NOT_IMPLEMENTED here = system freeze) ----
@@ -1115,25 +1111,6 @@ impl RequestHandler for EventLoop {
             _pad_0: [0; 4],
         };
         reply_fixed(&reply)
-    }
-
-    fn handle_create_esync(&mut self, _client_fd: i32, _buf: &[u8]) -> Reply {
-        // Return NOT_IMPLEMENTED so Wine falls back to server-based sync.
-        // This is safe because select (above) handles the server path.
-        reply_fixed(&ReplyHeader { error: 0xC000_0002, reply_size: 0 })
-    }
-
-    fn handle_get_esync_fd(&mut self, _client_fd: i32, _buf: &[u8]) -> Reply {
-        reply_fixed(&ReplyHeader { error: 0xC000_0002, reply_size: 0 })
-    }
-
-    fn handle_get_esync_apc_fd(&mut self, _client_fd: i32, _buf: &[u8]) -> Reply {
-        reply_fixed(&ReplyHeader { error: 0xC000_0002, reply_size: 0 })
-    }
-
-    fn handle_create_fsync(&mut self, _client_fd: i32, _buf: &[u8]) -> Reply {
-        // Return NOT_IMPLEMENTED so Wine disables fsync and uses server sync
-        reply_fixed(&ReplyHeader { error: 0xC000_0002, reply_size: 0 })
     }
 
     // ---- Additional critical stubs to prevent hangs ----

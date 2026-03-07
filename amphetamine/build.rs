@@ -84,6 +84,8 @@ fn type_map() -> HashMap<&'static str, (&'static str, usize, usize)> {
     m.insert("struct thread_info", ("[u8; 40]", 40, 8));
     m.insert("union udp_endpoint", ("[u8; 32]", 32, 4));
     m.insert("struct user_apc", ("[u8; 40]", 40, 8));
+    // D3DKMT handles (upstream Wine 11+)
+    m.insert("d3dkmt_handle_t", ("u32", 4, 4));
     // Shared memory types (Proton-specific)
     m.insert("desktop_shm_t", ("u32", 4, 4));
     m.insert("queue_shm_t", ("u32", 4, 4));

@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Build triskelion, clone Valve Wine, and apply triskelion patches."""
+"""Build and deploy amphetamine: triskelion binary, DXVK/VKD3D, optional ntsync ntdll."""
 
 import filecmp
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tarfile
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -13,12 +17,11 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 RUST_DIR = SCRIPT_DIR / "amphetamine"
 PATCHES_DIR = SCRIPT_DIR / "patches" / "wine"
 
-WINE_SRC_DIR = Path.home() / ".local" / "share" / "amphetamine" / "wine-src"
-WINE_OBJ_DIR = Path.home() / ".local" / "share" / "amphetamine" / "wine-obj"
-WINE_BUILD_DIR = Path.home() / ".local" / "share" / "amphetamine" / "wine-build"
+DATA_DIR = Path.home() / ".local" / "share" / "amphetamine"
+WINE_SRC_DIR = DATA_DIR / "wine-src"
+WINE_OBJ_DIR = DATA_DIR / "wine-obj"
 STEAM_COMPAT_DIR = Path.home() / ".local" / "share" / "Steam" / "compatibilitytools.d" / "amphetamine"
-WINE_CLONE_URL = "https://github.com/ValveSoftware/wine.git"
-WINE_CLONE_BRANCH = "proton_10.0"
+WINE_CLONE_URL = "https://gitlab.winehq.org/wine/wine.git"
 
 # Essential build deps for Wine on Arch-based systems.
 # WoW64 mode (--enable-archs=x86_64,i386) uses mingw for 32-bit PE DLLs,
@@ -67,7 +70,7 @@ static inline BOOL triskelion_has_posted( volatile void *queue_ptr )
 }
 """
 
-# Patch text: server.c bypass block (inserted before FTRACE_BLOCK_START)
+# Patch text: server.c bypass block (inserted before send_request)
 SERVER_BYPASS = """\
     /* triskelion: shared memory bypass for hot-path messages */
     ret = triskelion_try_bypass( req_ptr );
@@ -77,12 +80,13 @@ SERVER_BYPASS = """\
 """
 
 # Patch text: win32u peek_message condition prefix
-PEEK_MSG_PREFIX = """\
+PEEK_MSG_GUARD = """\
         /* triskelion: if the shm ring has pending posted messages,
-         * disable check_queue_bits and force the server call path.
+         * skip check_queue_bits and force the server call path.
          * The bypass in ntdll server_call_unlocked will pop from the ring. */
-        if (!triskelion_has_posted(NtCurrentTeb()->glReserved2) &&
-            """
+        if (triskelion_has_posted(NtCurrentTeb()->glReserved2))
+            ;  /* fall through to server call */
+        else """
 
 
 ENV_CONFIG_TEMPLATE = """\
@@ -156,6 +160,32 @@ def prompt_yn(question):
             return False
 
 
+def get_latest_wine_tag():
+    """Query upstream Wine for the latest stable release tag (e.g. wine-11.4)."""
+    out = subprocess.run(
+        ["git", "ls-remote", "--tags", WINE_CLONE_URL],
+        capture_output=True, text=True,
+    )
+    if out.returncode != 0:
+        log("ERROR", "Failed to query Wine release tags")
+        return None
+
+    # Match stable tags: wine-X.Y (no -rc, no -dev)
+    tag_re = re.compile(r"refs/tags/(wine-(\d+)\.(\d+))$")
+    tags = []
+    for line in out.stdout.splitlines():
+        m = tag_re.search(line)
+        if m:
+            tags.append((int(m.group(2)), int(m.group(3)), m.group(1)))
+
+    if not tags:
+        log("ERROR", "No stable Wine tags found")
+        return None
+
+    tags.sort(reverse=True)
+    return tags[0][2]
+
+
 def build_triskelion():
     log("INFO", "Building triskelion...")
     ret = subprocess.run(["cargo", "build", "--release", "-p", "triskelion"], cwd=SCRIPT_DIR).returncode
@@ -219,14 +249,19 @@ def clone_wine():
         log("INFO", "Wine source: already cloned")
         return
 
-    log("INFO", f"Cloning Valve Wine ({WINE_CLONE_BRANCH})...")
+    tag = get_latest_wine_tag()
+    if not tag:
+        log("ERROR", "Cannot determine latest Wine release")
+        return
+
+    log("INFO", f"Cloning upstream Wine ({tag})...")
     WINE_SRC_DIR.parent.mkdir(parents=True, exist_ok=True)
     ret = subprocess.run([
-        "git", "clone", "--depth", "1", "-b", WINE_CLONE_BRANCH,
+        "git", "clone", "--depth", "1", "-b", tag,
         WINE_CLONE_URL, str(WINE_SRC_DIR),
     ]).returncode
     if ret != 0:
-        log("ERROR", "Clone failed — GitHub may be down, retry later")
+        log("ERROR", "Clone failed — GitLab may be down, retry later")
         return
     log("INFO", f"Clone complete: {WINE_SRC_DIR}")
 
@@ -261,27 +296,27 @@ def patch_server_c():
     text = path.read_text()
     patched = False
 
-    # Pre-hook: triskelion_try_bypass before server call
+    # Pre-hook: triskelion_try_bypass before send_request
     if "triskelion_try_bypass" not in text:
-        anchor = '    FTRACE_BLOCK_START("req %s", req->name)'
+        anchor = "    if ((ret = send_request( req ))) return ret;\n    return wait_reply( req );"
         if anchor not in text:
-            log("ERROR", f"Anchor not found in {path}: {anchor!r}")
+            log("ERROR", f"Anchor not found in {path}: send_request/wait_reply block")
             sys.exit(1)
-        text = text.replace(anchor, SERVER_BYPASS + anchor)
+        text = text.replace(anchor,
+            SERVER_BYPASS + anchor)
         patched = True
 
-    # Post-hook: triskelion_post_call after server call (ntsync shadow creation)
+    # Post-hook: triskelion_post_call after wait_reply (ntsync shadow creation)
     if "triskelion_post_call" not in text:
-        # Insert before the final "return ret;" in server_call_unlocked
-        post_anchor = "    FTRACE_BLOCK_END()\n    return ret;\n}"
+        post_anchor = "    return wait_reply( req );"
         if post_anchor not in text:
-            log("ERROR", f"Anchor not found in {path}: FTRACE_BLOCK_END return")
+            log("ERROR", f"Anchor not found in {path}: return wait_reply")
             sys.exit(1)
         text = text.replace(post_anchor,
-            "    FTRACE_BLOCK_END()\n"
+            "    ret = wait_reply( req );\n"
             "    /* triskelion: shadow newly created sync objects with ntsync */\n"
             "    triskelion_post_call( req_ptr, ret );\n"
-            "    return ret;\n}")
+            "    return ret;")
         patched = True
 
     if patched:
@@ -332,15 +367,15 @@ def patch_win32u_message():
         sys.exit(1)
     text = text.replace(func_anchor, func_anchor + WIN32U_FUNCTION)
 
-    # Modification B: prepend triskelion check to peek_message condition
-    original_condition = "!filter->waited && NtGetTickCount() - thread_info->last_getmsg_time < 3000"
+    # Modification B: prepend triskelion check to check_queue_bits condition
+    original_condition = "if (check_queue_bits( wake_mask, filter->mask, wake_mask | signal_bits, filter->mask | clear_bits,"
     if original_condition not in text:
-        log("ERROR", f"Anchor not found in {path}: peek_message condition")
+        log("ERROR", f"Anchor not found in {path}: check_queue_bits condition")
         sys.exit(1)
 
     text = text.replace(
-        "        if (" + original_condition,
-        PEEK_MSG_PREFIX + original_condition,
+        "        " + original_condition,
+        PEEK_MSG_GUARD + original_condition,
     )
     path.write_text(text)
     log("INFO", "Patched win32u/message.c: triskelion_has_posted + peek_message bypass")
@@ -413,7 +448,7 @@ def install_wine_build_deps():
         subprocess.run(["pacman", "--version"], capture_output=True)
     except FileNotFoundError:
         log("ERROR", "pacman: not found — Wine build requires Arch-based system")
-        log("ERROR", "  Install deps manually, then re-run with --build-wine")
+        log("ERROR", "  Install deps manually, then re-run install.py")
         return False
 
     missing = []
@@ -446,76 +481,269 @@ def install_wine_build_deps():
 
 
 def build_wine():
-    """Configure, build, and install Wine from patched source.
-    Produces a locally-built Wine at ~/.local/share/amphetamine/wine-build/
-    with ntsync + triskelion patches baked in. ABI-safe because everything
-    is compiled on the user's machine with their toolchain."""
-    if not (WINE_SRC_DIR / "configure.ac").exists():
+    """Compile ntdll.so directly with gcc from Wine source — no Wine build system.
+    We patched triskelion.c and server.c. This compiles all ntdll unix sources
+    (20 files) into a single .so and deploys it to Steam compat dir."""
+    if not (WINE_SRC_DIR / "dlls").exists():
         log("ERROR", "Wine source: not found")
         return False
 
-    # Check if already built
-    wine_bin = WINE_BUILD_DIR / "bin" / "wine"
-    wine64_bin = WINE_BUILD_DIR / "bin" / "wine64"
-    if wine_bin.exists() or wine64_bin.exists():
-        log("INFO", "Wine: already built")
-        if not prompt_yn("  Rebuild Wine from source?"):
+    ntdll_dest = STEAM_COMPAT_DIR / "lib" / "ntdll.so"
+    if ntdll_dest.exists():
+        log("INFO", "ntdll.so: already deployed")
+        if not prompt_yn("  Rebuild?"):
             return True
 
-    if not install_wine_build_deps():
-        return False
-
-    # Generate configure script if not present
-    configure = WINE_SRC_DIR / "configure"
-    if not configure.exists():
-        log("INFO", "Generating configure script...")
-        ret = subprocess.run(["autoreconf", "-fi"], cwd=WINE_SRC_DIR).returncode
+    # One-time configure to generate config.h (the only thing we need)
+    config_h = WINE_OBJ_DIR / "include" / "config.h"
+    if not config_h.exists():
+        log("INFO", "Running configure (one-time, for config.h)...")
+        WINE_OBJ_DIR.mkdir(parents=True, exist_ok=True)
+        configure = WINE_SRC_DIR / "configure"
+        if not configure.exists():
+            ret = subprocess.run(["autoreconf", "-fi"], cwd=WINE_SRC_DIR).returncode
+            if ret != 0:
+                log("ERROR", "autoreconf: failed")
+                return False
+        ret = subprocess.run([
+            str(configure),
+            "--enable-archs=x86_64,i386",
+            "--with-wayland", "--with-vulkan",
+            "--disable-tests",
+        ], cwd=WINE_OBJ_DIR).returncode
         if ret != 0:
-            log("ERROR", "autoreconf: failed")
+            log("ERROR", "Configure failed")
             return False
 
-    # Out-of-tree build
-    WINE_OBJ_DIR.mkdir(parents=True, exist_ok=True)
-    WINE_BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    # Compile all ntdll unix sources (skip non-x86_64 signal handlers)
+    skip = {"signal_arm.c", "signal_arm64.c", "signal_i386.c"}
+    unix_dir = WINE_SRC_DIR / "dlls" / "ntdll" / "unix"
+    sources = sorted(f for f in unix_dir.glob("*.c") if f.name not in skip)
 
-    # Configure
-    log("INFO", "Configuring Wine...")
-    configure_cmd = [
-        str(configure),
-        f"--prefix={WINE_BUILD_DIR}",
-        "--enable-archs=x86_64,i386",
-        "--with-wayland",
-        "--with-vulkan",
-        "--with-gstreamer",
-        "--with-pulse",
-        "--with-alsa",
-        "--without-oss",
-        "--disable-tests",
+    gcc_base = [
+        "gcc", "-c", "-fPIC", "-O2", "-pipe",
+        f"-I{WINE_OBJ_DIR}/include",
+        f"-I{WINE_SRC_DIR}/include",
+        f"-I{WINE_SRC_DIR}/dlls/ntdll",
+        "-D__WINESRC__", "-DHAVE_CONFIG_H", "-DWINE_UNIX_LIB",
+        "-D_NTSYSTEM_", "-DLTC_NO_PROTOTYPES", "-DLTC_SOURCE",
+        "-D_ACRTIMP=", "-DWINBASEAPI=",
+        '-DBINDIR="/usr/bin"', '-DLIBDIR="/usr/lib"',
+        '-DDATADIR="/usr/share"', '-DSYSTEMDLLPATH="/usr/lib/wine"',
+        "-fcf-protection=none", "-fvisibility=hidden",
+        "-fno-stack-protector", "-fno-strict-aliasing",
     ]
-    ret = subprocess.run(configure_cmd, cwd=WINE_OBJ_DIR).returncode
+
+    obj_dir = WINE_OBJ_DIR / "amphetamine_objs"
+    obj_dir.mkdir(parents=True, exist_ok=True)
+
+    log("INFO", f"Compiling ntdll ({len(sources)} files, gcc)...")
+    objects = []
+    for src in sources:
+        obj = obj_dir / src.with_suffix(".o").name
+        ret = subprocess.run(
+            gcc_base + ["-o", str(obj), str(src)],
+            capture_output=True, text=True,
+        ).returncode
+        if ret != 0:
+            log("ERROR", f"Failed to compile {src.name}")
+            return False
+        objects.append(obj)
+
+    # Link into ntdll.so
+    ntdll_so = obj_dir / "ntdll.so"
+    ret = subprocess.run(
+        ["gcc", "-shared", "-o", str(ntdll_so)] + [str(o) for o in objects]
+        + ["-lpthread", "-lrt", "-lm"],
+    ).returncode
     if ret != 0:
-        log("ERROR", "Wine configure failed — check output above for missing deps")
+        log("ERROR", "Failed to link ntdll.so")
         return False
 
-    # Build
-    import multiprocessing
-    jobs = multiprocessing.cpu_count()
-    log("INFO", f"Building Wine with {jobs} threads...")
-    ret = subprocess.run(["make", f"-j{jobs}"], cwd=WINE_OBJ_DIR).returncode
-    if ret != 0:
-        log("ERROR", "Wine build: failed")
-        return False
-
-    # Install
-    log("INFO", f"Installing Wine to {WINE_BUILD_DIR}...")
-    ret = subprocess.run(["make", "install"], cwd=WINE_OBJ_DIR).returncode
-    if ret != 0:
-        log("ERROR", "Wine install: failed")
-        return False
-
-    log("INFO", f"Wine built: {WINE_BUILD_DIR}")
-    log("INFO", "  amphetamine will auto-detect this build (ntsync enabled)")
+    # Deploy
+    lib_dir = STEAM_COMPAT_DIR / "lib"
+    lib_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(ntdll_so, ntdll_dest)
+    log("INFO", f"Deployed ntdll.so ({ntdll_dest.stat().st_size // 1024} KB)")
     return True
+
+
+def download_github_release(owner, repo, asset_glob):
+    """Download latest release asset from GitHub. Returns path to cached tarball or None."""
+    cache_dir = DATA_DIR / "downloads"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check what we already have cached
+    version_file = cache_dir / f"{repo}.version"
+    cached_version = version_file.read_text().strip() if version_file.exists() else None
+
+    # Query GitHub API for latest release
+    api_url = f"https://api.github.com/repos/{owner}/{repo}/releases/latest"
+    try:
+        req = urllib.request.Request(api_url, headers={"Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+    except Exception as e:
+        log("WARN", f"{repo}: failed to query GitHub API: {e}")
+        # Fall back to cached version if available
+        existing = list(cache_dir.glob(f"{repo}-*.tar.*"))
+        if existing:
+            log("INFO", f"{repo}: using cached download")
+            return existing[0]
+        return None
+
+    tag = data.get("tag_name", "")
+    if tag == cached_version:
+        existing = list(cache_dir.glob(f"{repo}-*.tar.*"))
+        if existing:
+            log("INFO", f"{repo}: {tag} (cached)")
+            return existing[0]
+
+    # Find matching asset
+    download_url = None
+    asset_name = None
+    for asset in data.get("assets", []):
+        name = asset["name"]
+        if asset_glob in name and name.endswith((".tar.gz", ".tar.xz", ".tar.zst")):
+            download_url = asset["browser_download_url"]
+            asset_name = name
+            break
+
+    if not download_url:
+        log("WARN", f"{repo}: no matching release asset found (looking for '{asset_glob}')")
+        return None
+
+    # Clean old cached versions
+    for old in cache_dir.glob(f"{repo}-*.tar.*"):
+        old.unlink()
+
+    dest = cache_dir / asset_name
+    log("INFO", f"{repo}: downloading {tag}...")
+    try:
+        urllib.request.urlretrieve(download_url, dest)
+    except Exception as e:
+        log("ERROR", f"{repo}: download failed: {e}")
+        return None
+
+    version_file.write_text(tag)
+    log("INFO", f"{repo}: downloaded {asset_name}")
+    return dest
+
+
+def download_dxvk_vkd3d():
+    """Download DXVK and VKD3D-proton from GitHub releases."""
+    dxvk_tar = download_github_release("doitsujin", "dxvk", "dxvk-")
+    vkd3d_tar = download_github_release("HansKristian-Work", "vkd3d-proton", "vkd3d-proton-")
+    return dxvk_tar, vkd3d_tar
+
+
+def deploy_dxvk_vkd3d(dxvk_tar, vkd3d_tar):
+    """Extract DXVK and VKD3D-proton DLLs into amphetamine's lib directory."""
+    lib_dir = STEAM_COMPAT_DIR / "lib"
+
+    if dxvk_tar:
+        _deploy_tarball_dlls(dxvk_tar, lib_dir, "dxvk", "x64", "x32")
+    if vkd3d_tar:
+        _deploy_tarball_dlls(vkd3d_tar, lib_dir, "vkd3d-proton", "x64", "x86")
+
+
+def _deploy_tarball_dlls(tarball, lib_dir, label, dir_64, dir_32):
+    """Extract DLLs from a DXVK or VKD3D-proton tarball into lib/wine/{label}/."""
+    staging = DATA_DIR / "staging" / label
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with tarfile.open(tarball) as tf:
+            try:
+                tf.extractall(staging, filter="data")
+            except TypeError:
+                # Python < 3.12: no filter parameter
+                tf.extractall(staging)
+    except Exception as e:
+        log("ERROR", f"{label}: failed to extract tarball: {e}")
+        return
+
+    # Find the extracted directory (e.g., dxvk-2.5.3/)
+    extracted = list(staging.iterdir())
+    if not extracted:
+        log("ERROR", f"{label}: tarball extracted empty")
+        return
+    root = extracted[0]
+
+    # Deploy 64-bit DLLs
+    src_64 = root / dir_64
+    dst_64 = lib_dir / "wine" / label / "x86_64-windows"
+    if src_64.exists():
+        dst_64.mkdir(parents=True, exist_ok=True)
+        count = 0
+        for dll in src_64.glob("*.dll"):
+            shutil.copy2(dll, dst_64 / dll.name)
+            count += 1
+        log("INFO", f"{label}: deployed {count} 64-bit DLLs")
+
+    # Deploy 32-bit DLLs
+    src_32 = root / dir_32
+    dst_32 = lib_dir / "wine" / label / "i386-windows"
+    if src_32.exists():
+        dst_32.mkdir(parents=True, exist_ok=True)
+        count = 0
+        for dll in src_32.glob("*.dll"):
+            shutil.copy2(dll, dst_32 / dll.name)
+            count += 1
+        log("INFO", f"{label}: deployed {count} 32-bit DLLs")
+
+    # Cleanup staging
+    shutil.rmtree(staging, ignore_errors=True)
+
+
+def find_proton():
+    """Find Proton installation (optional). Returns path to files/ dir or None."""
+    steam_common = Path.home() / ".steam" / "root" / "steamapps" / "common"
+
+    proton_exp = steam_common / "Proton - Experimental" / "files"
+    if (proton_exp / "bin").exists():
+        return proton_exp
+
+    if steam_common.exists():
+        for entry in steam_common.iterdir():
+            if entry.name.startswith("Proton"):
+                files = entry / "files"
+                if (files / "bin").exists():
+                    return files
+
+    return None
+
+
+def deploy_steam_exe():
+    """Deploy steam.exe — cached copy or extract from Proton once."""
+    cached = DATA_DIR / "steam.exe"
+
+    # Already cached? Just verify it's still there
+    if cached.exists():
+        log("INFO", "steam.exe: cached")
+        return True
+
+    # Extract from Proton
+    proton = find_proton()
+    if not proton:
+        log("WARN", "steam.exe: Proton not found — cannot extract")
+        log("WARN", "  Games will run but Steam overlay/achievements won't work")
+        log("WARN", "  Install any Proton from Steam to fix this (one-time extraction)")
+        return False
+
+    # Look for steam.exe in Proton's Wine DLL dirs
+    for subdir in ("x86_64-windows", "i386-windows"):
+        src = proton / "lib" / "wine" / subdir / "steam.exe"
+        if src.exists():
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, cached)
+            log("INFO", f"steam.exe: extracted from Proton and cached")
+            return True
+
+    log("WARN", "steam.exe: not found in Proton installation")
+    return False
 
 
 def configure_verbose():
@@ -535,14 +763,13 @@ def configure_verbose():
 
 
 def check_dependencies():
-    """Verify all required dependencies before building."""
+    """Verify required dependencies: Rust, Git, Steam, system Wine."""
     ok = True
 
     # Rust 1.85+ (edition 2024)
     try:
         out = subprocess.run(["rustc", "--version"], capture_output=True, text=True)
         if out.returncode == 0:
-            # "rustc 1.93.1 (01f6ddf75 ...)" -> "1.93.1"
             ver = out.stdout.split()[1]
             parts = ver.split(".")
             major, minor = int(parts[0]), int(parts[1])
@@ -582,34 +809,29 @@ def check_dependencies():
         log("ERROR", "  Install Steam natively (not Flatpak)")
         ok = False
 
-    # Wine runtime (Wine binaries, DXVK, VKD3D-Proton, Steam client bridge).
-    # These are independent components that Valve bundles inside Proton.
-    # A Proton installation is the easiest way to get them all.
-    steam_common = Path.home() / ".steam" / "root" / "steamapps" / "common"
-    proton_found = False
-    proton_name = None
-
-    proton_exp = steam_common / "Proton - Experimental" / "files" / "bin" / "wine64"
-    if proton_exp.exists():
-        proton_found = True
-        proton_name = "Proton Experimental"
-    elif steam_common.exists():
-        for entry in steam_common.iterdir():
-            if entry.name.startswith("Proton") and (entry / "files" / "bin" / "wine64").exists():
-                proton_found = True
-                proton_name = entry.name
-                break
-
-    if proton_found:
-        log("INFO", f"Wine runtime: {proton_name}")
-    else:
-        log("ERROR", "Wine runtime: not found")
-        log("ERROR", "  amphetamine needs Wine binaries, DXVK, VKD3D-Proton, and the")
-        log("ERROR", "  Steam client bridge. These ship inside any Proton installation.")
-        log("ERROR", "")
-        log("ERROR", "  Install any Proton from Steam:")
-        log("ERROR", "    Steam → Library → search 'Proton' → Install")
+    # System Wine
+    try:
+        out = subprocess.run(["wine", "--version"], capture_output=True, text=True)
+        if out.returncode == 0:
+            log("INFO", f"Wine: {out.stdout.strip()}")
+        else:
+            log("ERROR", "Wine: not found")
+            log("ERROR", "  Install Wine from your package manager")
+            ok = False
+    except FileNotFoundError:
+        log("ERROR", "Wine: not found")
+        log("ERROR", "  Install Wine from your package manager")
         ok = False
+
+    # gcc (needed for ntsync build, warn but don't fail)
+    try:
+        out = subprocess.run(["gcc", "--version"], capture_output=True, text=True)
+        if out.returncode == 0:
+            log("INFO", "gcc: found (needed for ntsync build)")
+        else:
+            log("WARN", "gcc: not found (needed only for ntsync build)")
+    except FileNotFoundError:
+        log("WARN", "gcc: not found (needed only for ntsync build)")
 
     return ok
 
@@ -620,19 +842,55 @@ def main():
     if not check_dependencies():
         return 1
 
-    clone_wine()
-    if not (WINE_SRC_DIR / "dlls").exists():
-        log("ERROR", "Wine source: not available — cannot continue")
-        sys.exit(1)
-
+    # Step 1: Build and deploy triskelion binary
     ret = build_triskelion()
     if ret != 0:
         return ret
 
+    # Step 2: ntsync build (optional — user prompt)
+    print()
+    check_ntsync()
+    print()
+
+    if prompt_yn("  Build triskelion with ntsync with Wine's upstream compatibility?"):
+        if not install_wine_build_deps():
+            log("WARN", "Skipping ntsync build — missing dependencies")
+        else:
+            clone_wine()
+            if (WINE_SRC_DIR / "dlls").exists():
+                patch_copy_triskelion_c()
+                patch_makefile_in()
+                patch_server_c()
+                patch_unix_private_h()
+                patch_win32u_message()
+                log("INFO", f"Wine source patched: {WINE_SRC_DIR}")
+
+                print()
+                if build_wine():
+                    log("INFO", "ntdll.so built: ntsync + shared-memory message bypass enabled")
+                else:
+                    log("WARN", "ntdll.so build failed — games still work without ntsync")
+            else:
+                log("ERROR", "Wine source: clone failed — skipping ntsync build")
+    else:
+        log("INFO", "ntsync build: skipped")
+
+    # Step 3: Download and deploy DXVK/VKD3D-proton from GitHub
+    print()
+    log("INFO", "Downloading DXVK and VKD3D-proton...")
+    dxvk_tar, vkd3d_tar = download_dxvk_vkd3d()
+    if dxvk_tar or vkd3d_tar:
+        deploy_dxvk_vkd3d(dxvk_tar, vkd3d_tar)
+    else:
+        log("WARN", "DXVK/VKD3D: download failed — games needing D3D translation may fail")
+
+    # Step 4: Cache and deploy steam.exe
+    print()
+    deploy_steam_exe()
+
+    # Step 5: User configuration
     configure_shader_cache()
     configure_custom_env()
-
-    check_ntsync()
 
     print()
     log("INFO", "Save data protection: enabled (automatic)")
@@ -640,29 +898,7 @@ def main():
     log("INFO", "  wipes files during first launch with a new compatibility tool.")
     print()
 
-    if (WINE_SRC_DIR / "dlls").exists():
-        patch_copy_triskelion_c()
-        patch_makefile_in()
-        patch_server_c()
-        patch_unix_private_h()
-        patch_win32u_message()
-
-        log("INFO", f"Wine source patched: {WINE_SRC_DIR}")
-
-        if "--build-wine" in sys.argv:
-            print()
-            log("INFO", "Building Wine with shared-memory message bypass...")
-            if build_wine():
-                log("INFO", "Wine built: PostMessage/GetMessage bypass wineserver via shared memory")
-            else:
-                log("WARN", "Wine build failed — games still work (bypass disabled, all messages route through triskelion)")
-        else:
-            log("INFO", "Optional: build Wine with shared-memory message bypass:")
-            log("INFO", "  python install.py --build-wine")
-    else:
-        log("WARN", "Wine source: not available, skipping patches")
-        log("WARN", "Binary deployed to Steam — games now utilize triskelion to interface with Wine")
-
+    log("INFO", "Installation complete!")
     return 0
 
 
