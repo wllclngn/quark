@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and deploy amphetamine: triskelion binary, DXVK/VKD3D, optional ntsync ntdll."""
+"""Build and deploy amphetamine: triskelion binary, DXVK/VKD3D, optional ntsync ntdll, optional kernel module."""
 
 import filecmp
 import json
@@ -22,6 +22,9 @@ WINE_SRC_DIR = DATA_DIR / "wine-src"
 WINE_OBJ_DIR = DATA_DIR / "wine-obj"
 STEAM_COMPAT_DIR = Path.home() / ".local" / "share" / "Steam" / "compatibilitytools.d" / "amphetamine"
 WINE_CLONE_URL = "https://gitlab.winehq.org/wine/wine.git"
+
+KMOD_SOURCE = SCRIPT_DIR / "amphetamine-c23"
+KMOD_NAME = "triskelion_kmod"
 
 # Essential build deps for Wine on Arch-based systems.
 # WoW64 mode (--enable-archs=x86_64,i386) uses mingw for 32-bit PE DLLs,
@@ -746,6 +749,227 @@ def deploy_steam_exe():
     return False
 
 
+### ── Kernel module (amphetamine-c23) ────────────────────────────────────
+
+
+def get_kernel_version():
+    return os.uname().release
+
+
+def check_kernel_headers(kver):
+    return Path(f"/lib/modules/{kver}/build").exists()
+
+
+def detect_kernel_compiler(kver):
+    """Return extra make args if the kernel was built with LLVM."""
+    auto_conf = Path(f"/lib/modules/{kver}/build/include/config/auto.conf")
+    if auto_conf.exists():
+        try:
+            text = auto_conf.read_text()
+            if "CONFIG_CC_IS_CLANG=y" in text:
+                return ["LLVM=1"]
+        except OSError:
+            pass
+    return []
+
+
+def find_kmod_tool(name):
+    path = shutil.which(name)
+    if path:
+        return path
+    for sbin in ("/usr/sbin", "/sbin"):
+        candidate = os.path.join(sbin, name)
+        if os.path.isfile(candidate):
+            return candidate
+    return name
+
+
+def get_module_vermagic(ko_path):
+    """Extract vermagic kernel version from a .ko file."""
+    modinfo = find_kmod_tool("modinfo")
+    out = subprocess.run([modinfo, str(ko_path)], capture_output=True, text=True)
+    if out.returncode != 0:
+        return None
+    for line in out.stdout.splitlines():
+        if line.startswith("vermagic:"):
+            return line.split()[1]
+    return None
+
+
+def build_and_install_kernel_module():
+    """Build, install, and load the triskelion kernel module."""
+    if not KMOD_SOURCE.exists():
+        log("ERROR", f"Kernel module source not found: {KMOD_SOURCE}")
+        return False
+
+    kver = get_kernel_version()
+
+    if not check_kernel_headers(kver):
+        log("ERROR", f"Kernel headers not found for {kver}")
+        log("ERROR", "  Arch: sudo pacman -S linux-headers  (or linux-cachyos-headers)")
+        log("ERROR", "  Debian/Ubuntu: sudo apt install linux-headers-$(uname -r)")
+        log("ERROR", "  Fedora: sudo dnf install kernel-devel")
+        return False
+
+    # Space-in-path handling: kernel build system can't handle spaces in M=
+    build_src = KMOD_SOURCE
+    tmp_build = Path("/tmp/triskelion-kmod")
+    if " " in str(KMOD_SOURCE):
+        log("INFO", "Staging kernel source to /tmp (path has spaces)...")
+        if tmp_build.exists():
+            shutil.rmtree(tmp_build)
+        exclude = {".o", ".ko", ".mod", ".mod.c", ".mod.o", ".order", ".symvers"}
+        shutil.copytree(
+            KMOD_SOURCE, tmp_build,
+            ignore=shutil.ignore_patterns(
+                "*.o", "*.ko", "*.mod*", ".tmp*",
+                "Module.symvers", "modules.order",
+            ),
+        )
+        build_src = tmp_build
+
+    # Detect compiler toolchain
+    cc_args = detect_kernel_compiler(kver)
+    kbuild = f"/lib/modules/{kver}/build"
+
+    # Clean + build
+    log("INFO", f"Building kernel module ({kver})...")
+    make_base = ["make", "-C", kbuild, f"M={build_src}"] + cc_args
+
+    subprocess.run(make_base + ["clean"], capture_output=True)
+    result = subprocess.run(make_base + ["modules"], capture_output=True, text=True)
+
+    if result.returncode != 0:
+        log("ERROR", "Kernel module build failed:")
+        for line in result.stderr.splitlines():
+            if "error:" in line:
+                log("ERROR", f"  {line.strip()}")
+        return False
+
+    ko_path = build_src / f"{KMOD_NAME}.ko"
+    if not ko_path.exists():
+        log("ERROR", f"{KMOD_NAME}.ko not found after build")
+        return False
+
+    log("INFO", f"Built: {KMOD_NAME}.ko ({ko_path.stat().st_size // 1024} KB)")
+
+    # Verify vermagic matches running kernel
+    vermagic = get_module_vermagic(ko_path)
+    if vermagic and vermagic != kver:
+        log("ERROR", f"Vermagic mismatch: module={vermagic}, kernel={kver}")
+        log("ERROR", "  Install matching kernel headers and rebuild")
+        return False
+
+    # Install
+    log("INFO", "Installing kernel module (sudo required)...")
+
+    ret = subprocess.run(["sudo", "mkdir", "-p", f"/lib/modules/{kver}/extra"]).returncode
+    if ret != 0:
+        log("ERROR", "Failed to create module directory")
+        return False
+
+    ret = subprocess.run([
+        "sudo", "cp", str(ko_path), f"/lib/modules/{kver}/extra/{KMOD_NAME}.ko"
+    ]).returncode
+    if ret != 0:
+        log("ERROR", "Failed to copy kernel module")
+        return False
+
+    depmod = find_kmod_tool("depmod")
+    subprocess.run(["sudo", depmod, "-a"], capture_output=True)
+
+    # Auto-load on boot
+    conf_path = f"/etc/modules-load.d/{KMOD_NAME}.conf"
+    proc = subprocess.Popen(
+        ["sudo", "tee", conf_path],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+    )
+    proc.communicate(input=f"{KMOD_NAME}\n".encode())
+
+    # Load module
+    rmmod = find_kmod_tool("rmmod")
+    modprobe = find_kmod_tool("modprobe")
+
+    # Unload if already loaded
+    check = subprocess.run(["lsmod"], capture_output=True, text=True)
+    if KMOD_NAME in check.stdout:
+        subprocess.run(["sudo", rmmod, KMOD_NAME], capture_output=True)
+
+    ret = subprocess.run(["sudo", modprobe, KMOD_NAME]).returncode
+    if ret != 0:
+        log("ERROR", "Failed to load kernel module")
+        return False
+
+    # Verify
+    if Path("/dev/triskelion").exists():
+        log("INFO", "/dev/triskelion: live")
+    else:
+        log("WARN", "/dev/triskelion not found — module loaded but device missing")
+
+    check = subprocess.run(["lsmod"], capture_output=True, text=True)
+    if KMOD_NAME in check.stdout:
+        log("INFO", f"Kernel module loaded: {KMOD_NAME}")
+        log("INFO", f"  Auto-load on boot: {conf_path}")
+        log("INFO", "  Re-run installer after kernel upgrades!")
+        return True
+
+    log("ERROR", "Kernel module failed to load")
+    return False
+
+
+def uninstall_kernel_module():
+    """Unload, remove, and clean up the triskelion kernel module."""
+    kver = get_kernel_version()
+    ko_path = Path(f"/lib/modules/{kver}/extra/{KMOD_NAME}.ko")
+    conf_path = Path(f"/etc/modules-load.d/{KMOD_NAME}.conf")
+    removed = False
+
+    # Unload if loaded
+    check = subprocess.run(["lsmod"], capture_output=True, text=True)
+    if KMOD_NAME in check.stdout:
+        rmmod = find_kmod_tool("rmmod")
+        subprocess.run(["sudo", rmmod, KMOD_NAME])
+        log("INFO", f"Unloaded: {KMOD_NAME}")
+
+    if ko_path.exists():
+        subprocess.run(["sudo", "rm", str(ko_path)])
+        removed = True
+
+    if conf_path.exists():
+        subprocess.run(["sudo", "rm", str(conf_path)])
+        removed = True
+
+    if removed:
+        depmod = find_kmod_tool("depmod")
+        subprocess.run(["sudo", depmod, "-a"], capture_output=True)
+        log("INFO", "Kernel module uninstalled")
+
+    return True
+
+
+def resolve_kernel():
+    """Determine whether to build the kernel module. Returns True/False."""
+    if not KMOD_SOURCE.exists():
+        return False
+
+    kver = get_kernel_version()
+    if not check_kernel_headers(kver):
+        log("INFO", f"Kernel headers not found for {kver} — skipping kernel module")
+        log("INFO", "  Arch: sudo pacman -S linux-headers  (or linux-cachyos-headers)")
+        log("INFO", "  Debian/Ubuntu: sudo apt install linux-headers-$(uname -r)")
+        log("INFO", "  Fedora: sudo dnf install kernel-devel")
+        return False
+
+    print()
+    print(f"  Linux kernel headers found (kernel {kver}).")
+    print("  amphetamine can install the triskelion kernel module:")
+    print("    - Wineserver in ring 0 — zero context switches")
+    print("    - Sub-3\u00b5s sync operations (semaphore, mutex, event)")
+    print("    - /dev/triskelion char device, per-game server context")
+    print()
+    return prompt_yn("  Install the triskelion kernel module?")
+
+
 def configure_verbose():
     """Handle --verbose / --no-verbose flags. Sticky: once enabled, stays
     enabled until explicitly disabled with --no-verbose."""
@@ -875,7 +1099,14 @@ def main():
     else:
         log("INFO", "ntsync build: skipped")
 
-    # Step 3: Download and deploy DXVK/VKD3D-proton from GitHub
+    # Step 3: Kernel module (optional — user prompt)
+    if resolve_kernel():
+        if build_and_install_kernel_module():
+            log("INFO", "Kernel module: installed and loaded")
+        else:
+            log("WARN", "Kernel module: build/install failed — games still work without it")
+
+    # Step 4: Download and deploy DXVK/VKD3D-proton from GitHub
     print()
     log("INFO", "Downloading DXVK and VKD3D-proton...")
     dxvk_tar, vkd3d_tar = download_dxvk_vkd3d()
@@ -884,11 +1115,11 @@ def main():
     else:
         log("WARN", "DXVK/VKD3D: download failed — games needing D3D translation may fail")
 
-    # Step 4: Cache and deploy steam.exe
+    # Step 5: Cache and deploy steam.exe
     print()
     deploy_steam_exe()
 
-    # Step 5: User configuration
+    # Step 6: User configuration
     configure_shader_cache()
     configure_custom_env()
 

@@ -1,0 +1,4 @@
+obj-m := triskelion_kmod.o
+triskelion_kmod-y := triskelion_main.o triskelion_objects.o triskelion_sync.o triskelion_queue.o triskelion_dispatch.o
+
+ccflags-y := -Wall -Wextra

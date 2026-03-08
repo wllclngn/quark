@@ -1,0 +1,57 @@
+# triskelion kernel module test — 2026-03-07 19:24:56
+# pid 9656, uid 1000
+
+# HELP triskelion_test_passed Whether each ioctl test passed (1) or failed (0).
+# TYPE triskelion_test_passed gauge
+triskelion_test_passed{test="device_open"} 1 1772933096339
+triskelion_test_passed{test="create_semaphore"} 1 1772933096339
+triskelion_test_passed{test="create_mutex"} 1 1772933096339
+triskelion_test_passed{test="create_event"} 1 1772933096339
+triskelion_test_passed{test="release_semaphore"} 1 1772933096339
+triskelion_test_passed{test="release_mutex"} 1 1772933096339
+triskelion_test_passed{test="set_event"} 1 1772933096339
+triskelion_test_passed{test="reset_event"} 1 1772933096339
+triskelion_test_passed{test="pulse_event"} 1 1772933096339
+triskelion_test_passed{test="post_message"} 1 1772933096339
+triskelion_test_passed{test="get_message"} 1 1772933096339
+triskelion_test_passed{test="get_message_empty"} 1 1772933096339
+triskelion_test_passed{test="close_invalid_handle"} 1 1772933096339
+triskelion_test_passed{test="semaphore_overflow"} 1 1772933096339
+triskelion_test_passed{test="mutex_wrong_owner"} 1 1772933096339
+triskelion_test_passed{test="close_semaphore"} 1 1772933096339
+triskelion_test_passed{test="close_mutex"} 1 1772933096339
+triskelion_test_passed{test="close_event"} 1 1772933096339
+
+# HELP triskelion_test_duration_nanoseconds Time taken for each ioctl test.
+# TYPE triskelion_test_duration_nanoseconds gauge
+triskelion_test_duration_nanoseconds{test="device_open"} 35558 1772933096339
+triskelion_test_duration_nanoseconds{test="create_semaphore"} 13439 1772933096339
+triskelion_test_duration_nanoseconds{test="create_mutex"} 6964 1772933096339
+triskelion_test_duration_nanoseconds{test="create_event"} 3718 1772933096339
+triskelion_test_duration_nanoseconds{test="release_semaphore"} 3279 1772933096339
+triskelion_test_duration_nanoseconds{test="release_mutex"} 2967 1772933096339
+triskelion_test_duration_nanoseconds{test="set_event"} 2496 1772933096339
+triskelion_test_duration_nanoseconds{test="reset_event"} 2415 1772933096339
+triskelion_test_duration_nanoseconds{test="pulse_event"} 2446 1772933096339
+triskelion_test_duration_nanoseconds{test="post_message"} 8484 1772933096339
+triskelion_test_duration_nanoseconds{test="get_message"} 5500 1772933096339
+triskelion_test_duration_nanoseconds{test="get_message_empty"} 2108 1772933096339
+triskelion_test_duration_nanoseconds{test="close_invalid_handle"} 9089 1772933096339
+triskelion_test_duration_nanoseconds{test="semaphore_overflow"} 9237 1772933096339
+triskelion_test_duration_nanoseconds{test="mutex_wrong_owner"} 8344 1772933096339
+triskelion_test_duration_nanoseconds{test="close_semaphore"} 2662 1772933096339
+triskelion_test_duration_nanoseconds{test="close_mutex"} 3936 1772933096339
+triskelion_test_duration_nanoseconds{test="close_event"} 2248 1772933096339
+
+# HELP triskelion_tests_total Total number of tests executed.
+# TYPE triskelion_tests_total counter
+triskelion_tests_total 18 1772933096339
+
+# HELP triskelion_tests_passed_total Total number of tests that passed.
+# TYPE triskelion_tests_passed_total counter
+triskelion_tests_passed_total 18 1772933096339
+
+# HELP triskelion_tests_failed_total Total number of tests that failed.
+# TYPE triskelion_tests_failed_total counter
+triskelion_tests_failed_total 0 1772933096339
+

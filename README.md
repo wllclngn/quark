@@ -12,7 +12,7 @@ amphetamine is a Steam compatibility layer that utilizes triskelion, a lock-free
 | Dependencies | Python 3, runtime libraries | libc |
 | Deployment cache | None (re-evaluates every launch) | v3 per-component (wine, dxvk, vkd3d, steam) |
 | Prefix setup | Python shutil (readdir + copy per file) | getdents64 (32 KB bulk reads) + hardlinks |
-| Wineserver sync | pthread mutexes, kernel locks | ntsync (kernel-native, Linux 6.14+), CAS/futex fallback |
+| Wineserver sync | pthread mutexes, kernel locks | `/dev/triskelion` kernel module (ring 0), ntsync fallback |
 | Timer precision | Fixed polling interval | timerfd (kernel-precise deadlines) |
 | Message passing | All through wineserver socket | Shared-memory SPSC bypass |
 | Save data | No protection | Pre-launch snapshot + post-game restore |
@@ -40,6 +40,11 @@ Steam
        ├─ Save data protection (pre-launch snapshot, post-game restore)
        ├─ Deployment cache (v3 per-component) — cache hit skips all file ops
        └─ wine64 with WINESERVER=triskelion
+            ├─ /dev/triskelion kernel module (ring 0 sync — sub-3μs median)
+            │    ├─ NT semaphore (atomic_cmpxchg CAS, slab cache)
+            │    ├─ NT mutex (spinlock, slab cache)
+            │    ├─ NT event (atomic_xchg, slab cache)
+            │    └─ Message queues (hlist hash table, per-thread ring buffers)
             ├─ ntsync kernel driver (Linux 6.14+) — native NT semaphore/mutex/event
             │    └─ Fallback: CAS + futex wake (older kernels)
             ├─ Shared-memory ring buffers (256 slots, atomic indices)
@@ -56,6 +61,34 @@ amphetamine does not interfere with VAC, EAC, or BattlEye. Triskelion runs as a 
 Steam's `compatibilitytools.d/` infrastructure exists for custom compatibility tools. Proton-GE and wine-tkg have operated for years with zero VAC ban incidents. amphetamine is not a cheat, a bypass, or a modification to game code.
 
 ## Performance
+
+### triskelion kernel module (`/dev/triskelion`)
+
+The triskelion kernel module moves wineserver sync primitives into ring 0. No socket, no context switch — userspace issues ioctls directly into kernel memory. Events use `atomic_xchg`, semaphores use `atomic_cmpxchg` CAS loops, all objects allocated from dedicated slab caches (`kmem_cache`).
+
+Benchmarked across 18 runs (324 ioctls, 0 failures):
+
+| Operation | Min (ns) | Median (ns) | Mean (ns) | Max (ns) | Mechanism |
+|---|---|---|---|---|---|
+| get_message_empty | 2,031 | 2,162 | 2,156 | 2,314 | ring buffer bounds check |
+| close_event | 1,988 | 2,136 | 2,682 | 11,848 | slab free + handle reclaim |
+| reset_event | 2,097 | 2,261 | 2,244 | 2,438 | `atomic_xchg` |
+| set_event | 2,343 | 2,490 | 2,519 | 2,982 | `atomic_xchg` + wake |
+| pulse_event | 2,353 | 2,524 | 2,540 | 2,756 | `atomic_xchg` + wake + reset |
+| close_semaphore | 2,487 | 2,697 | 2,711 | 2,931 | slab free + handle reclaim |
+| release_mutex | 2,637 | 2,795 | 2,853 | 3,311 | spinlock (owner+count) |
+| release_semaphore | 2,865 | 3,170 | 3,186 | 3,727 | `atomic_cmpxchg` CAS loop |
+| create_event | 3,123 | 3,605 | 3,586 | 3,971 | slab alloc + handle insert |
+| close_mutex | 3,522 | 3,692 | 3,832 | 6,039 | slab free + handle reclaim |
+| get_message | 4,988 | 5,116 | 5,188 | 5,792 | hash lookup + ring buffer read |
+| create_mutex | 5,840 | 6,420 | 6,447 | 7,021 | slab alloc + spinlock init |
+| post_message | 7,650 | 8,273 | 8,481 | 10,506 | hash lookup/create + ring insert |
+| create_semaphore | 9,840 | 10,285 | 10,771 | 22,542 | slab alloc (first, cold cache) |
+| device_open | 32,371 | 32,929 | 34,133 | 62,475 | `kzalloc` context + handle table |
+
+Hot-path sync operations (the calls Wine games make thousands of times per frame) hold at sub-3μs median. `device_open` is a one-time cost per game launch.
+
+### Userspace (Rust triskelion)
 
 - **Stack-allocated replies** — Fixed-size replies use a `[u8; 64]` stack buffer (`Reply::Fixed`). Zero heap allocation per request. `Vec` used only for VARARG replies (registry ops, startup info — rare).
 
@@ -88,6 +121,7 @@ Steam's `compatibilitytools.d/` infrastructure exists for custom compatibility t
 - **Wine** — System Wine from your package manager (runtime for games)
 - **Rust** (1.85+, 2024 edition)
 - **gcc, git** — Only needed if building ntsync support (optional)
+- **Linux kernel headers** — Only needed if building the triskelion kernel module (optional)
 - **Proton** (optional) — Only used for steam.exe extraction (one-time, cached)
 
 ```bash
@@ -105,8 +139,9 @@ rustup default stable
 The installer:
 1. Builds and deploys triskelion to `~/.local/share/Steam/compatibilitytools.d/amphetamine/`
 2. Prompts to build ntsync support (clones Wine source, compiles patched ntdll.so with gcc)
-3. Downloads DXVK and VKD3D-proton directly from GitHub releases
-4. Caches steam.exe from Proton (one-time extraction)
+3. Prompts to build and install the triskelion kernel module (`/dev/triskelion`) — auto-detects LLVM toolchain, verifies vermagic, sets up auto-load on boot
+4. Downloads DXVK and VKD3D-proton directly from GitHub releases
+5. Caches steam.exe from Proton (one-time extraction)
 
 Then select "amphetamine" as the compatibility tool for any game in Steam.
 
@@ -126,7 +161,7 @@ Requires Rust 2024 edition (rustc 1.85+). Single dependency: `libc`.
 `launcher.rs` — 1,557 lines of Rust that replace Proton's ~2,000-line Python script.
 
 **Discovery**:
-- Wine: `TRISKELION_WINE_DIR` → system Wine → Proton Experimental → any Proton (fallback)
+- Wine: `TRISKELION_WINE_DIR` → Proton Experimental → any Proton → system Wine (fallback)
 - Steam: `STEAM_COMPAT_CLIENT_INSTALL_PATH` → `~/.steam/root` → `~/.local/share/Steam`
 
 **Prefix setup**:
@@ -207,7 +242,18 @@ Wine source resolution: `WINE_SRC` → `~/.local/share/amphetamine/wine-src/` �
 
 ```
 amphetamine/
-  install.py               Build + deploy + Wine patching pipeline
+  install.py               Build + deploy + Wine patching + kernel module pipeline
+  amphetamine-c23/          triskelion kernel module (C, ring 0)
+    triskelion.h            UAPI header (ioctl numbers, arg structs)
+    triskelion_internal.h   Internal declarations (handle table, sync objects, ctx)
+    triskelion_main.c       /dev/triskelion miscdevice, open/release/ioctl
+    triskelion_sync.c       Semaphore, mutex, event (atomics + slab caches)
+    triskelion_objects.c    Handle tables, process/thread state
+    triskelion_queue.c      Per-thread message queues (hlist hash table)
+    triskelion_dispatch.c   ioctl dispatch (create/release/set/reset/pulse/close)
+    Kbuild                  Kernel build integration
+    Makefile                LLVM toolchain (CC=clang LD=ld.lld)
+    test_triskelion.py      ioctl test harness (18 tests, Prometheus .prom output)
   amphetamine/              triskelion Rust crate (6,448 lines)
     build.rs                protocol.def codegen (829 lines, 306 opcodes)
     include/
@@ -256,9 +302,12 @@ Steam calls `./proton waitforexitandrun <game.exe>`. triskelion's CLI parses it 
 
 ## Testing
 
-47 package integrity tests (test_package.py). Integration suite covers deploy, launch, profile, and multi-game comparison (triskelion-tests.py). Orchestrator covers patch, build, bypass, package, and compat validation (amphetamine-tests.py).
+47 package integrity tests (test_package.py). Integration suite covers deploy, launch, profile, and multi-game comparison (triskelion-tests.py). Orchestrator covers patch, build, bypass, package, and compat validation (amphetamine-tests.py). Kernel module has its own ioctl test harness with Prometheus output.
 
 ```bash
+# Kernel module tests (18 ioctl tests, outputs to ~/.cache/triskelion/*.prom)
+python3 amphetamine-c23/test_triskelion.py
+
 # Integration tests
 python3 tests/triskelion-tests.py test-deploy          # build + deploy
 python3 tests/triskelion-tests.py test-launch           # launch game via Steam
