@@ -17,7 +17,7 @@
 use crate::output::{DisplayHardware, GpuInfo, ConnectorInfo};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-pub const SHM_MAGIC: u32 = 0x504C4158; // "PLAX"
+pub const SHM_MAGIC: u32 = 0x5359424C; // "SYBL"
 pub const SHM_VERSION: u32 = 1;
 pub const MAX_CONNECTORS: usize = 8;
 pub const MAX_MODES_PER_CONNECTOR: usize = 64;
@@ -268,8 +268,9 @@ impl Drop for DisplayShm {
             if self.fd >= 0 {
                 libc::close(self.fd);
             }
-            let c_name = std::ffi::CString::new(self.shm_name.as_str()).unwrap();
-            libc::shm_unlink(c_name.as_ptr());
+            // Do NOT shm_unlink here — triskelion reads the segment after
+            // PARALLAX exits and handles cleanup via shm_unlink in
+            // parallax_display::read_parallax_shm().
         }
     }
 }

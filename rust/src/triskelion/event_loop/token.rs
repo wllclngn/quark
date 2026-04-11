@@ -127,13 +127,4 @@ impl EventLoop {
         reply_fixed(&ReplyHeader { error: 0, reply_size: 0 })
     }
 
-    pub(crate) fn handle_adjust_token_privileges(&mut self, _client_fd: i32, _buf: &[u8]) -> Reply {
-        // Return success with no modified privileges. Games call this to enable
-        // SeDebugPrivilege etc. We report success but don't track privileges.
-        reply_fixed(&AdjustTokenPrivilegesReply {
-            header: ReplyHeader { error: 0, reply_size: 0 },
-            len: 0,
-            _pad_0: [0; 4],
-        })
-    }
 }

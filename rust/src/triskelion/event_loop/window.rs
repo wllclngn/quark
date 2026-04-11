@@ -1,24 +1,8 @@
 // Window management, desktop, messaging, and input handling
 
 use super::*;
-#[allow(unused_variables)]
 
 impl EventLoop {
-
-    /// Walk up the parent chain checking WS_VISIBLE (stock: is_visible in window.c:882)
-    fn _is_window_visible(&self, handle: u32) -> bool {
-        const WS_VISIBLE: u32 = 0x10000000;
-        let mut win = handle;
-        loop {
-            let ws = match self.window_states.get(&win) {
-                Some(ws) => ws,
-                None => return false,
-            };
-            if ws.style & WS_VISIBLE == 0 { return false; }
-            if ws.parent == 0 { return true; } // reached root (desktop)
-            win = ws.parent;
-        }
-    }
 
     /// Walk up parents to find first ancestor with PAINT_HAS_SURFACE (stock: get_top_clipping_window)
     fn get_top_clipping_window(&self, handle: u32) -> u32 {
@@ -44,17 +28,92 @@ impl EventLoop {
 
         let tid = self.client_thread_id(client_fd as RawFd);
 
-        // Parse flags (stock: queue.c:3350)
+        // Parse flags (stock: queue.c:3337)
         // Low 16 bits: PM_NOREMOVE=0, PM_REMOVE=1, PM_NOYIELD=2
         // High 16 bits: QS_* filter mask. 0 = QS_ALLINPUT
         const QS_POSTMESSAGE: u32 = 0x0008;
         const QS_PAINT: u32 = 0x0020;
         const QS_TIMER: u32 = 0x0010;
         const QS_ALLINPUT: u32 = 0x04FF;
+        const QS_INPUT: u32 = 0x0407; // QS_MOUSEMOVE|QS_MOUSEBUTTON|QS_KEY|QS_RAWINPUT|QS_TOUCH|QS_POINTER
+        const QS_HOTKEY: u32 = 0x0080;
+        const QS_ALLPOSTMESSAGE: u32 = 0x0100;
         let filter = {
             let f = req.flags >> 16;
             if f == 0 { QS_ALLINPUT } else { f }
         };
+
+        // Stock Wine queue.c:3339-3350 clears changed_bits BEFORE checking.
+        // But stock also clears wake_bits when messages are consumed from
+        // server-side queues (hardware queue, posted list, etc.). In our
+        // architecture, input messages (QS_KEY, QS_MOUSEMOVE, QS_MOUSEBUTTON)
+        // don't pass through server-side queues — they're delivered by the
+        // client-side x11drv. So wake_bits for input get set by
+        // send_hardware_message but never cleared by message consumption.
+        //
+        // Wine's check_queue_bits (message.c:2906): if wake_bits & signal_bits
+        // is non-zero, the client ALWAYS calls the server → 20k+ req/sec spin.
+        //
+        // Fix: clear BOTH wake_bits AND changed_bits for filtered categories
+        // before checking. When real events arrive, set_queue_bits_for_tid
+        // re-sets them. This matches stock's semantic intent (clear stale
+        // state before each get_message pass) even though stock achieves it
+        // via different code paths.
+        if let Some(tid_val) = tid {
+            let locator = self.clients.values()
+                .find(|c| c.thread_id == tid_val)
+                .map(|c| c.queue_locator);
+            if let Some(locator) = locator {
+                let offset = u64::from_le_bytes([
+                    locator[8], locator[9], locator[10], locator[11],
+                    locator[12], locator[13], locator[14], locator[15],
+                ]) as usize;
+                if !self.session_map.is_null() && (offset + 1024) <= self.session_size {
+                    unsafe {
+                        let base = self.session_map.add(offset);
+                        let seq_atomic = &*(base as *const std::sync::atomic::AtomicI64);
+                        let shm = base.add(16);
+                        let old_seq = seq_atomic.load(std::sync::atomic::Ordering::Relaxed);
+                        seq_atomic.store(old_seq | 1, std::sync::atomic::Ordering::Release);
+                        // Stock queue.c:3339: ONLY clear changed_bits here, NOT wake_bits.
+                        // Clearing wake_bits before checking kills signals the game needs
+                        // during init (window creation, GL setup). wake_bits get cleared
+                        // when messages are actually consumed from the queue.
+                        let changed_bits_ptr = shm.add(20) as *mut u32;
+                        if filter & QS_POSTMESSAGE != 0 {
+                            let mask = QS_POSTMESSAGE | QS_HOTKEY | QS_TIMER | QS_ALLPOSTMESSAGE;
+                            *changed_bits_ptr &= !mask;
+                        }
+                        if filter & QS_INPUT != 0 {
+                            *changed_bits_ptr &= !QS_INPUT;
+                        }
+                        if filter & QS_PAINT != 0 {
+                            *changed_bits_ptr &= !QS_PAINT;
+                        }
+                        seq_atomic.store((old_seq & !1) + 2, std::sync::atomic::Ordering::Release);
+                    }
+                }
+            }
+        }
+
+        // 0. Check cross-process tracked sent messages (highest priority, stock: queue.c:3348)
+        // Sent messages are dispatched before posted messages in Wine's model.
+        const QS_SENDMESSAGE_BIT: u32 = 0x0040;
+        if filter & QS_SENDMESSAGE_BIT != 0 {
+            if let Some(tid_val) = tid {
+                if let Some(pending) = self.sent_messages.peek(tid_val) {
+                    let reply = GetMessageReply {
+                        header: ReplyHeader { error: 0, reply_size: 0 },
+                        win: pending.win, msg: pending.msg_code,
+                        wparam: pending.wparam, lparam: pending.lparam,
+                        r#type: pending.msg_type, x: 0, y: 0, time: 0,
+                        total: 0, _pad_0: [0; 4],
+                    };
+                    log_info!("get_message: tid={tid_val:#x} SENT win={:#06x} msg={:#06x}", pending.win, pending.msg_code);
+                    return reply_fixed(&reply);
+                }
+            }
+        }
 
         // 1. Check posted messages (stock: queue.c:3356)
         if filter & QS_POSTMESSAGE != 0 {
@@ -153,25 +212,47 @@ impl EventLoop {
                 let offset = u64::from_le_bytes(queue_loc[8..16].try_into().unwrap());
                 if !self.session_map.is_null() {
                     self.shared_write(offset, |shm| unsafe {
-                        // queue_shm_t layout: wake_bits(u32), changed_bits(u32), wake_mask(u32), changed_mask(u32), ...
+                        // queue_shm_t layout (from protocol.def):
+                        //   +0: access_time (u64)
+                        //   +8: wake_mask (u32)
+                        //  +12: wake_bits (u32)   ← DO NOT WRITE HERE
+                        //  +16: changed_mask (u32)
+                        //  +20: changed_bits (u32)
+                        //  +24: internal_bits (u32)
                         *(shm.add(8) as *mut u32) = req.wake_mask;
-                        *(shm.add(12) as *mut u32) = req.changed_mask;
+                        *(shm.add(16) as *mut u32) = req.changed_mask;
                     });
                 }
             }
         }
 
-        // No messages — reset queue event, return STATUS_PENDING (0x103).
-        // Stock wineserver: queue.c set_error(STATUS_PENDING). The client sees
-        // STATUS_PENDING and enters client-side ntsync wait on the queue event.
-        // When a message arrives or timer fires, the queue event is signaled,
-        // the client wakes and re-calls get_message.
+        // No messages — return STATUS_PENDING (stock: queue.c:3402-3411).
+        // Write wake_mask + changed_mask to SHM so the client can be woken
+        // for the right events going forward, then signal/reset the sync
+        // object based on queue status.
+        //
+        // changed_bits were already cleared at the TOP of this handler
+        // (matching stock queue.c:3339-3350). wake_bits are NOT cleared here
+        // — they represent "something arrived" and get cleared when the
+        // message is actually consumed from the queue. The client's
+        // check_queue_masks uses (changed_bits & changed_mask) which is now 0
+        // for the categories we cleared, so the spin stops.
         if let Some(client) = self.clients.get(&(client_fd as RawFd)) {
-            let pid = client.process_id;
-            let qh = client.queue_handle;
-            if qh != 0 {
-                if let Some((obj, _)) = self.ntsync_objects.get(&(pid, qh)) {
-                    let _ = obj.event_reset();
+            let locator = client.queue_locator;
+            let offset = u64::from_le_bytes([
+                locator[8], locator[9], locator[10], locator[11],
+                locator[12], locator[13], locator[14], locator[15],
+            ]) as usize;
+            if !self.session_map.is_null() && (offset + 1024) <= self.session_size {
+                unsafe {
+                    let base = self.session_map.add(offset);
+                    let seq_atomic = &*(base as *const std::sync::atomic::AtomicI64);
+                    let shm = base.add(16);
+                    let old_seq = seq_atomic.load(std::sync::atomic::Ordering::Relaxed);
+                    seq_atomic.store(old_seq | 1, std::sync::atomic::Ordering::Release);
+                    *(shm.add(8) as *mut u32) = req.wake_mask;     // wake_mask
+                    *(shm.add(16) as *mut u32) = req.changed_mask; // changed_mask
+                    seq_atomic.store((old_seq & !1) + 2, std::sync::atomic::Ordering::Release);
                 }
             }
         }
@@ -209,8 +290,6 @@ impl EventLoop {
         };
 
         // Resolve target thread: req.id if nonzero, otherwise look up window's owner
-        // Stock wineserver (queue.c:3157): if (req->id) get_thread_from_id(req->id)
-        // else if (req->win) get_window_thread(req->win)
         let target_tid = if req.id != 0 {
             req.id
         } else if req.win != 0 {
@@ -219,21 +298,14 @@ impl EventLoop {
             0
         };
 
-        // For blocking sent messages (MSG_OTHER_PROCESS, MSG_ASCII, MSG_UNICODE, MSG_CALLBACK),
-        // the sender enters wait_message_reply after this call and blocks on its queue ntsync
-        // event waiting for QS_SMRESULT. Stock wineserver creates a message_result linking
-        // sender→receiver, and the receiver's reply_message sets QS_SMRESULT on the sender.
-        // We don't have that infrastructure yet. Instead, immediately signal QS_SMRESULT on
-        // the sender so it unblocks with result=0. This is correct for messages that can't
-        // be delivered (desktop window, no receiver) and a safe approximation for others.
         let is_blocking_send = matches!(req.r#type,
             MSG_OTHER_PROCESS | MSG_ASCII | MSG_UNICODE | MSG_CALLBACK);
         let sender_tid = self.client_thread_id(client_fd as RawFd).unwrap_or(0);
+        const QS_SMRESULT: u32 = 0x8000;
 
         // Desktop window (tid=0) or no target: acknowledge immediately
         if target_tid == 0 {
             if is_blocking_send && sender_tid != 0 {
-                const QS_SMRESULT: u32 = 0x8000;
                 self.set_queue_bits_for_tid(sender_tid, QS_SMRESULT);
             }
             return reply_fixed(&ReplyHeader { error: 0, reply_size: 0 });
@@ -243,45 +315,110 @@ impl EventLoop {
         let target_exists = self.clients.values().any(|c| c.thread_id == target_tid);
         if !target_exists {
             if is_blocking_send && sender_tid != 0 {
-                const QS_SMRESULT: u32 = 0x8000;
                 self.set_queue_bits_for_tid(sender_tid, QS_SMRESULT);
             }
             return reply_fixed(&ReplyHeader { error: 0, reply_size: 0 });
         }
 
+        // Resolve PIDs for the same-process vs cross-process fork
+        let sender_pid = self.client_pid(client_fd as RawFd);
+        let target_pid = self.clients.values()
+            .find(|c| c.thread_id == target_tid)
+            .map(|c| c.process_id)
+            .unwrap_or(0);
+        let same_process = sender_pid != 0 && sender_pid == target_pid;
+
         if let Some(queue) = self.shm.get_queue(target_tid) {
+            // For same-process blocking sends, force MSG_UNICODE so Wine's
+            // peek_message skips unpack_message(). We don't pack the vararg
+            // data, so MSG_OTHER_PROCESS would cause Wine to unpack raw
+            // pointers as packed structs → garbage → c0000005.
+            // MSG_UNICODE tells Wine: use wparam/lparam directly (valid
+            // same-process pointers).
+            let wire_type = if same_process && req.r#type == 1 { // MSG_OTHER_PROCESS→MSG_UNICODE
+                3i32
+            } else {
+                req.r#type
+            };
+
             let msg = crate::queue::QueuedMessage {
                 win: req.win,
                 msg: req.msg,
                 wparam: req.wparam,
                 lparam: req.lparam,
-                msg_type: req.r#type,
+                msg_type: wire_type,
                 x: 0,
                 y: 0,
                 time: 0,
                 _pad: [0; 2],
             };
 
+            // Non-blocking: always ring buffer
             if req.r#type == MSG_POSTED || req.r#type == MSG_NOTIFY {
                 if queue.post(msg) {
                     self.set_queue_bits_for_tid(target_tid, QS_POSTMESSAGE | QS_ALLPOSTMESSAGE);
                     return reply_fixed(&ReplyHeader { error: 0, reply_size: 0 });
                 }
             }
-            // For blocking sent messages: post to queue, wake receiver, AND signal sender
-            if queue.post(msg) {
-                self.set_queue_bits_for_tid(target_tid, QS_SENDMESSAGE);
-                if is_blocking_send && sender_tid != 0 {
-                    const QS_SMRESULT: u32 = 0x8000;
-                    self.set_queue_bits_for_tid(sender_tid, QS_SMRESULT);
+
+            // Blocking sent message: fork on same-process vs cross-process
+            if same_process {
+                // SAME-PROCESS TRACKED: sender blocks until receiver's
+                // reply_message signals QS_SMRESULT. Required because
+                // lparam often points to the sender's stack frame — if
+                // we signal QS_SMRESULT immediately, the sender returns,
+                // frees the stack, and the receiver reads garbage (c0000005).
+                if queue.post(msg) {
+                    self.set_queue_bits_for_tid(target_tid, QS_SENDMESSAGE);
+                    if is_blocking_send && sender_tid != 0 {
+                        self.sent_messages.track(crate::sent_messages::PendingSentMessage {
+                            sender_tid,
+                            receiver_tid: target_tid,
+                            msg_code: req.msg,
+                            win: req.win,
+                            wparam: req.wparam,
+                            lparam: req.lparam,
+                            msg_type: req.r#type,
+                        });
+                    }
+                    return reply_fixed(&ReplyHeader { error: 0, reply_size: 0 });
                 }
-                return reply_fixed(&ReplyHeader { error: 0, reply_size: 0 });
+            } else {
+                // CROSS-PROCESS: adaptive fast vs tracked routing.
+                // Cold start = tracked (conservative, correct Wine semantics).
+                // Warm start = learned from prior reply observations.
+                //
+                // Force fast-path for messages to daemon-owned windows (desktop).
+                // Nobody runs a message loop for these, so tracked sends block forever.
+                let is_daemon_owned = req.win == self.desktop_top_window
+                    || req.win == self.desktop_msg_window;
+                let use_fast = is_daemon_owned || self.sent_messages.should_fast_path(req.msg);
+                if queue.post(msg) {
+                    self.set_queue_bits_for_tid(target_tid, QS_SENDMESSAGE);
+                    if is_blocking_send && sender_tid != 0 {
+                        if use_fast {
+                            // Promoted or daemon-owned: sender gets immediate QS_SMRESULT
+                            self.set_queue_bits_for_tid(sender_tid, QS_SMRESULT);
+                        } else {
+                            // Tracked: sender blocks until reply_message
+                            self.sent_messages.track(crate::sent_messages::PendingSentMessage {
+                                sender_tid,
+                                receiver_tid: target_tid,
+                                msg_code: req.msg,
+                                win: req.win,
+                                wparam: req.wparam,
+                                lparam: req.lparam,
+                                msg_type: req.r#type,
+                            });
+                        }
+                    }
+                    return reply_fixed(&ReplyHeader { error: 0, reply_size: 0 });
+                }
             }
         }
 
-        // No SHM queue — still signal sender for blocking sends
+        // No SHM queue or ring full — still signal sender for blocking sends
         if is_blocking_send && sender_tid != 0 {
-            const QS_SMRESULT: u32 = 0x8000;
             self.set_queue_bits_for_tid(sender_tid, QS_SMRESULT);
         }
         reply_fixed(&ReplyHeader { error: 0, reply_size: 0 })
@@ -339,7 +476,7 @@ impl EventLoop {
                 let ntsync_fd = if queue_handle != 0 && pid != 0 {
                     if let Some((obj, _)) = self.ntsync_objects.get(&(pid, queue_handle)) {
                         obj.fd()
-                    } else if let Some(obj) = self.get_or_create_event(true, false) {
+                    } else if let Some(obj) = self.get_or_create_event(false, false) {
                         let fd = obj.fd();
                         self.ntsync_objects.insert((pid, queue_handle), (obj, 1));
                         log_info!("set_queue_fd: created queue ntsync event pid={pid} handle={queue_handle:#x} fd={fd}");
@@ -365,9 +502,12 @@ impl EventLoop {
                     }
                 }
 
-                // Wake the queue via ntsync so get_message unblocks
+                // Wake the queue via ntsync so get_message unblocks.
+                // Use QS_POSTMESSAGE (not QS_INPUT bits) -- there are no
+                // input messages at init time and stale QS_INPUT bits cause
+                // the client to call get_message in a tight loop.
                 if let Some(tid) = self.clients.get(&(client_fd as RawFd)).map(|c| c.thread_id) {
-                    self.set_queue_bits_for_tid(tid, 0x0001 | 0x0002 | 0x0004);
+                    self.set_queue_bits_for_tid(tid, 0x0008); // QS_POSTMESSAGE
                 }
 
             } else {
@@ -436,8 +576,31 @@ impl EventLoop {
             } else { (0, 0) }
         } else { (0, 0) };
 
-        // When poll_events is set, Wine has drained its ProcessEvents and wants
-        // to re-arm polling on the X11 display fd. Clear QS_DRIVER and re-arm.
+        // Clear QS_DRIVER and re-arm queue_fd ONLY when poll_events is set
+        // (stock: queue.c:3117). Clearing unconditionally was killing input --
+        // x11drv's ProcessEvents never saw QS_DRIVER because set_queue_mask
+        // cleared it on every message loop iteration before ProcessEvents fired.
+        if req.poll_events != 0 {
+            if let Some(locator) = self.clients.get(&(client_fd as RawFd)).map(|c| c.queue_locator) {
+                let offset = u64::from_le_bytes([
+                    locator[8], locator[9], locator[10], locator[11],
+                    locator[12], locator[13], locator[14], locator[15],
+                ]) as usize;
+                if !self.session_map.is_null() && (offset + 1024) <= self.session_size {
+                    unsafe {
+                        let base = self.session_map.add(offset);
+                        let seq_atomic = &*(base as *const std::sync::atomic::AtomicI64);
+                        let shm = base.add(16);
+                        let old_seq = seq_atomic.load(std::sync::atomic::Ordering::Relaxed);
+                        seq_atomic.store(old_seq | 1, std::sync::atomic::Ordering::Release);
+                        let internal_bits_ptr = shm.add(24) as *mut u32;
+                        *internal_bits_ptr &= !0x80000000u32; // QS_DRIVER
+                        seq_atomic.store((old_seq & !1) + 2, std::sync::atomic::Ordering::Release);
+                    }
+                }
+            }
+        }
+        // Re-arm queue_fd polling (EPOLLONESHOT pattern)
         if req.poll_events != 0 {
             if let Some(queue_fd) = self.clients.get(&(client_fd as RawFd)).and_then(|c| c.queue_fd) {
                 self.pending_queue_fd_rearms.push(queue_fd);
@@ -512,7 +675,7 @@ impl EventLoop {
         // Store locator for this atom so create_window can set window_shm_t.class
         self.class_locators.insert(atom, locator);
         // Store client_ptr so create_window can return it (Wine dereferences this!)
-        let pid = self.client_pid(client_fd as std::os::unix::io::RawFd);
+        let _pid = self.client_pid(client_fd as std::os::unix::io::RawFd);
         self.class_client_ptrs.insert(atom, req.client_ptr);
         self.class_win_extra.insert(atom, req.win_extra as i32);
 
@@ -616,14 +779,14 @@ impl EventLoop {
         };
         self.set_window_shm(window_shared_offset, &class_loc, dpi_context);
 
-        // triskelion advantage: we KNOW the game's render API from PE scan.
-        // For top-level visible windows, pre-set PAINT_HAS_SURFACE so the
-        // Wayland surface attaches on the FIRST set_window_pos — no retries.
-        // Stock wineserver waits for the client to set this reactively.
+        // Pre-set PAINT_HAS_SURFACE for visible top-level windows so the display
+        // driver can attach a surface on the first set_window_pos. For windows created
+        // hidden (no WS_VISIBLE), the client sets this later via paint_flags.
         const WS_VISIBLE: u32 = 0x10000000;
         const PAINT_HAS_SURFACE: u16 = 0x01;
         let is_toplevel = reply_parent == self.desktop_top_window && atom != DESKTOP_CLASS_ATOM;
-        let initial_paint_flags = if is_toplevel && (req.style & WS_VISIBLE != 0) {
+        let is_desktop = reply_parent == 0 && atom == DESKTOP_CLASS_ATOM;
+        let initial_paint_flags = if (is_toplevel || is_desktop) && (req.style & WS_VISIBLE != 0) {
             PAINT_HAS_SURFACE
         } else {
             0
@@ -689,7 +852,7 @@ impl EventLoop {
         let win_extra = self.class_win_extra.get(&atom).copied().unwrap_or(0);
 
 
-        log_info!("create_window: handle={handle:#06x} atom={atom} style={:#010x} parent={reply_parent:#06x} tid={tid:#x}", req.style);
+        log_info!("create_window: handle={handle:#06x} atom={atom} style={:#010x} req_parent={:#06x} parent={reply_parent:#06x} tid={tid:#x}", req.style, req.parent);
 
         let reply = CreateWindowReply {
             header: ReplyHeader { error: 0, reply_size: 0 },
@@ -711,6 +874,14 @@ impl EventLoop {
         };
         let old_style = self.window_states.get(&req.handle).map(|ws| ws.style).unwrap_or(0);
         log_info!("destroy_window: handle={:#06x} style={old_style:#010x}", req.handle);
+        // Reparent children to destroyed window's parent
+        let parent = self.window_states.get(&req.handle).map(|ws| ws.parent).unwrap_or(0);
+        for (_, child_ws) in self.window_states.iter_mut() {
+            if child_ws.parent == req.handle { child_ws.parent = parent; }
+        }
+        // Clean up properties and clipboard listeners for this window
+        self.window_properties.retain(|(wh, _), _| *wh != req.handle);
+        self.clipboard_listeners.remove(&req.handle);
         self.window_states.remove(&req.handle);
         // Recycle handle index
         const FIRST_USER_HANDLE: u32 = 0x0020;
@@ -886,6 +1057,19 @@ impl EventLoop {
             // Update paint_flags from client (stock: window.c:2721)
             ws.paint_flags = (ws.paint_flags & !PAINT_CLIENT_FLAGS) | (req.paint_flags & PAINT_CLIENT_FLAGS);
 
+            // If the client set HAS_PIXEL_FORMAT but not HAS_SURFACE, and this is a
+            // visible top-level window, force HAS_SURFACE. The Vulkan path
+            // (vkCreateWin32SurfaceKHR -> set_window_pixel_format) sets PIXEL_FORMAT
+            // but the GDI window_surface may not exist yet. Without HAS_SURFACE,
+            // get_top_clipping_window stops at the wrong ancestor and surface_win
+            // calculation breaks, preventing DXVK from presenting frames.
+            if ws.paint_flags & 0x02 != 0 && ws.paint_flags & 0x01 == 0
+                && ws.parent == self.desktop_top_window
+                && ws.style & 0x10000000 != 0
+            {
+                ws.paint_flags |= 0x01;
+            }
+
             // Apply SWP_SHOWWINDOW/SWP_HIDEWINDOW to style bits (stock: window.c:1959)
             const SWP_SHOWWINDOW: u16 = 0x0040;
             const SWP_HIDEWINDOW: u16 = 0x0080;
@@ -908,7 +1092,8 @@ impl EventLoop {
                 // Stash tid and handle for WM_ACTIVATEAPP post after borrow ends
                 activate_tid = Some(ws.tid);
                 activate_hwnd = req.handle as u32;
-            } else if req.swp_flags & SWP_HIDEWINDOW != 0 {
+            }
+            if req.swp_flags & SWP_HIDEWINDOW != 0 {
                 ws.style &= !WS_VISIBLE;
             }
             let should_paint = ((req.swp_flags & SWP_SHOWWINDOW) != 0) ||
@@ -956,21 +1141,18 @@ impl EventLoop {
             .map(|ws| (ws.style, ws.ex_style))
             .unwrap_or((0, 0));
 
-        // get_top_clipping_window + visibility check (stock: window.c:2739-2740)
-        // For top-level windows (parent == desktop), always return the window itself
-        // as surface_win when visible. Wine's display driver needs this to create the
-        // X11 surface — without it, no window ever appears on screen.
+        // Return surface_win for top-level windows or windows with PAINT_HAS_SURFACE.
+        // Check req.handle's parent directly (not top's parent, which was the Apr 6
+        // regression). HWND_MESSAGE children (parent=0x22) are excluded -- x11drv
+        // refuses to create X11 windows for them (winex11.drv/window.c:2838).
         let top = self.get_top_clipping_window(req.handle);
         let is_toplevel = self.window_states.get(&req.handle)
             .map(|ws| ws.parent == self.desktop_top_window)
             .unwrap_or(false);
         let has_surface = self.window_states.get(&top)
             .map(|w| w.paint_flags & 0x01 != 0).unwrap_or(false);
-        // Wine 11.5 manages WS_VISIBLE client-side in shared memory — the server
-        // never sees ShowWindow. Always return surface_win for top-level windows
-        // or windows with PAINT_HAS_SURFACE so the X11 driver can create the surface.
         let surface_win = if is_toplevel || has_surface { top } else { 0 };
-        let style = self.window_states.get(&req.handle).map(|ws| ws.style).unwrap_or(0);
+        let _style = self.window_states.get(&req.handle).map(|ws| ws.style).unwrap_or(0);
 
         log_info!("set_window_pos: handle={:#06x} swp={:#06x} paint={:#04x} style={new_style:#010x} surface_win={surface_win:#06x}", req.handle, req.swp_flags, req.paint_flags);
 
@@ -1039,9 +1221,7 @@ impl EventLoop {
             return reply_fixed(&ReplyHeader { error: 0xC000000D, reply_size: 0 });
         };
 
-        // VARARG text starts after the fixed request struct
-        let vararg_off = std::mem::size_of::<SetWindowTextRequest>();
-        let text = if buf.len() > vararg_off { buf[vararg_off..].to_vec() } else { Vec::new() };
+        let text = if buf.len() > VARARG_OFF { buf[VARARG_OFF..].to_vec() } else { Vec::new() };
 
         if let Some(ws) = self.window_states.get_mut(&req.handle) {
             ws.window_text = text;
@@ -1115,8 +1295,8 @@ impl EventLoop {
     }
 
 
-    pub(crate) fn handle_get_desktop_window(&mut self, client_fd: i32, buf: &[u8]) -> Reply {
-        let force = if buf.len() >= std::mem::size_of::<GetDesktopWindowRequest>() {
+    pub(crate) fn handle_get_desktop_window(&mut self, _client_fd: i32, buf: &[u8]) -> Reply {
+        let _force = if buf.len() >= std::mem::size_of::<GetDesktopWindowRequest>() {
             let req = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const GetDesktopWindowRequest) };
             req.force
         } else { 0 };
@@ -1145,6 +1325,11 @@ impl EventLoop {
             return reply_fixed(&ReplyHeader { error: 0xC000000D, reply_size: 0 });
         };
 
+        // Validate new parent exists (0 = no parent is valid, desktop windows are valid)
+        if req.parent != 0 && req.parent != self.desktop_top_window && req.parent != self.desktop_msg_window
+            && !self.window_states.contains_key(&req.parent) {
+            return reply_fixed(&ReplyHeader { error: 0xC0000008, reply_size: 0 }); // STATUS_INVALID_HANDLE
+        }
         let old_parent = if let Some(ws) = self.window_states.get_mut(&req.handle) {
             let old = ws.parent;
             ws.parent = req.parent;
@@ -1473,7 +1658,7 @@ impl EventLoop {
     }
 
     pub(crate) fn handle_set_foreground_window(&mut self, client_fd: i32, buf: &[u8]) -> Reply {
-        let req = if buf.len() >= std::mem::size_of::<SetForegroundWindowRequest>() {
+        let _req = if buf.len() >= std::mem::size_of::<SetForegroundWindowRequest>() {
             unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const SetForegroundWindowRequest) }
         } else {
             return reply_fixed(&ReplyHeader { error: 0xC000000D, reply_size: 0 });
@@ -1642,10 +1827,14 @@ impl EventLoop {
     }
 
 
-    pub(crate) fn handle_get_key_state(&mut self, _client_fd: i32, _buf: &[u8]) -> Reply {
+    pub(crate) fn handle_get_key_state(&mut self, _client_fd: i32, buf: &[u8]) -> Reply {
+        let vk = if buf.len() >= std::mem::size_of::<GetKeyStateRequest>() {
+            let req: GetKeyStateRequest = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const _) };
+            (req.key & 0xFF) as u8
+        } else { 0 };
         reply_fixed(&GetKeyStateReply {
             header: ReplyHeader { error: 0, reply_size: 0 },
-            state: 0,
+            state: self.read_desktop_keystate(vk),
             _pad_0: [0; 7],
         })
     }
@@ -1661,13 +1850,32 @@ impl EventLoop {
     }
 
 
-    pub(crate) fn handle_set_caret_window(&mut self, _client_fd: i32, _buf: &[u8]) -> Reply {
+    pub(crate) fn handle_set_caret_window(&mut self, client_fd: i32, buf: &[u8]) -> Reply {
+        let req = if buf.len() >= std::mem::size_of::<SetCaretWindowRequest>() {
+            unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const SetCaretWindowRequest) }
+        } else {
+            return reply_fixed(&ReplyHeader { error: 0xC000000D, reply_size: 0 });
+        };
+        let tid = self.client_thread_id(client_fd as RawFd).unwrap_or(0);
+        // Return previous caret state for this thread
+        let (previous, old_rect, old_hide, old_state) = self.caret_state.get(&tid)
+            .map(|(w, r, h, s)| (*w, *r, *h, *s))
+            .unwrap_or((0, [0u8; 16], 0, 0));
+        // Set new caret: window + rect from width/height, hide_count=0, state=0
+        if req.handle != 0 {
+            let mut rect = [0u8; 16]; // left=0, top=0, right=width, bottom=height
+            rect[8..12].copy_from_slice(&req.width.to_le_bytes());
+            rect[12..16].copy_from_slice(&req.height.to_le_bytes());
+            self.caret_state.insert(tid, (req.handle, rect, 0, 0));
+        } else {
+            self.caret_state.remove(&tid);
+        }
         reply_fixed(&SetCaretWindowReply {
             header: ReplyHeader { error: 0, reply_size: 0 },
-            previous: 0,
-            old_rect: [0u8; 16],
-            old_hide: 0,
-            old_state: 0,
+            previous,
+            old_rect,
+            old_hide,
+            old_state,
             _pad_0: [0; 4],
         })
     }
@@ -1725,10 +1933,37 @@ impl EventLoop {
     }
 
 
-    pub(crate) fn handle_reply_message(&mut self, _client_fd: i32, _buf: &[u8]) -> Reply {
+    pub(crate) fn handle_reply_message(&mut self, client_fd: i32, buf: &[u8]) -> Reply {
+        let req = if buf.len() >= std::mem::size_of::<ReplyMessageRequest>() {
+            unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const ReplyMessageRequest) }
+        } else {
+            return reply_fixed(&ReplyHeader { error: 0, reply_size: 0 });
+        };
+
+        let receiver_tid = self.client_thread_id(client_fd as RawFd).unwrap_or(0);
+        if receiver_tid == 0 {
+            return reply_fixed(&ReplyHeader { error: 0, reply_size: 0 });
+        }
+
+        // Wake the most recent sender that was tracked-blocking on this receiver.
+        // Observe the reply for adaptive routing (zero = fast-path safe, nonzero = needs tracking).
+        if let Some((sender_tid, msg_code)) = self.sent_messages.drain_one_with_code(receiver_tid) {
+            self.sent_messages.observe_reply(msg_code, req.result);
+            const QS_SMRESULT: u32 = 0x8000;
+            self.set_queue_bits_for_tid(sender_tid, QS_SMRESULT);
+            log_info!("reply_message: receiver={receiver_tid:#x} -> sender={sender_tid:#x} msg={msg_code:#x} result={}", req.result);
+        }
+
         reply_fixed(&ReplyHeader { error: 0, reply_size: 0 })
     }
 
+
+    pub(crate) fn handle_update_window_zorder(&mut self, _client_fd: i32, _buf: &[u8]) -> Reply {
+        // Stock: walks siblings to find obscuring windows and reorders.
+        // We don't track sibling z-order yet, so this is a no-op.
+        // Balatro calls this 2000+ times per session; must return success.
+        reply_fixed(&ReplyHeader { error: 0, reply_size: 0 })
+    }
 
     pub(crate) fn handle_accept_hardware_message(&mut self, _client_fd: i32, _buf: &[u8]) -> Reply {
         reply_fixed(&ReplyHeader { error: 0, reply_size: 0 })
@@ -1752,10 +1987,13 @@ impl EventLoop {
 
 
     pub(crate) fn handle_get_message_reply(&mut self, client_fd: i32, _buf: &[u8]) -> Reply {
-        // Stock wineserver: sets STATUS_PENDING + result=0 when no message_result exists.
-        // reply_size=0: the result field is part of the fixed reply struct, not variable data.
-        // Setting reply_size=8 previously caused pipe frame misalignment — Wine read the
-        // header but not the body, leaving 8 bytes of garbage for the next server call.
+        // Sender consumed its reply — clear QS_SMRESULT so the next phantom
+        // wake doesn't dispatch a stale callback (root cause of c0000005 in
+        // Wine's session SHM cleanup path).
+        const QS_SMRESULT: u32 = 0x8000;
+        if let Some(tid) = self.client_thread_id(client_fd as RawFd) {
+            self.clear_queue_bits_for_tid(tid, QS_SMRESULT);
+        }
         reply_fixed(&GetMessageReplyReply {
             header: ReplyHeader { error: 0, reply_size: 0 },
             result: 0,
@@ -1805,7 +2043,11 @@ impl EventLoop {
         }
 
         // Create timer — stock: set_timer() in queue.c:1636
-        let rate = std::cmp::max(req.rate, 1);
+        // USER_TIMER_MINIMUM is 10ms in stock Wine (winuser.h). Games that ask
+        // for 1ms timers (or 0ms) get clamped to 10ms — without this, a
+        // run-away SetTimer(rate=1) burns the CPU at 1000 fires/sec.
+        const USER_TIMER_MINIMUM: u32 = 10;
+        let rate = std::cmp::max(req.rate, USER_TIMER_MINIMUM);
         let timer = super::WinTimer {
             when: std::time::Instant::now() + std::time::Duration::from_millis(rate as u64),
             rate_ms: rate,
@@ -1897,7 +2139,6 @@ impl EventLoop {
                     if let Some((obj, _)) = self.ntsync_objects.get(&(pid, qh)) {
                         let _ = obj.event_set();
                     }
-                    self.fsync_wake_handle(pid, qh);
                 }
             }
         }
@@ -2005,7 +2246,7 @@ impl EventLoop {
     // unique property name gets a unique key. Without this, all string
     // properties on the same window collide at key (window, 0).
 
-    pub(crate) fn handle_get_window_property(&mut self, client_fd: i32, buf: &[u8]) -> Reply {
+    pub(crate) fn handle_get_window_property(&mut self, _client_fd: i32, buf: &[u8]) -> Reply {
         let req = if buf.len() >= std::mem::size_of::<GetWindowPropertyRequest>() {
             unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const GetWindowPropertyRequest) }
         } else {
@@ -2016,7 +2257,7 @@ impl EventLoop {
         } else {
             let vararg = if buf.len() > VARARG_OFF { &buf[VARARG_OFF..] } else { &[] as &[u8] };
             let name_u16 = vararg_to_u16(vararg);
-            let name_str = String::from_utf16_lossy(&name_u16);
+            let _name_str = String::from_utf16_lossy(&name_u16);
             // Try exact match first, then lowercase (atoms are case-insensitive)
             self.state.atom_names.get(&name_u16).copied().unwrap_or_else(|| {
                 let lower: Vec<u16> = name_u16.iter().map(|&c| {
@@ -2263,10 +2504,18 @@ impl EventLoop {
         })
     }
 
-    pub(crate) fn handle_destroy_class(&mut self, _client_fd: i32, _buf: &[u8]) -> Reply {
+    pub(crate) fn handle_destroy_class(&mut self, _client_fd: i32, buf: &[u8]) -> Reply {
+        let req = if buf.len() >= std::mem::size_of::<DestroyClassRequest>() {
+            unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const DestroyClassRequest) }
+        } else {
+            return reply_fixed(&ReplyHeader { error: 0xC000000D, reply_size: 0 });
+        };
+        let ptr = self.class_client_ptrs.remove(&req.atom).unwrap_or(0);
+        self.class_locators.remove(&req.atom);
+        self.class_win_extra.remove(&req.atom);
         reply_fixed(&DestroyClassReply {
             header: ReplyHeader { error: 0, reply_size: 0 },
-            client_ptr: 0,
+            client_ptr: ptr,
         })
     }
 
@@ -2281,7 +2530,7 @@ impl EventLoop {
 
     // User handle allocation
     pub(crate) fn handle_alloc_user_handle(&mut self, client_fd: i32, buf: &[u8]) -> Reply {
-        let req = if buf.len() >= std::mem::size_of::<AllocUserHandleRequest>() {
+        let _req = if buf.len() >= std::mem::size_of::<AllocUserHandleRequest>() {
             unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const AllocUserHandleRequest) }
         } else {
             return reply_fixed(&ReplyHeader { error: 0xC000000D, reply_size: 0 });
@@ -2307,7 +2556,13 @@ impl EventLoop {
         };
         // Recycle the handle index so alloc_user_handle can reuse it
         const FIRST_USER_HANDLE: u32 = 0x0020;
+        if req.handle < FIRST_USER_HANDLE {
+            return reply_fixed(&ReplyHeader { error: 0xC0000008, reply_size: 0 }); // STATUS_INVALID_HANDLE
+        }
         let index = (req.handle - FIRST_USER_HANDLE) >> 1;
+        if index >= self.next_user_handle_index {
+            return reply_fixed(&ReplyHeader { error: 0xC0000008, reply_size: 0 }); // STATUS_INVALID_HANDLE
+        }
         self.user_handle_free_list.push(index);
         self.window_states.remove(&req.handle);
         reply_fixed(&ReplyHeader { error: 0, reply_size: 0 })
@@ -2408,7 +2663,7 @@ impl EventLoop {
             return reply_fixed(&ReplyHeader { error: 0xC0000017, reply_size: 0 });
         }
 
-        let vararg = &buf[std::mem::size_of::<CreateWinstationRequest>()..];
+        let vararg = if buf.len() > VARARG_OFF { &buf[VARARG_OFF..] } else { &[] as &[u8] };
         if !vararg.is_empty() {
             self.winstation_names.insert(oid as u32, vararg.to_vec());
         }
@@ -2445,7 +2700,7 @@ impl EventLoop {
         })
     }
 
-    pub(crate) fn handle_set_winstation_monitors(&mut self, client_fd: i32, buf: &[u8]) -> Reply {
+    pub(crate) fn handle_set_winstation_monitors(&mut self, _client_fd: i32, buf: &[u8]) -> Reply {
         // Parse request: fixed header (16 bytes) followed by vararg monitor_info array.
         // monitor_info = { rectangle raw (16), rectangle virt (16), u32 flags, u32 dpi } = 40 bytes each
         const MONITOR_INFO_SIZE: usize = 40;
@@ -2455,7 +2710,7 @@ impl EventLoop {
             return reply_fixed(&ReplyHeader { error: 0xC000000D, reply_size: 0 });
         };
 
-        let vararg = &buf[std::mem::size_of::<SetWinstationMonitorsRequest>()..];
+        let vararg = if buf.len() > VARARG_OFF { &buf[VARARG_OFF..] } else { &[] as &[u8] };
         let monitor_count = vararg.len() / MONITOR_INFO_SIZE;
 
         if req.increment != 0 {
@@ -2476,7 +2731,7 @@ impl EventLoop {
                 let old_seq = seq_atomic.load(std::sync::atomic::Ordering::Relaxed);
                 seq_atomic.store(old_seq | 1, std::sync::atomic::Ordering::Release);
                 *(shm.add(DESKTOP_SHM_MONITOR_SERIAL_OFFSET) as *mut u64) = serial;
-                seq_atomic.store((old_seq | 1) + 1, std::sync::atomic::Ordering::Release);
+                seq_atomic.store((old_seq & !1) + 2, std::sync::atomic::Ordering::Release);
             }
         }
 
@@ -2592,7 +2847,7 @@ impl EventLoop {
 
         // Return the process idle event if we have one
         let pid = self.client_pid(client_fd as RawFd);
-        let idle_event = self.process_idle_events.get(&pid)
+        let _idle_event = self.process_idle_events.get(&pid)
             .and_then(|_| {
                 // The idle event handle was already allocated in the process —
                 // but we'd need to look it up. For now return 0 (optional).
@@ -2607,13 +2862,10 @@ impl EventLoop {
         })
     }
 
-    pub(crate) fn handle_get_last_input_time(&mut self, _client_fd: i32, _buf: &[u8]) -> Reply {
-        reply_fixed(&GetLastInputTimeReply {
-            header: ReplyHeader { error: 0, reply_size: 0 },
-            time: self.last_input_time,
-            _pad_0: [0; 4],
-        })
-    }
+    // handle_get_last_input_time was removed in Wine 11.6 (opcode no longer in
+    // protocol.def). Last-input timestamps are now read client-side from
+    // KUSER_SHARED_DATA. The handler is dropped from build.rs's dispatch table
+    // automatically when regenerating against 11.6 or later.
 
     pub(crate) fn handle_send_hardware_message(&mut self, _client_fd: i32, buf: &[u8]) -> Reply {
         let req = if buf.len() >= std::mem::size_of::<SendHardwareMessageRequest>() {
@@ -2779,7 +3031,12 @@ impl EventLoop {
         let lparam = ((y as u32 as u64) << 16) | (x as u32 as u64 & 0xFFFF);
         self.last_input_time = time;
 
-        for (i, &(msg_code, qbits)) in msg_table.iter().enumerate() {
+        // Post input messages to SHM ring as QS_POSTMESSAGE so the client
+        // reads them directly without a server round-trip. Stock Wine uses a
+        // separate hardware queue (MSG_HARDWARE + QS_INPUT), but our SHM ring
+        // architecture delivers all messages through the same posted ring.
+        const QS_POSTMESSAGE: u32 = 0x0008;
+        for (i, &(msg_code, _qbits)) in msg_table.iter().enumerate() {
             if flags & (1 << i) == 0 { continue; }
             if let Some(queue) = self.shm.get_queue(target_tid as u32) {
                 let msg = crate::queue::QueuedMessage {
@@ -2795,7 +3052,7 @@ impl EventLoop {
                 };
                 queue.post(msg);
             }
-            self.set_queue_bits_for_tid(target_tid, qbits);
+            self.set_queue_bits_for_tid(target_tid, QS_POSTMESSAGE);
         }
     }
 
@@ -2851,7 +3108,7 @@ impl EventLoop {
             };
             queue.post(msg);
         }
-        self.set_queue_bits_for_tid(target_tid, 0x0001); // QS_KEY
+        self.set_queue_bits_for_tid(target_tid, 0x0008); // QS_POSTMESSAGE (not QS_KEY)
     }
 
 

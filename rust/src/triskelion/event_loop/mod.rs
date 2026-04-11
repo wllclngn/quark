@@ -20,6 +20,9 @@ mod window;
 mod token;
 mod completion;
 mod client;
+mod side_tables;
+
+pub(crate) use side_tables::{HandleSideTables, PipeHandle};
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
@@ -81,6 +84,13 @@ const MAX_OPCODES: usize = 306;
 // Wine request VARARG data starts at offset 64 (the fixed request block is
 // padded to 64 bytes, i.e. sizeof(union generic_request)), NOT at sizeof(XxxRequest).
 const VARARG_OFF: usize = 64;
+
+#[repr(C)]
+pub(super) struct WakeUpReply {
+    pub cookie: u64,
+    pub signaled: i32,
+    pub _pad: i32,
+}
 
 struct PendingWait {
     deadline: Instant,
@@ -158,8 +168,6 @@ pub struct EventLoop {
     pub(super) win_timers_expired: FxHashMap<u32, Vec<WinTimer>>,
     start_time: Instant,
     peak_clients: usize,
-    process_init_count: u64,
-    thread_init_count: u64,
     // ntsync: kernel-native NT sync (None = older kernel, fallback to stubs)
     ntsync: Option<crate::ntsync::NtsyncDevice>,
     ntsync_objects: FxHashMap<(u32, obj_handle_t), (Arc<crate::ntsync::NtsyncObj>, u32)>,
@@ -191,9 +199,9 @@ pub struct EventLoop {
     // Deferred event signals: after APC delivery in Select, signal these ntsync events.
     // This ensures the IOSB is written (by APC callback) BEFORE the event fires.
     pub(super) deferred_event_signals: FxHashMap<RawFd, Vec<(u32, u32)>>,
-    // Deferred pipe completion signals: (pid, handle) pairs to signal when
-    // get_inproc_sync_fd creates an on-demand event for the handle.
-    deferred_pipe_signals: FxHashSet<(u32, obj_handle_t)>,
+    /// Per-handle side tables. All state keyed by (pid, handle) lives here.
+    /// Cleanup goes through HandleSideTables::purge or purge_pid.
+    pub(crate) side_tables: HandleSideTables,
     // System process shutdown: tracks pids that called MakeProcessSystem.
     // When all non-system processes exit, shutdown_event is signaled.
     system_pids: HashSet<u32>,
@@ -228,11 +236,6 @@ pub struct EventLoop {
     // get_desktop_window(force=1) defers reply until this is true,
     // preventing the game from racing with explorer's display init.
     desktop_ready: bool,
-    // PIDs that already received 0 from get_desktop_window(force=0) to trigger explorer spawn.
-    // Subsequent force=0 calls from the same PID return handles immediately.
-    _explorer_spawn_triggered: rustc_hash::FxHashSet<u32>,
-    // Clients waiting for desktop to be ready: (client_fd, force)
-    _desktop_waiters: Vec<i32>,
     next_user_handle_index: u32, // next index into user_entry table
     user_handle_free_list: Vec<u32>, // recycled user handle indices
     // Session shared memory: persistent mmap and bump allocator for shared_object_t entries
@@ -257,6 +260,8 @@ pub struct EventLoop {
     // Wine's lock_display_devices checks if the process winstation is "__wineservice_winstation"
     // to trigger the virtual_monitor path, which bumps monitor_serial.
     winstation_names: HashMap<u32, Vec<u8>>,
+    // Cross-process SendMessage tracker: senders blocked waiting for reply_message.
+    pub(super) sent_messages: crate::sent_messages::SentMessages,
     // Protocol intelligence: per-game learning from auto-stubs
     intel: crate::intel::IntelManager,
     // Per-process idle events: pid → ntsync manual-reset event (initially unsignaled).
@@ -277,9 +282,6 @@ pub struct EventLoop {
     completion_waiters: FxHashMap<u32, Vec<CompletionWaiter>>,
     // Per-thread cached completion message (from wait satisfaction): client_fd → msg
     thread_completion_cache: FxHashMap<RawFd, CompletionMsg>,
-    // Completion bindings: (pid, object_handle) → (port_handle, ckey)
-    // When async I/O completes on an object, post to its bound completion port.
-    pub(super) completion_bindings: FxHashMap<(u32, u32), (u32, u64)>,
     // Pending async reads: (pid, user_arg) → read state for get_async_result retry
     pending_reads: FxHashMap<(u32, u64), PendingRead>,
     // Completed ioctl operations: (pid, user_arg) → status code.
@@ -289,16 +291,6 @@ pub struct EventLoop {
     // When a pipe connect completes, we queue the APC here. The next select from
     // that thread checks this queue and returns STATUS_KERNEL_APC with the APC data.
     pending_kernel_apcs: FxHashMap<RawFd, Vec<[u8; 28]>>,
-    // Reusable wait handles for pipe I/O: (pid, pipe_handle) → wait event handle
-    pipe_io_wait_handles: FxHashMap<(u32, u32), u32>,
-    // Fsync shm index map: (pid, handle) → shm_idx. When the server signals
-    // an event for this handle, it also does futex_wake on the fsync shm slot.
-    // This bridges server-side ntsync with client-side fsync waits.
-    pub(crate) fsync_indices: FxHashMap<(u32, u32), u32>,
-    // fsync types: (pid, handle) → fsync type (from create_fsync)
-    pub(crate) _fsync_types: FxHashMap<(u32, u32), i32>,
-    // Per-handle pipe flags (from set_named_pipe_info): (pid, handle) → flags
-    pipe_handle_flags: FxHashMap<(u32, u32), u32>,
     // Clipboard state: monotonic sequence number (stock: clipboard.c)
     clipboard_seqno: u32,
     // Per-thread WM_QUIT state: tid → (exit_code, pending). Set by PostQuitMessage,
@@ -327,11 +319,9 @@ pub struct EventLoop {
     // shutting down. Cleared when a new client connects. This prevents the
     // daemon from self-terminating between wineboot exit and game connect.
     pub linger_deadline: Option<Instant>,
+    pub linger_secs: u64,
     // Async pipe reads: broker polls these periodically. When data arrives,
     // reads it and signals the wait handle. Replaces BlockingPipeRead.
-    // Fsync shared memory index allocator. Each create_esync/create_fsync
-    // bumps this to allocate a slot in the fsync shm.
-    pub(crate) next_fsync_idx: u32,
     // Per-process winstation handle: pid → handle. Processes that call
     // set_process_winstation get their own handle. Others get default.
     pub(crate) process_winstations: FxHashMap<u32, u32>,
@@ -342,13 +332,6 @@ pub struct EventLoop {
     // All threads in a process share one msg_fd. SCM_RIGHTS fds drain here,
     // tagged with the sending thread's tid for correct routing.
     pub(crate) process_inflight_fds: FxHashMap<u32, VecDeque<(u32, i32, RawFd)>>,
-    /// Track (pid, handle) pairs that had their fd sent via get_handle_fd.
-    /// Prevents add_fd_to_cache assertion from duplicate fd sends.
-    pub(crate) fd_sent: FxHashSet<(u32, u32)>,
-    /// Pipe handle → data fd mapping: (pid, handle) → pipe data fd.
-    /// When get_inproc_sync_fd creates an ntsync object for a pipe handle,
-    /// this mapping is used to emit WatchPipeFd effects.
-    pub(crate) pipe_data_fds: FxHashMap<(u32, u32), RawFd>,
     /// Pending pipe watch requests: (pipe_data_fd, ntsync_fd).
     /// Handlers push to this; process_request drains into effects.
     pub(crate) pending_pipe_watches: Vec<(RawFd, RawFd)>,
@@ -379,9 +362,6 @@ impl EventLoop {
         epoll_add(epoll_fd, timer_fd, libc::EPOLLIN as u32);
 
         let ntsync = crate::ntsync::NtsyncDevice::open();
-        if ntsync.is_some() {
-        } else {
-        }
 
         let mut state = ServerState::new();
 
@@ -403,7 +383,7 @@ impl EventLoop {
                 object_id: oid, fd: session_fd,
             });
             state.mappings.insert(oid, crate::objects::MappingInfo {
-                _fd: session_fd, size: session_size as u64, flags: 0x800000, pe_image_info: None, nt_name: None, // SEC_COMMIT
+                fd: session_fd, size: session_size as u64, flags: 0x800000, pe_image_info: None, nt_name: None, shared_fd: None, // SEC_COMMIT
             });
 
             // mmap session memfd persistently — kept alive for shared object allocation
@@ -467,8 +447,6 @@ impl EventLoop {
 
             start_time: Instant::now(),
             peak_clients: 0,
-            process_init_count: 0,
-            thread_init_count: 0,
             ntsync,
             ntsync_objects: FxHashMap::default(),
             ntsync_objects_created: 0,
@@ -483,7 +461,7 @@ impl EventLoop {
             client_worker_interrupts: FxHashMap::default(),
             client_apc_flags: FxHashMap::default(),
             deferred_event_signals: FxHashMap::default(),
-            deferred_pipe_signals: FxHashSet::default(),
+            side_tables: HandleSideTables::new(),
             system_pids: HashSet::new(),
             shutdown_event: None,
             desktop_locator_id,
@@ -499,8 +477,6 @@ impl EventLoop {
             desktop_top_window: 0,
             desktop_msg_window: 0,
             desktop_ready: false,
-            _explorer_spawn_triggered: rustc_hash::FxHashSet::default(),
-            _desktop_waiters: Vec::new(),
             next_user_handle_index: 0,
             user_handle_free_list: Vec::new(),
             session_map,
@@ -515,6 +491,7 @@ impl EventLoop {
             monitor_serial: 1, // Start at 1: matches stock wineserver
 
             winstation_names: HashMap::new(),
+            sent_messages: crate::sent_messages::SentMessages::new(),
             intel: {
                 let intel = crate::intel::IntelManager::new();
                 intel.log_summary();
@@ -528,13 +505,9 @@ impl EventLoop {
             completion_queues: FxHashMap::default(),
             completion_waiters: FxHashMap::default(),
             thread_completion_cache: FxHashMap::default(),
-            completion_bindings: FxHashMap::default(),
             pending_reads: FxHashMap::default(),
             completed_ioctls: FxHashMap::default(),
             pending_kernel_apcs: FxHashMap::default(),
-
-            pipe_io_wait_handles: FxHashMap::default(),
-            pipe_handle_flags: FxHashMap::default(),
             clipboard_seqno: 0,
             thread_quit_state: FxHashMap::default(),
             monitor_rect: {
@@ -556,16 +529,18 @@ impl EventLoop {
             clipboard_listeners: FxHashSet::default(),
             next_timer_ids: FxHashMap::default(),
             linger_deadline: None,
-            next_fsync_idx: 1, // 0 is reserved
-            fsync_indices: FxHashMap::default(),
-            _fsync_types: FxHashMap::default(),
+            linger_secs: {
+                // Adaptive: scale linger with game exe size (proxy for load time)
+                let hint = std::env::var("QUARK_LINGER_HINT")
+                    .ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                let exe_mb = hint / (1024 * 1024);
+                exe_mb.max(5).min(30)
+            },
             process_winstations: FxHashMap::default(),
             default_winstation_handle: 0, // set below after alloc
             pending_pipe_reads: Vec::new(),
             completed_pipe_reads: Vec::new(),
             process_inflight_fds: FxHashMap::default(),
-            fd_sent: FxHashSet::default(),
-            pipe_data_fds: FxHashMap::default(),
             pending_pipe_watches: Vec::new(),
             pending_queue_fd_watches: Vec::new(),
             pending_queue_fd_rearms: Vec::new(),
@@ -661,10 +636,29 @@ impl EventLoop {
         ev.shm.set_desktop_ready();
         log_info!("desktop: ready (no explorer, daemon-owned)");
 
-        // __wine_svcctlstarted is NOT pre-signaled — services.exe signals it
-        // naturally after creating the svcctl pipe. Pre-signaling caused wineboot
-        // to skip the SCM connection path, so services never received the start
-        // command and never spawned winedevice/plugplay/svchost.
+        // Let wineboot run naturally — pre-signaling __wineboot_event skips
+        // critical x11drv initialization (set_queue_fd never called by game thread).
+        // Pre-create mutexes needed by plugplay/font init.
+        if let Some(ref ntsync_dev) = ev.ntsync {
+            if let Some(obj) = ntsync_dev.create_mutex(0, 0) {
+                if let Some(dup) = obj.dup() {
+                    ev.named_sync.insert("display_device_init".to_string(), (dup.fd(), 3));
+                    std::mem::forget(dup);
+                }
+            }
+            if let Some(obj) = ntsync_dev.create_mutex(0, 0) {
+                if let Some(dup) = obj.dup() {
+                    ev.named_sync.insert("__wine_font_mutex__".to_string(), (dup.fd(), 3));
+                    std::mem::forget(dup);
+                }
+            }
+        }
+
+        // Seed adaptive message routing with profiles from prior launches
+        let msg_profiles = ev.intel.take_msg_profiles();
+        if !msg_profiles.is_empty() {
+            ev.sent_messages.load_profiles(msg_profiles);
+        }
 
         ev
     }
@@ -871,7 +865,6 @@ impl EventLoop {
             }
 
             if queue_handle != 0 {
-                self.fsync_wake_handle(pid, queue_handle);
                 if let Some((obj, _)) = self.ntsync_objects.get(&(pid, queue_handle)) {
                     let _ = obj.event_set();
                 }
@@ -879,8 +872,10 @@ impl EventLoop {
         }
     }
 
-    /// Clear specific wake_bits for a thread's queue shared memory.
-    /// Used to clear QS_PAINT when no more windows need painting.
+    /// Clear specific wake_bits AND changed_bits for a thread's queue shared memory.
+    /// Used by handle_get_message when the requested categories are empty, so the
+    /// client's check_queue_masks() doesn't keep returning "wake" on stale state.
+    /// Both bits must be cleared together — see set_queue_bits_for_tid which sets both.
     pub(crate) fn clear_queue_bits_for_tid(&mut self, tid: u32, bits: u32) {
         let client = self.clients.values().find(|c| c.thread_id == tid);
         if let Some(client) = client {
@@ -897,36 +892,11 @@ impl EventLoop {
                     let old_seq = seq_atomic.load(std::sync::atomic::Ordering::Relaxed);
                     seq_atomic.store(old_seq | 1, std::sync::atomic::Ordering::Release);
                     let wake_bits_ptr = shm.add(12) as *mut u32;
-                    *wake_bits_ptr &= !bits; // CLEAR the bits
+                    let changed_bits_ptr = shm.add(20) as *mut u32;
+                    *wake_bits_ptr &= !bits;
+                    *changed_bits_ptr &= !bits;
                     seq_atomic.store((old_seq & !1) + 2, std::sync::atomic::Ordering::Release);
                 }
-            }
-        }
-    }
-
-    /// Signal a handle's fsync shm slot. Bridges server-side events
-    /// with client-side fsync futex waits. Called whenever we signal
-    /// an event, process exit, thread exit, etc.
-    pub(crate) fn fsync_wake_handle(&mut self, pid: u32, handle: u32) {
-        let (idx, _was_new) = if let Some(&idx) = self.fsync_indices.get(&(pid, handle)) {
-            (idx, false)
-        } else {
-            let idx = self.next_fsync_idx;
-            self.next_fsync_idx += 1;
-            self.fsync_indices.insert((pid, handle), idx);
-            (idx, true)
-        };
-        // Don't call fsync_shm_write before fsync_signal — fsync_signal does
-        // atomic swap(1) and only wakes if old==0. If we pre-set to 1,
-        // the swap returns 1 (already set) and the wake is skipped.
-        crate::fsync_signal(idx);
-    }
-
-    /// Signal ALL fsync slots for a process (used on process exit to wake all waiters).
-    pub(crate) fn fsync_wake_all_for_pid(&self, pid: u32) {
-        for (&(p, _h), &idx) in &self.fsync_indices {
-            if p == pid {
-                crate::fsync_signal(idx);
             }
         }
     }
@@ -969,12 +939,6 @@ impl EventLoop {
     fn send_wake_up(&self, pw: &PendingWait, signaled: i32) {
         if let Some(client) = self.clients.get(&pw.client_fd) {
             if let Some(wait_fd) = client.wait_fd {
-                #[repr(C)]
-                struct WakeUpReply {
-                    cookie: u64,
-                    signaled: i32,
-                    _pad: i32,
-                }
                 let reply = WakeUpReply {
                     cookie: pw.cookie,
                     signaled,
@@ -1140,7 +1104,8 @@ impl EventLoop {
 impl Drop for EventLoop {
     fn drop(&mut self) {
         if self.total_requests > 0 {
-            self.intel.flush();
+            let profiles = self.sent_messages.snapshot_profiles();
+            self.intel.flush(&profiles);
             self.registry.dump_keys();
             self.dump_opcode_stats();
             // Prometheus generation removed — montauk handles tracing now.
@@ -1164,6 +1129,21 @@ impl Drop for EventLoop {
                     }
                 }
             }
+        }
+        // Kill Wine child processes. Without this, orphaned Wine processes
+        // spin on reconnect after the daemon exits, pegging CPU.
+        let mut killed_pids = std::collections::HashSet::new();
+        for client in self.clients.values() {
+            if client.unix_pid > 0 && killed_pids.insert(client.unix_pid) {
+                unsafe { libc::kill(client.unix_pid, libc::SIGKILL); }
+            }
+        }
+        if !killed_pids.is_empty() {
+            log_info!("shutdown: killed {} Wine child processes", killed_pids.len());
+        }
+        // Close named_sync canonical fds (created via mem::forget)
+        for (_, (fd, _)) in &self.named_sync {
+            unsafe { libc::close(*fd); }
         }
         unsafe {
             libc::close(self.timer_fd);
@@ -1369,7 +1349,7 @@ fn default_resolution() -> (i32, i32) {
 impl EventLoop {
     /// Apply real display hardware data from PARALLAX shared memory.
     /// Updates desktop window rect and display GUID to match real hardware.
-    pub fn apply_display_data(&mut self, dd: &crate::parallax_display::DisplayData) {
+    pub fn apply_display_data(&mut self, dd: &crate::display::DisplayData) {
         let (w, h) = dd.primary_resolution();
 
         // Update desktop window rect to real primary resolution

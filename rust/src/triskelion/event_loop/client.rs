@@ -70,11 +70,33 @@ impl EventLoop {
                     .filter(|c| c.process_id == pid && c.thread_id != 0)
                     .map(|c| c.thread_id)
                     .collect();
-                let before = process.threads.len();
                 process.threads.retain(|t| connected_tids.contains(t));
-                if before != process.threads.len() {
-                }
             }
+        }
+
+        // Clean up pending sent messages for this receiver thread.
+        // Any tracked sends that never got reply_message must wake their
+        // senders with QS_SMRESULT or those threads block forever.
+        if tid != 0 {
+            let sender_tids = self.sent_messages.drain_all_for_receiver(tid);
+            for sender_tid in sender_tids {
+                self.set_queue_bits_for_tid(sender_tid, 0x8000); // QS_SMRESULT
+            }
+        }
+
+        // Clean up per-thread state that disconnect doesn't otherwise touch
+        if tid != 0 {
+            self.caret_state.remove(&tid);
+            self.next_timer_ids.remove(&tid);
+            self.thread_quit_state.remove(&tid);
+        }
+        self.deferred_event_signals.remove(&fd);
+        self.pending_wakes.remove(&fd);
+        self.pending_kernel_apcs.remove(&fd);
+        self.thread_completion_cache.remove(&fd);
+        // Clean stale completion_waiters entries for this client
+        for (_, waiters) in self.completion_waiters.iter_mut() {
+            waiters.retain(|w| w.client_fd != fd);
         }
 
         // Signal ntsync events for thread handles (WaitForSingleObject on thread).
@@ -83,7 +105,6 @@ impl EventLoop {
             for (creator_pid, handle, obj) in &entries {
                 log_info!("thread_exit: signaling handle={handle:#x} pid={creator_pid} for fd={fd} tid={tid}");
                 let _ = obj.event_set();
-                self.fsync_wake_handle(*creator_pid, *handle);
             }
         } else {
             log_info!("thread_exit: NO exit events registered for fd={fd} tid={tid}");
@@ -106,6 +127,55 @@ impl EventLoop {
                     unsafe { libc::close(fd); }
                 }
             }
+
+            // Purge all per-process state from event loop collections.
+            // After the last thread exits, no client holds cached fds for
+            // this process's ntsync objects — safe to drop the Arcs now.
+            self.ntsync_objects.retain(|(p, _), _| *p != pid);
+            self.ntsync_recyclable.retain(|(p, _)| *p != pid);
+            self.pending_reads.retain(|(p, _), _| *p != pid);
+            self.completed_ioctls.retain(|(p, _), _| *p != pid);
+            self.kernel_object_ptrs.retain(|(p, _, _), _| *p != pid);
+            self.process_winstations.remove(&pid);
+            // All per-handle side tables for this pid (pipe_handles closes
+            // data fds, plus io_wait_handles, fd_sent, completion_bindings).
+            self.side_tables.purge_pid(pid);
+            // nt_timers: remove entries for dead process
+            self.nt_timers.retain(|(p, _, _, _)| *p != pid);
+            // Async pipe reads: close pipe fds and remove for dead process
+            for r in self.pending_pipe_reads.iter() {
+                if r.pid == pid { unsafe { libc::close(r.pipe_fd); } }
+            }
+            self.pending_pipe_reads.retain(|r| r.pid != pid);
+            self.completed_pipe_reads.retain(|r| r.pid != pid);
+            // Named pipes: remove instances owned by dead process, close their fds
+            for instances in self.named_pipes.values_mut() {
+                for info in instances.iter() {
+                    if info.server_pid == pid {
+                        unsafe { libc::close(info.client_data_fd); }
+                    }
+                }
+                instances.retain(|info| info.server_pid != pid);
+            }
+            self.named_pipes.retain(|_, v| !v.is_empty());
+            // Windows owned by threads of the dead process
+            let dead_tids: Vec<u32> = self.state.threads.iter()
+                .filter(|(_, t)| t.pid == pid)
+                .map(|(&tid, _)| tid)
+                .collect();
+            let dead_windows: Vec<u32> = self.window_states.iter()
+                .filter(|(_, ws)| dead_tids.contains(&ws.tid))
+                .map(|(&h, _)| h)
+                .collect();
+            for wh in &dead_windows {
+                self.window_states.remove(wh);
+                self.clipboard_listeners.remove(wh);
+                self.window_properties.retain(|(h, _), _| h != wh);
+                self.win_timers_pending.remove(wh);
+                self.win_timers_expired.remove(wh);
+            }
+            // Registry notifications for dead process
+            self.registry.remove_notifications_for_pid(pid);
 
             let did_init = self.state.processes.get(&pid)
                 .map(|p| p.startup_done).unwrap_or(false);
@@ -130,10 +200,6 @@ impl EventLoop {
                         log_warn!("EARLY_DEATH: signaled info handle {ih:#x} (parent_pid={parent_pid}) for dead pid={pid} result={result:?}");
                     }
                 }
-                // Wake fsync slots after releasing ntsync_objects borrow
-                for (parent_pid, ih) in &info_entries {
-                    self.fsync_wake_handle(*parent_pid, *ih);
-                }
             }
 
             // NOTE: previously drained ALL named_sync on any early death.
@@ -153,8 +219,6 @@ impl EventLoop {
             if let Some(entries) = self.process_exit_events.remove(&pid) {
                 for (parent_pid, handle, obj) in &entries {
                     let result = obj.event_set();
-                    // Also signal fsync shm for this handle so client-side futex waiters wake
-                    self.fsync_wake_handle(*parent_pid, *handle);
                 }
             }
 
@@ -198,9 +262,6 @@ impl EventLoop {
                 }
             }
 
-            // Wake ALL fsync slots for the dying process so any waiters unblock
-            self.fsync_wake_all_for_pid(pid);
-
             // Check if this was a user (non-system) process dying.
             // If no user processes remain, signal shutdown_event to wake system processes
             // and start the linger timer — don't exit yet, new processes may connect
@@ -224,6 +285,22 @@ impl EventLoop {
                     log_info!("disconnect: linger started (5s deadline)");
                 }
             }
+
+            // Final cleanup: remove process and thread entries from ServerState.
+            // This MUST be last — earlier code reads state.processes/threads.
+            self.system_pids.remove(&pid);
+            self.state.image_views.retain(|(p, _), _| *p != pid);
+            // Close dup'd ntsync fds before removing entries
+            for (_, v) in self.state.process_info_handles.iter() {
+                if v.target_pid == pid && v.ntsync_obj_fd >= 0 {
+                    unsafe { libc::close(v.ntsync_obj_fd); }
+                }
+            }
+            self.state.process_info_handles.retain(|_, v| v.target_pid != pid);
+            for &t in &dead_tids {
+                self.state.threads.remove(&t);
+            }
+            self.state.processes.remove(&pid);
         } else if pid != 0 && tid != 0 {
         } else if pid != 0 && tid == 0 {
         }

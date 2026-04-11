@@ -31,7 +31,7 @@ from collections import Counter, OrderedDict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from util import kill_quark_processes, STEAM_ROOT, AMP_DIR_STR
+from util import kill_quark_processes, STEAM_ROOT, COMPAT_DIR_STR
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 
@@ -134,7 +134,7 @@ def find_wine_pids():
     """
     pids = []
     try:
-        r = subprocess.run(["pgrep", "-a", "-f", AMP_DIR_STR],
+        r = subprocess.run(["pgrep", "-a", "-f", COMPAT_DIR_STR],
                            capture_output=True, text=True, timeout=5)
         for line in r.stdout.strip().splitlines():
             if line.strip():

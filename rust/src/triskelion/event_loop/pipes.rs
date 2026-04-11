@@ -3,27 +3,6 @@
 use super::*;
 #[allow(unused_variables)]
 
-// Map generic access rights to specific file access rights.
-// Windows generic bits: GENERIC_READ=0x80000000, GENERIC_WRITE=0x40000000,
-// GENERIC_EXECUTE=0x20000000, GENERIC_ALL=0x10000000.
-// Wine's ntdll checks specific bits (FILE_READ_DATA, FILE_WRITE_DATA) not generic.
-fn map_generic_file_access(access: u32) -> u32 {
-    let mut mapped = access;
-    if access & 0x80000000 != 0 { // GENERIC_READ
-        mapped |= 0x00120089; // FILE_READ_DATA|FILE_READ_ATTRIBUTES|FILE_READ_EA|READ_CONTROL|SYNCHRONIZE
-    }
-    if access & 0x40000000 != 0 { // GENERIC_WRITE
-        mapped |= 0x00120116; // FILE_WRITE_DATA|FILE_WRITE_ATTRIBUTES|FILE_WRITE_EA|FILE_APPEND_DATA|READ_CONTROL|SYNCHRONIZE
-    }
-    if access & 0x20000000 != 0 { // GENERIC_EXECUTE
-        mapped |= 0x001200A0; // FILE_EXECUTE|FILE_READ_ATTRIBUTES|READ_CONTROL|SYNCHRONIZE
-    }
-    if access & 0x10000000 != 0 { // GENERIC_ALL
-        mapped |= 0x001F01FF; // FILE_ALL_ACCESS
-    }
-    mapped
-}
-
 
 // Async metadata from FSCTL_PIPE_LISTEN ioctl — needed to deliver APC_ASYNC_IO.
 #[derive(Debug, Clone, Copy)]
@@ -39,11 +18,9 @@ pub(super) struct PipeListenAsync {
 // Named pipe state tracking for FSCTL_PIPE_LISTEN / CreateFile connection.
 #[derive(Debug)]
 pub(super) struct NamedPipeInfo {
-    server_pid: u32,
+    pub(super) server_pid: u32,
     server_handle: u32,         // handle in server process's handle table
-    _server_data_fd: RawFd,     // server's end of the socketpair
-    client_data_fd: RawFd,      // client's end (held until a client connects)
-    _flags: u32,                // pipe flags from CreateNamedPipeRequest
+    pub(super) client_data_fd: RawFd,      // client's end (held until a client connects)
     state: PipeState,
     // When FSCTL_PIPE_LISTEN is called, we create a ntsync event and
     // return its handle as the Ioctl wait handle. When a client connects
@@ -68,7 +45,7 @@ pub(super) struct PendingPipeWaiter {
 impl EventLoop {
 
     pub(crate) fn handle_create_named_pipe(&mut self, client_fd: i32, buf: &[u8]) -> Reply {
-        let req = if buf.len() >= std::mem::size_of::<CreateNamedPipeRequest>() {
+        let _req = if buf.len() >= std::mem::size_of::<CreateNamedPipeRequest>() {
             unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const CreateNamedPipeRequest) }
         } else {
             return reply_fixed(&ReplyHeader { error: 0xC000000D, reply_size: 0 });
@@ -98,7 +75,9 @@ impl EventLoop {
         log_info!("PIPE_CREATE: name=\"{pipe_name}\" pid={pid} handle={handle:#x}");
 
         // Track pipe data fd for ntsync signaling
-        self.pipe_data_fds.insert((pid, handle), fds[0]);
+        self.side_tables.pipe_handles.insert((pid, handle), super::PipeHandle {
+            data_fd: fds[0],
+        });
 
         // Register in named pipe registry (keep client fd for later connection)
         let created = if !pipe_name.is_empty() {
@@ -107,9 +86,7 @@ impl EventLoop {
             instances.push(NamedPipeInfo {
                 server_pid: pid,
                 server_handle: handle,
-                _server_data_fd: fds[0],
                 client_data_fd: fds[1],  // held until a client connects
-                _flags: req.flags,
                 state: PipeState::Listening,
                 listen_event: None,
                 listen_async: None,
@@ -201,7 +178,6 @@ impl EventLoop {
                                             }
                                         }
                                         if info.client_data_fd >= 0 { unsafe { libc::close(info.client_data_fd); } }
-                                        info._server_data_fd = fds[0];
                                         info.client_data_fd = fds[1];
                                     }
                                 }
@@ -260,7 +236,6 @@ impl EventLoop {
                                                 }
                                             }
                                             if info.client_data_fd >= 0 { unsafe { libc::close(info.client_data_fd); } }
-                                            info._server_data_fd = fds[0];
                                             info.client_data_fd = fds[1];
                                         }
                                     }
@@ -326,7 +301,7 @@ _async_event: 0, // sync mode — no overlapped event
                                         entry.fd = Some(fds[0]);
                                     }
                                 }
-                                info._server_data_fd = fds[0];
+                                if info.client_data_fd >= 0 { unsafe { libc::close(info.client_data_fd); } }
                                 info.client_data_fd = fds[1];
                             }
                             info.state = PipeState::Listening;
@@ -592,7 +567,7 @@ _async_event: 0, // sync mode — no overlapped event
                 .and_then(|(_, instances)| instances.iter().find(|i| i.server_pid == server_pid && i.state == PipeState::Connected))
                 .map(|i| i.server_handle)
             {
-                if let Some(&(port_handle, ckey)) = self.completion_bindings.get(&(server_pid, pipe_handle)) {
+                if let Some(&(port_handle, ckey)) = self.side_tables.completion_bindings.get(&(server_pid, pipe_handle)) {
                     let msg = super::CompletionMsg {
                         ckey,
                         cvalue: la.user as u64,
@@ -652,7 +627,7 @@ _async_event: 0, // sync mode — no overlapped event
         // Map generic access rights to specific file access rights.
         // Wine's ntdll checks specific rights (FILE_WRITE_DATA) not generic (GENERIC_WRITE).
         // Without this mapping, server_get_unix_fd fails with STATUS_ACCESS_DENIED.
-        let mapped_access = map_generic_file_access(access);
+        let mapped_access = Self::map_file_access(access);
 
         // Create a handle for the client process
         let oid = self.state.alloc_object_id();
@@ -668,7 +643,9 @@ _async_event: 0, // sync mode — no overlapped event
                     crate::objects::HandleEntry::with_fd(oid, client_data_fd, crate::objects::FD_TYPE_DEVICE, mapped_access, pipe_options)
                 );
                 // Track pipe data fd for ntsync signaling
-                self.pipe_data_fds.insert((pid, h), client_data_fd);
+                self.side_tables.pipe_handles.insert((pid, h), super::PipeHandle {
+                    data_fd: client_data_fd,
+                });
                 h
             } else { 0 }
         } else { 0 };
@@ -680,16 +657,14 @@ _async_event: 0, // sync mode — no overlapped event
         }))
     }
 
-    pub(crate) fn handle_set_named_pipe_info(&mut self, client_fd: i32, buf: &[u8]) -> Reply {
-        let req = if buf.len() >= std::mem::size_of::<SetNamedPipeInfoRequest>() {
-            unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const SetNamedPipeInfoRequest) }
-        } else {
+    pub(crate) fn handle_set_named_pipe_info(&mut self, _client_fd: i32, buf: &[u8]) -> Reply {
+        if buf.len() < std::mem::size_of::<SetNamedPipeInfoRequest>() {
             return reply_fixed(&ReplyHeader { error: 0xC000000D, reply_size: 0 });
-        };
-        let pid = self.client_pid(client_fd as RawFd);
-        if req.flags != 0 {
-            self.pipe_handle_flags.insert((pid, req.handle), req.flags);
         }
+        // Stock wineserver records the flags so set_pipe_state can read them back.
+        // Triskelion has no consumer for them — handler returns success without
+        // storing. Reintroduce a real store + read path before any code starts
+        // depending on the value.
         reply_fixed(&ReplyHeader { error: 0, reply_size: 0 })
     }
 

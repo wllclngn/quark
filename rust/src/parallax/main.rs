@@ -71,12 +71,10 @@ fn main() {
             let child_cmd = get_child_command(&config);
             if let Some(cmd_str) = child_cmd {
                 eprintln!("[PARALLAX] launching child: {cmd_str}");
-                run_child(&cmd_str, &shm);
-            } else {
-                // No child — just hold the shm open until signal
-                eprintln!("[PARALLAX] no child command, holding display info (Ctrl+C to exit)");
-                wait_for_signal();
+                run_child(&cmd_str);
             }
+            // Exit immediately. Triskelion reads the SHM during its
+            // startup and shm_unlinks when done. No need to hold open.
         }
         None => {
             eprintln!("[PARALLAX] failed to create shared memory segment");
@@ -109,7 +107,7 @@ fn get_child_command(config: &config::Config) -> Option<String> {
     config.child.clone()
 }
 
-fn run_child(cmd: &str, _shm: &display_info::DisplayShm) {
+fn run_child(cmd: &str) {
     let parts: Vec<&str> = cmd.split_whitespace().collect();
     if parts.is_empty() { return; }
 
@@ -131,19 +129,5 @@ fn run_child(cmd: &str, _shm: &display_info::DisplayShm) {
         Err(e) => {
             eprintln!("[PARALLAX] child wait error: {e}");
         }
-    }
-}
-
-fn wait_for_signal() {
-    // Block on SIGINT/SIGTERM
-    unsafe {
-        let mut set: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut set);
-        libc::sigaddset(&mut set, libc::SIGINT);
-        libc::sigaddset(&mut set, libc::SIGTERM);
-        libc::sigprocmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
-        let mut sig: i32 = 0;
-        libc::sigwait(&set, &mut sig);
-        eprintln!("[PARALLAX] received signal {sig}, exiting");
     }
 }

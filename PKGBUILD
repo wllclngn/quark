@@ -16,13 +16,16 @@ makedepends=(
     'rust'
     'cargo'
     'git'
+    'clang'
+    'lld'
+    'autoconf'
 )
 optdepends=(
     'dxvk: DirectX 9/10/11 to Vulkan translation'
     'vkd3d: DirectX 12 to Vulkan translation'
     'lib32-vulkan-driver: 32-bit Vulkan support'
 )
-provides=('quark' 'triskelion' 'parallax')
+provides=('quark' 'triskelion' 'sybil')
 source=("git+https://github.com/wllclngn/personal.git#tag=v${pkgver}")
 sha256sums=('SKIP')
 
@@ -47,7 +50,7 @@ package() {
     # Binaries
     install -Dm755 target/release/quark "${pkgdir}/usr/lib/quark/quark"
     install -Dm755 target/release/triskelion "${pkgdir}/usr/lib/quark/triskelion"
-    install -Dm755 target/release/parallax "${pkgdir}/usr/lib/quark/parallax"
+    install -Dm755 target/release/sybil "${pkgdir}/usr/lib/quark/sybil"
 
     # Steam expects "proton" entry point
     ln -s quark "${pkgdir}/usr/lib/quark/proton"
@@ -61,7 +64,7 @@ package() {
 
     # Compute shader
     install -d "${pkgdir}/usr/lib/quark/shaders"
-    install -Dm644 rust/src/parallax/shaders/downscale.comp \
+    install -Dm644 rust/src/sybil/shaders/downscale.comp \
         "${pkgdir}/usr/lib/quark/shaders/downscale.comp"
 
     # Steam compatibility tool VDFs

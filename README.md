@@ -1,6 +1,8 @@
-# quark/triskelion/PARALLAX
+# quark · triskelion · PARALLAX
 
-Three Rust binaries replacing Proton, wineserver, and explorer.exe. quark replaces Proton's Python launcher. triskelion replaces Wine's 26,000-line C wineserver with a ~17,000-line Rust daemon built on `/dev/ntsync` kernel primitives, CSP event loop, and shared-memory message queues. PARALLAX replaces explorer.exe with DRM/KMS display enumeration and shared-memory hardware data.
+ATTENTION: quark is a still-in-development software.
+
+Three Rust binaries replacing Proton, wineserver, and explorer.exe. quark replaces Proton's Python launcher. triskelion replaces Wine's 26,000-line C wineserver with a ~18,000-line Rust daemon built on `/dev/ntsync` kernel primitives, CSP event loop, shared-memory message queues, and adaptive message routing. PARALLAX replaces explorer.exe with DRM/KMS display enumeration and shared-memory hardware data.
 
 Three binaries, one crate. Drops in as a Steam compatibility tool.
 
@@ -10,13 +12,14 @@ Steam
        ├─ triskelion (wineserver replacement daemon)
        │    ├─ CSP event loop (authority + I/O threads, flume channels)
        │    ├─ /dev/ntsync (kernel-native NT semaphore/mutex/event)
-       │    └─ Wine protocol v930 (306 opcodes, 246 with handlers)
+       │    ├─ Wine protocol v931 (306 opcodes, 246 with handlers)
+       │    └─ Adaptive routing (PANDEMONIUM-inspired observe/classify/decide/persist)
        ├─ PARALLAX (display compositor, DRM/KMS enumeration)
        │    └─ shared memory → triskelion (GPU, connectors, modes, DEVMODEW)
-       ├─ Wine client (system Wine 11.5, winex11.drv via XWayland)
+       ├─ Wine client (system Wine, winex11.drv via XWayland)
        │    └─ /dev/ntsync ioctls (inproc sync, bypasses daemon)
        ├─ steam.exe (Wine builtin, built from Proton steam_helper source)
-       │    └─ lsteamclient.dll/.so (built from Proton source, patched for Wine 11.5)
+       │    └─ lsteamclient.dll/.so (built from Proton source, patched for system Wine)
        ├─ DXVK (d3d9/d3d10/d3d11/dxgi → Vulkan, deployed to prefix)
        ├─ VKD3D-Proton (d3d12 → Vulkan, deployed to prefix)
        └─ EAC bridge (from Proton EasyAntiCheat Runtime, Steam tool 1826330)
@@ -24,19 +27,14 @@ Steam
 
 ## Status
 
-| Game | Requests | Status |
-|------|----------|--------|
-| Balatro | 340+ | RENDERING, full keyboard + mouse input |
-| Dark Souls Remastered | 166,359 | DXVK Fossilize active, 11 processes, 87 opcodes |
-| Resident Evil 4 | 238 | 7 PIDs, .NET CLR init, device manager IRP queue needed |
-| Hades | 515 | Launches, services running |
-| Halls of Torment | 358 | Launches |
-| Silent Hill 2 | 240 | Launches |
-| Elden Ring | 199 | Display fixed, EAC process creation blocker |
-| Quake II | 212 | Launches |
-| DOOM | 218 | Launches |
-| Half-Life 2 | 210 | Launches |
-| Duke Nukem 3D | 205 | Launches |
+| Game | Engine | Requests | Status |
+|------|--------|----------|--------|
+| Hollow Knight | Unity/Mono | 3,558 | PLAYABLE (renders, interactable, Steam API) |
+| Wedding Witch | Unity/Mono | 2,088 | PLAYABLE (renders, interactable, Steam API) |
+| Balatro | LOVE2D/SDL2 | 1,168 | x11drv, LOVE runs, PHYSFS require error (game code) |
+| Halls of Torment | .NET | 2,102 | x11drv, Mono loads, kernelbase crash |
+| TMNT Shredder's Revenge | FNA/.NET | 1,962 | x11drv, Mono + FNA loads, kernelbase crash |
+| Duke Nukem 3D | Native i386 | 174 | WoW64 loads, 32-bit DLLs chain, needs Steam IPC |
 
 ## quark, Proton Replacement
 
@@ -160,6 +158,25 @@ Steam
 | client.rs | 231 | 0 | Connection lifecycle, exit events, SHM slot free |
 | dispatch.rs | 184 | 0 | Opcode routing, auto-stub, panic recovery |
 | token.rs | 139 | 10 | Security tokens, privileges |
+| sent_messages.rs | ~160 | 0 | Adaptive message routing: per-msg_code profiles, persistence via intel.rs |
+
+### Adaptive Message Routing
+
+Replaces the earlier Sibyl module. Cross-process SendMessage routing inspired by PANDEMONIUM's procdb: observe, classify, decide, persist. Profiles persist across launches in .quark_cache v3 (intel.rs Section 6).
+
+| | Stock wineserver | triskelion |
+|---|---|---|
+| Sent message routing | Static: same-process inline, cross-process via message_result chain | Adaptive: tracked default, fast-path when reply patterns learned |
+| Cold start behavior | Full infrastructure from first message | All cross-process sends tracked (correct Wine semantics, won't break games) |
+| Learning | None | Per-msg_code vote counting (fast vs tracked), promotion at 90% confidence after 8 observations |
+| Persistence | None | .quark_cache v3 Section 6 (up to 256 msg_code profiles per game) |
+| Daemon-owned windows | Desktop has message loop (explorer.exe) | Always fast-path (no message loop exists) |
+
+**Sent message fork** (in handle_send_message):
+- **Same-process**: Sender blocks (tracked). MSG_OTHER_PROCESS rewritten to MSG_UNICODE so Wine skips unpack_message.
+- **Cross-process, daemon-owned target**: Immediate QS_SMRESULT (desktop/msg windows have no message loop).
+- **Cross-process, promoted**: Learned fire-and-forget. Ring buffer + immediate QS_SMRESULT.
+- **Cross-process, tracked**: Ring buffer + QS_SENDMESSAGE wake on receiver. No QS_SMRESULT until reply_message.
 
 **ntsync lifecycle**:
 - Device fd and per-thread alert fd sent to Wine via pending_fd (guaranteed ordering).
@@ -208,7 +225,7 @@ lsteamclient patches (applied to Proton source during build):
 |-------|---------|
 | 004-configure-add-lsteamclient-dll | Register lsteamclient in Wine configure |
 | 005-configure-add-steam-helper | Register steam_helper in Wine configure |
-| 006-lsteamclient-wine11-api-compat | Path API compat for Wine 11.5 |
+| 006-lsteamclient-wine11-api-compat | Path API compat for system Wine |
 | 007-lsteamclient-link-stdcxx | Link libstdc++ |
 
 All wine patches applied automatically by install.py (`sorted(patch_dir.glob("*.patch"))`).
@@ -224,14 +241,21 @@ EAC integration uses Valve's official Proton EasyAntiCheat Runtime (Steam tool 1
 ### Dependencies
 
 - **Linux 6.14+** with `/dev/ntsync` enabled
-- **Wine 11.5+** (system Wine)
+- **Wine 11.5+** (detected from system, never pinned)
 - **Rust 1.85+** (2024 edition)
-- **x86_64-w64-mingw32-gcc** (for lsteamclient + steam.exe stubs)
-- **Proton EasyAntiCheat Runtime** (Steam tool, for EAC games)
+- **clang + lld** (for PE stub DLLs — no mingw needed)
+- **autoconf, make** (for patched Wine DLL builds)
+- **Proton EasyAntiCheat Runtime** (Steam tool, optional, for EAC games)
+
+Optional:
+- **wine-mono** (for .NET/FNA games: TMNT, Halls of Torment)
+- **lib32-wine** (for 32-bit games: Duke Nukem 3D, Half-Life 2)
 
 ```bash
 # Arch Linux / CachyOS
-pacman -S wine rust mingw-w64-gcc
+pacman -S wine rust clang lld autoconf base-devel
+pacman -S wine-mono      # optional, for .NET/FNA games
+pacman -S lib32-wine      # optional, for 32-bit games
 ```
 
 ```bash
@@ -243,7 +267,7 @@ The installer:
 2. Deploys system Wine tree (hardlinks)
 3. Syncs PE DLLs to game prefixes
 4. Downloads + deploys DXVK and VKD3D-Proton
-5. Builds lsteamclient.dll/.so + steam.exe from Proton source (patched for Wine 11.5)
+5. Builds lsteamclient.dll/.so + steam.exe from Proton source (patched for system Wine)
 6. Applies wine patches (001-015) and builds patched ntdll + kernelbase + win32u
 7. Deploys EAC bridge DLLs from Proton EAC Runtime (warns if not installed)
 8. Creates Steam compatibility tool VDFs (proton symlink -> quark, bin/wineserver -> triskelion)

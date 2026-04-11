@@ -1,0 +1,48 @@
+diff --git a/programs/wineboot/wineboot.c b/programs/wineboot/wineboot.c
+index 7c814d1..3a13a7d 100644
+--- a/programs/wineboot/wineboot.c
++++ b/programs/wineboot/wineboot.c
+@@ -1878,6 +1878,8 @@ int __cdecl main( int argc, char *argv[] )
+     if (NtQuerySystemInformationEx( SystemSupportedProcessorArchitectures, &process, sizeof(process),
+                                     machines, sizeof(machines), NULL )) machines[0].Machine = 0;
+ 
++    BOOL fast_boot = !!_wgetenv( L"QUARK_FAST_BOOT" );
++
+     /* create event to be inherited by services.exe */
+     InitializeObjectAttributes( &attr, &nameW, OBJ_OPENIF | OBJ_INHERIT, 0, NULL );
+     NtCreateEvent( &event, EVENT_ALL_ACCESS, &attr, NotificationEvent, 0 );
+@@ -1888,6 +1890,13 @@ int __cdecl main( int argc, char *argv[] )
+     create_hardware_registry_keys();
+     create_dynamic_registry_keys();
+     create_computer_name_keys();
++
++    if (fast_boot)
++    {
++        WINE_TRACE("QUARK_FAST_BOOT: skipping services, wine.inf, RunKeys\n");
++        goto fast_finish;
++    }
++
+     wininit();
+     pendingRename();
+ 
+@@ -1901,13 +1910,17 @@ int __cdecl main( int argc, char *argv[] )
+     }
+     if (init || update) update_wineprefix( update );
+ 
++fast_finish:
+     create_volatile_environment_registry_key();
+     create_known_dlls();
+-    initialize_internet();
+ 
+-    ProcessRunKeys( HKEY_LOCAL_MACHINE, L"RunOnce", TRUE, TRUE );
++    if (!fast_boot)
++    {
++        initialize_internet();
++        ProcessRunKeys( HKEY_LOCAL_MACHINE, L"RunOnce", TRUE, TRUE );
++    }
+ 
+-    if (!init && !restart)
++    if (!init && !restart && !fast_boot)
+     {
+         ProcessRunKeys( HKEY_LOCAL_MACHINE, L"Run", FALSE, FALSE );
+         ProcessRunKeys( HKEY_CURRENT_USER, L"Run", FALSE, FALSE );

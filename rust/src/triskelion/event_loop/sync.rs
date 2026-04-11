@@ -210,10 +210,6 @@ impl EventLoop {
                         log_warn!("deferred_event_signal: MISS pid={evpid} handle={handle:#x}");
                     }
                 }
-                // Wake fsync slots after signaling ntsync objects
-                for (evpid, handle) in &events {
-                    self.fsync_wake_handle(*evpid, *handle);
-                }
             }
 
             // Close the APC handle — it was allocated when the APC was delivered
@@ -226,24 +222,30 @@ impl EventLoop {
 
         // Thread suspension: when the select vararg includes CONTEXT data
         // (after apc_result + select_op), the thread is suspending.
-        // Required for WoW64 init. Return STATUS_PENDING; resume_thread wakes it.
+        // Return STATUS_PENDING; resume_thread wakes it.
         const APC_RESULT_SIZE_CHECK: usize = 40;
         let contexts_offset = super::VARARG_OFF + APC_RESULT_SIZE_CHECK + req.size as usize;
         let has_contexts = buf.len() > contexts_offset;
         if has_contexts && req.size == 0 {
-            let _pid = self.client_pid(client_fd as RawFd);
             let tid = self.client_thread_id(client_fd as RawFd).unwrap_or(0);
-            let cookie_val = req.cookie;
-            if let Some(client) = self.clients.get_mut(&(client_fd as RawFd)) {
-                client.suspend_cookie = cookie_val as u64;
-                log_info!("SELECT_SUSPEND: tid={tid} fd={client_fd} cookie={cookie_val:#x} wait_fd={:?}",
-                    client.wait_fd);
+            // Only block if the thread is still suspended (suspend_count > 0).
+            // If resume_thread already ran, suspend_count is 0 — don't block.
+            let still_suspended = self.state.threads.get(&tid)
+                .map(|t| t.suspend_count > 0)
+                .unwrap_or(false);
+            if still_suspended {
+                let cookie_val = req.cookie;
+                if let Some(client) = self.clients.get_mut(&(client_fd as RawFd)) {
+                    client.suspend_cookie = cookie_val as u64;
+                    log_info!("SELECT_SUSPEND: tid={tid} fd={client_fd} cookie={cookie_val:#x} wait_fd={:?}",
+                        client.wait_fd);
+                }
+                return reply_fixed(&SelectReply {
+                    header: ReplyHeader { error: 0x103, reply_size: 0 },
+                    apc_handle: 0,
+                    signaled: 0,
+                });
             }
-            return reply_fixed(&SelectReply {
-                header: ReplyHeader { error: 0x103, reply_size: 0 },
-                apc_handle: 0,
-                signaled: 0,
-            });
         }
 
         let has_objects = req.size > 0;
@@ -296,7 +298,7 @@ impl EventLoop {
                             if let Some(fallback_obj) = self.get_or_create_event(false, true) {
                                 ntsync_fds.push(fallback_obj.fd());
                                 ntsync_arcs.push(Arc::clone(&fallback_obj));
-                                self.insert_recyclable_event(pid, handle, fallback_obj, 1); // INTERNAL
+                                self.insert_recyclable_event(pid, handle, fallback_obj, 2); // EVENT
                                 handles_debug.push(format!("{handle:#x}(FALLBACK)"));
                             } else {
                                 handles_debug.push(format!("{handle:#x}(MISSING)"));
@@ -493,12 +495,6 @@ impl EventLoop {
                                 }
                             };
 
-                            #[repr(C)]
-                            struct WakeUpReply {
-                                cookie: u64,
-                                signaled: i32,
-                                _pad: i32,
-                            }
                             let reply = WakeUpReply { cookie, signaled, _pad: 0 };
                             unsafe {
                                 libc::write(dup_wfd, &reply as *const _ as *const _, 16);
@@ -646,16 +642,6 @@ impl EventLoop {
                     0 => obj.event_pulse().unwrap_or(0),
                     _ => 0,
                 };
-                // Bridge to fsync: signal/clear the fsync shm slot too
-                match req.op {
-                    0 | 1 => self.fsync_wake_handle(pid, req.handle), // SET/PULSE
-                    2 => { // RESET
-                        if let Some(&idx) = self.fsync_indices.get(&(pid, req.handle)) {
-                            crate::fsync_clear(idx);
-                        }
-                    }
-                    _ => {}
-                }
                 let reply = EventOpReply {
                     header: ReplyHeader { error: 0, reply_size: 0 },
                     state: prev as i32,
@@ -904,18 +890,18 @@ impl EventLoop {
         let handle = self.alloc_waitable_handle_for_client(client_fd);
         if handle == 0 {
             log_error!("create_keyed_event: handle=0! fd={client_fd}");
-            return reply_fixed(&ReplyHeader { error: 0xC0000017, reply_size: 0 }); // STATUS_NO_MEMORY
+            return reply_fixed(&ReplyHeader { error: 0xC0000017, reply_size: 0 });
         }
         let pid = self.client_pid(client_fd as RawFd);
         if let Some(obj) = self.get_or_create_event(true, false) {
             self.ntsync_objects.insert((pid, handle), (obj, 1)); // INTERNAL (keyed event)
         }
-        let reply = CreateKeyedEventReply {
+        log_info!("create_keyed_event: handle={handle:#x} pid={pid} fd={client_fd}");
+        reply_fixed(&CreateKeyedEventReply {
             header: ReplyHeader { error: 0, reply_size: 0 },
             handle,
             _pad_0: [0; 4],
-        };
-        reply_fixed(&reply)
+        })
     }
 
 
@@ -991,29 +977,52 @@ impl EventLoop {
         })
     }
 
-    pub(crate) fn handle_query_event(&mut self, _client_fd: i32, _buf: &[u8]) -> Reply {
+    pub(crate) fn handle_query_event(&mut self, client_fd: i32, buf: &[u8]) -> Reply {
+        let (manual_reset, state) = if buf.len() >= std::mem::size_of::<QueryEventRequest>() {
+            let req = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const QueryEventRequest) };
+            let pid = self.client_pid(client_fd as RawFd);
+            self.ntsync_objects.get(&(pid, req.handle))
+                .and_then(|(obj, _)| obj.event_read())
+                .map(|(m, s)| (m as i32, s as i32))
+                .unwrap_or((0, 0))
+        } else { (0, 0) };
         reply_fixed(&QueryEventReply {
             header: ReplyHeader { error: 0, reply_size: 0 },
-            manual_reset: 0,
-            state: 0,
+            manual_reset,
+            state,
         })
     }
 
-    pub(crate) fn handle_query_mutex(&mut self, _client_fd: i32, _buf: &[u8]) -> Reply {
+    pub(crate) fn handle_query_mutex(&mut self, client_fd: i32, buf: &[u8]) -> Reply {
+        let (count, owned) = if buf.len() >= std::mem::size_of::<QueryMutexRequest>() {
+            let req = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const QueryMutexRequest) };
+            let pid = self.client_pid(client_fd as RawFd);
+            self.ntsync_objects.get(&(pid, req.handle))
+                .and_then(|(obj, _)| obj.mutex_read())
+                .map(|(owner, count)| (count, if owner != 0 { 1i32 } else { 0 }))
+                .unwrap_or((0, 0))
+        } else { (0, 0) };
         reply_fixed(&QueryMutexReply {
             header: ReplyHeader { error: 0, reply_size: 0 },
-            count: 0,
-            owned: 0,
+            count,
+            owned,
             abandoned: 0,
             _pad_0: [0; 4],
         })
     }
 
-    pub(crate) fn handle_query_semaphore(&mut self, _client_fd: i32, _buf: &[u8]) -> Reply {
+    pub(crate) fn handle_query_semaphore(&mut self, client_fd: i32, buf: &[u8]) -> Reply {
+        let (current, max) = if buf.len() >= std::mem::size_of::<QuerySemaphoreRequest>() {
+            let req = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const QuerySemaphoreRequest) };
+            let pid = self.client_pid(client_fd as RawFd);
+            self.ntsync_objects.get(&(pid, req.handle))
+                .and_then(|(obj, _)| obj.sem_read())
+                .unwrap_or((0, 1))
+        } else { (0, 1) };
         reply_fixed(&QuerySemaphoreReply {
             header: ReplyHeader { error: 0, reply_size: 0 },
-            current: 0,
-            max: 1,
+            current,
+            max,
         })
     }
 
@@ -1253,8 +1262,8 @@ impl EventLoop {
         // Handle not found — create on-demand event.
         // For pipe handles: UNSIGNALED, monitored by I/O thread for data arrival.
         // For other handles: SIGNALED (timeout waits complete, not block forever).
-        let is_pipe = self.pipe_data_fds.contains_key(&(pid, handle));
-        let initial_signaled = !is_pipe;
+        let pipe_data_fd = self.side_tables.pipe_handles.get(&(pid, handle)).map(|p| p.data_fd);
+        let initial_signaled = pipe_data_fd.is_none();
         if let Some(obj) = self.get_or_create_event(true, initial_signaled) {
             let ntsync_fd = obj.fd();
             let dup_fd = unsafe { libc::fcntl(ntsync_fd, libc::F_DUPFD_CLOEXEC, 0) };
@@ -1268,22 +1277,15 @@ impl EventLoop {
                 .map(|e| e.access)
                 .unwrap_or(0x001F0003);
             // If pipe handle, set up I/O thread monitoring
-            if is_pipe {
-                if let Some(&pipe_fd) = self.pipe_data_fds.get(&(pid, handle)) {
-                    // Dup the ntsync fd for the I/O thread (it needs its own copy)
-                    let watch_ntsync = unsafe { libc::fcntl(ntsync_fd, libc::F_DUPFD_CLOEXEC, 0) };
-                    if watch_ntsync >= 0 {
-                        self.pending_pipe_watches.push((pipe_fd, watch_ntsync));
-                        log_info!("pipe_watch: queued fd={pipe_fd} ntsync={watch_ntsync} for pid={pid} handle={handle:#x}");
-                    }
+            if let Some(pipe_fd) = pipe_data_fd {
+                // Dup the ntsync fd for the I/O thread (it needs its own copy)
+                let watch_ntsync = unsafe { libc::fcntl(ntsync_fd, libc::F_DUPFD_CLOEXEC, 0) };
+                if watch_ntsync >= 0 {
+                    self.pending_pipe_watches.push((pipe_fd, watch_ntsync));
+                    log_info!("pipe_watch: queued fd={pipe_fd} ntsync={watch_ntsync} for pid={pid} handle={handle:#x}");
                 }
             }
             self.ntsync_objects.insert((pid, handle), (obj, 1)); // INTERNAL
-            if self.deferred_pipe_signals.remove(&(pid, handle)) {
-                if let Some((obj, _)) = self.ntsync_objects.get(&(pid, handle)) {
-                    let _ = obj.event_set();
-                }
-            }
             return reply_fixed(&GetInprocSyncFdReply {
                 header: ReplyHeader { error: 0, reply_size: 0 },
                 r#type: 1,
@@ -1318,28 +1320,6 @@ impl EventLoop {
             handle: token,
             _pad_0: [0; 4],
         })
-    }
-
-    // ---- Proton esync/fsync ----
-
-    /// Esync/fsync opcodes do not exist in Wine 11.4's protocol.
-    /// These handlers exist because Proton clients may still send them
-    /// before protocol remapping kicks in. Return NOT_IMPLEMENTED via
-    /// a generic ReplyHeader so no Proton-only struct types are needed.
-    pub(crate) fn _handle_create_esync(&mut self, _client_fd: i32, _buf: &[u8]) -> Reply {
-        reply_fixed(&ReplyHeader { error: 0xC0000002, reply_size: 0 }) // NOT_IMPLEMENTED
-    }
-
-    pub(crate) fn _handle_get_esync_fd(&mut self, _client_fd: i32, _buf: &[u8]) -> Reply {
-        reply_fixed(&ReplyHeader { error: 0xC0000002, reply_size: 0 }) // NOT_IMPLEMENTED
-    }
-
-    pub(crate) fn _handle_create_fsync(&mut self, _client_fd: i32, _buf: &[u8]) -> Reply {
-        reply_fixed(&ReplyHeader { error: 0xC0000002, reply_size: 0 }) // NOT_IMPLEMENTED
-    }
-
-    pub(crate) fn _handle_get_fsync_idx(&mut self, _client_fd: i32, _buf: &[u8]) -> Reply {
-        reply_fixed(&ReplyHeader { error: 0xC0000002, reply_size: 0 }) // NOT_IMPLEMENTED
     }
 
 }

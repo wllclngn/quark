@@ -12,20 +12,34 @@ REQUIRES: sudo (montauk --trace needs CAP_SYS_ADMIN for eBPF)
 Usage:
     sudo python3 tests/trace_fused_exe.py
     sudo python3 tests/trace_fused_exe.py --skip-stock   # Only run triskelion
-    sudo python3 tests/trace_fused_exe.py --skip-amp     # Only run stock
+    sudo python3 tests/trace_fused_exe.py --skip-quark     # Only run stock
     sudo python3 tests/trace_fused_exe.py --timeout 30   # Longer capture
 """
 
 import os, subprocess, sys, time, signal, re, shutil
+from datetime import datetime
 from pathlib import Path
 from collections import defaultdict
+
+
+def _ts() -> str:
+    return datetime.now().strftime("[%H:%M:%S]")
+
+def log_info(msg: str) -> None:
+    print(f"{_ts()} [INFO]   {msg}", flush=True)
+
+def log_warn(msg: str) -> None:
+    print(f"{_ts()} [WARN]   {msg}", flush=True)
+
+def log_error(msg: str) -> None:
+    print(f"{_ts()} [ERROR]  {msg}", flush=True)
 
 # Resolve real user home even under sudo
 _USER_HOME = Path(f"/home/{os.environ.get('SUDO_USER', os.environ.get('USER', 'mod'))}")
 
 MONTAUK = _USER_HOME / "personal/PROGRAMMING/SYSTEM PROGRAMS/LINUX/montauk/build/montauk"
 STEAM_ROOT = _USER_HOME / ".local/share/Steam"
-AMP_DIR = STEAM_ROOT / "compatibilitytools.d/quark"
+QUARK_DIR = STEAM_ROOT / "compatibilitytools.d/quark"
 GAME_EXE = STEAM_ROOT / "steamapps/common/Balatro/Balatro.exe"
 COMPAT_DATA = STEAM_ROOT / "steamapps/compatdata/2379780"
 PFX = COMPAT_DATA / "pfx"
@@ -36,7 +50,7 @@ PROTON_BIN = PROTON_DIR / "proton"
 
 TRACE_DIR = Path("/tmp/quark/fused_exe_trace")
 STOCK_TRACE = TRACE_DIR / "stock"
-AMP_TRACE = TRACE_DIR / "amp"
+QUARK_TRACE = TRACE_DIR / "quark"
 
 TIMEOUT = int(sys.argv[sys.argv.index("--timeout") + 1]) if "--timeout" in sys.argv else 25
 
@@ -58,8 +72,8 @@ def kill_all():
     for pat in ["triskelion", "montauk"]:
         subprocess.run(["pkill", "-9", "-f", pat], capture_output=True)
     # Kill wine processes from quark's directory ONLY (not system/Proton wine)
-    amp_bin = str(_USER_HOME / ".local/share/Steam/compatibilitytools.d/quark")
-    subprocess.run(["pkill", "-9", "-f", amp_bin], capture_output=True)
+    quark_bin = str(_USER_HOME / ".local/share/Steam/compatibilitytools.d/quark")
+    subprocess.run(["pkill", "-9", "-f", quark_bin], capture_output=True)
     # Kill any wineserver in /tmp dirs that triskelion created (but not Proton's)
     subprocess.run(["pkill", "-9", "-x", "triskelion"], capture_output=True)
     time.sleep(2)
@@ -98,7 +112,7 @@ def run_trace(label, trace_dir, proton_bin, use_stock_proton=False):
     # Start montauk --trace BEFORE the game so it catches the exec.
     # Pattern "wine" matches wine-preloader, wine64, wineserver, and children.
     trace_pattern = "wine"
-    print(f"\n  [{label}] Starting montauk --trace {trace_pattern} ...")
+    log_info(f"[{label}] starting montauk --trace {trace_pattern}")
     montauk_log = trace_dir / "montauk.log"
     montauk_proc = subprocess.Popen(
         [str(MONTAUK), "--trace", trace_pattern, "--log", str(trace_dir),
@@ -109,7 +123,7 @@ def run_trace(label, trace_dir, proton_bin, use_stock_proton=False):
     time.sleep(2)  # let eBPF attach and settle
 
     # Launch the game
-    print(f"  [{label}] Launching game ...")
+    log_info(f"[{label}] launching game")
     stderr_log = trace_dir / "wine_stderr.log"
     game_proc = subprocess.Popen(
         game_cmd, env=env, cwd="/tmp",
@@ -122,13 +136,13 @@ def run_trace(label, trace_dir, proton_bin, use_stock_proton=False):
     for i in range(TIMEOUT):
         time.sleep(1)
         if game_proc.poll() is not None:
-            print(f"  [{label}] Game exited at {i+1}s")
+            log_info(f"[{label}] game exited at {i+1}s")
             # Keep montauk running a bit to capture final state
             time.sleep(2)
             break
         if i % 5 == 4:
             prom_files = list(trace_dir.glob("montauk_*.prom"))
-            print(f"  [{label}] [{i+1}s] running... {len(prom_files)} snapshots")
+            log_info(f"[{label}] tick={i+1}s snapshots={len(prom_files)}")
 
     # Kill the ENTIRE process tree spawned by the game launcher.
     # start_new_session=True puts all children (wineserver, wine-preloader,
@@ -167,14 +181,14 @@ def run_trace(label, trace_dir, proton_bin, use_stock_proton=False):
             break
     if best:
         shutil.copy2(best, trace_dir / "final.prom")
-        print(f"  [{label}] Using snapshot: {best.name} ({best.stat().st_size // 1024}K)")
+        log_info(f"[{label}] snapshot={best.name} size={best.stat().st_size // 1024}K")
     elif prom_files:
         shutil.copy2(prom_files[-1], trace_dir / "final.prom")
-        print(f"  [{label}] Using last snapshot (no active trace data found)")
+        log_warn(f"[{label}] using last snapshot (no active trace data found)")
     else:
-        print(f"  [{label}] WARNING: no trace snapshots captured")
+        log_warn(f"[{label}] no trace snapshots captured")
 
-    print(f"  [{label}] Total snapshots: {len(prom_files)}")
+    log_info(f"[{label}] total snapshots={len(prom_files)}")
     return trace_dir
 
 
@@ -233,25 +247,24 @@ def fd_is_interesting(target):
 
 def analyze_fds(data, label):
     """Show file descriptors related to Balatro/LÖVE."""
-    print(f"\n  [{label}] Interesting file descriptors:")
+    log_info(f"[{label}] interesting fds:")
     found = {}
     for key, target in sorted(data["fds"].items()):
         if fd_is_interesting(target):
-            print(f"    {key}: {target}")
+            log_info(f"  {key}: {target}")
             found[key] = target
     if not found:
-        print(f"    (none found)")
-    # Also show total fd count
-    print(f"    Total tracked fds: {len(data['fds'])}")
+        log_info("  (none found)")
+    log_info(f"[{label}] total tracked fds={len(data['fds'])}")
     return found
 
 
 def analyze_io(data, label):
     """Show file I/O operations — the core of the diagnosis."""
-    print(f"\n  [{label}] File I/O operations ({len(data['io'])} captured):")
+    log_info(f"[{label}] file I/O operations ({len(data['io'])} captured)")
 
     if not data["io"]:
-        print(f"    (no I/O captured)")
+        log_info("  (no I/O captured)")
         return
 
     # Build fd → filename map
@@ -273,55 +286,52 @@ def analyze_io(data, label):
         target = fd_names.get(fd_key, "(unknown)")
         if fd_is_interesting(target) or any(fd_is_interesting(fd_names.get((o["pid"], o["fd"]), "")) for o in ops):
             interesting_io = True
-            print(f"\n    fd {fd} (pid {pid}): {target}")
+            log_info(f"  fd={fd} pid={pid} target={target}")
             for op in ops:
                 sc = op["syscall"]
                 count = op["count"]
                 result = op["result"]
                 whence = op["whence"]
-                if sc in ("lseek",):
+                if sc == "lseek":
                     whence_name = {0: "SEEK_SET", 1: "SEEK_CUR", 2: "SEEK_END"}.get(int(whence) if whence else -1, f"whence={whence}")
-                    print(f"      {sc}(fd={fd}, offset={count}, {whence_name}) = {result}")
+                    log_info(f"    {sc} fd={fd} offset={count} {whence_name} -> {result}")
                 elif sc in ("read", "pread64"):
-                    offset_str = f", offset={whence}" if sc == "pread64" and whence != "0" else ""
-                    print(f"      {sc}(fd={fd}, count={count}{offset_str}) = {result} bytes")
-                elif sc in ("write",):
-                    print(f"      {sc}(fd={fd}, count={count}) = {result} bytes")
+                    offset_str = f" offset={whence}" if sc == "pread64" and whence != "0" else ""
+                    log_info(f"    {sc} fd={fd} count={count}{offset_str} -> {result} bytes")
+                elif sc == "write":
+                    log_info(f"    {sc} fd={fd} count={count} -> {result} bytes")
                 elif sc in ("newfstat", "fstat"):
-                    print(f"      fstat(fd={fd}) = {result} (st_size={count})")
+                    log_info(f"    fstat fd={fd} -> result={result} st_size={count}")
                 else:
-                    print(f"      {sc}(fd={fd}, count={count}, result={result})")
+                    log_info(f"    {sc} fd={fd} count={count} result={result}")
 
     if not interesting_io:
-        # Show ALL I/O as fallback
-        print(f"\n    No Balatro-specific I/O found. All I/O operations:")
+        log_info("  no Balatro-specific I/O found, showing all operations:")
         for op in data["io"][:20]:
             target = fd_names.get((op["pid"], op["fd"]), "?")
             short_target = target.split("/")[-1] if "/" in target else target
-            print(f"      [{op['pid']}/{op['tid']}] {op['syscall']}(fd={op['fd']}→{short_target}, count={op['count']}) = {op['result']}")
+            log_info(f"    pid={op['pid']} tid={op['tid']} {op['syscall']} fd={op['fd']} target={short_target} count={op['count']} result={op['result']}")
         if len(data["io"]) > 20:
-            print(f"      ... and {len(data['io']) - 20} more")
+            log_info(f"    ... and {len(data['io']) - 20} more")
 
 
 def analyze_threads(data, label):
     """Show thread states for Wine/game processes."""
-    print(f"\n  [{label}] Traced processes: {len(data['processes'])}")
+    log_info(f"[{label}] traced processes={len(data['processes'])}")
     for pid, info in sorted(data["processes"].items()):
-        print(f"    pid={pid} ppid={info['ppid']} cmd={info['cmd']} root={info['root']}")
+        log_info(f"  pid={pid} ppid={info['ppid']} cmd={info['cmd']} root={info['root']}")
 
-    print(f"\n  [{label}] Thread states ({len(data['threads'])} threads):")
+    log_info(f"[{label}] thread states ({len(data['threads'])} threads)")
     for key, info in sorted(data["threads"].items()):
         comm = info["comm"]
         if comm in ("montauk", "montauk-bpf"):
             continue
-        print(f"    {key} [{comm:20s}] {info['syscall']:30s} wchan={info['wchan']}")
+        log_info(f"  {key} comm={comm:20s} syscall={info['syscall']:30s} wchan={info['wchan']}")
 
 
-def diff_io(stock_data, amp_data):
+def diff_io(stock_data, quark_data):
     """Compare I/O operations between stock and quark — the money shot."""
-    print(f"\n{'='*60}")
-    print(f"  I/O DIFF: Stock vs Triskelion")
-    print(f"{'='*60}")
+    log_info("I/O diff: stock vs triskelion")
 
     # Build fd → filename maps
     def fd_map(data):
@@ -332,21 +342,17 @@ def diff_io(stock_data, amp_data):
         return m
 
     stock_fds = fd_map(stock_data)
-    amp_fds = fd_map(amp_data)
+    quark_fds = fd_map(quark_data)
 
-    # Find Balatro.exe fds
     stock_bal_fds = {k: v for k, v in stock_fds.items() if "balatro" in v.lower()}
-    amp_bal_fds = {k: v for k, v in amp_fds.items() if "balatro" in v.lower()}
+    quark_bal_fds = {k: v for k, v in quark_fds.items() if "balatro" in v.lower()}
 
-    print(f"\n  Balatro.exe open fds:")
-    print(f"    Stock: {len(stock_bal_fds)}")
+    log_info(f"Balatro.exe open fds: stock={len(stock_bal_fds)} quark={len(quark_bal_fds)}")
     for k, v in stock_bal_fds.items():
-        print(f"      pid={k[0]} fd={k[1]}: {v}")
-    print(f"    Amp:   {len(amp_bal_fds)}")
-    for k, v in amp_bal_fds.items():
-        print(f"      pid={k[0]} fd={k[1]}: {v}")
+        log_info(f"  stock pid={k[0]} fd={k[1]} target={v}")
+    for k, v in quark_bal_fds.items():
+        log_info(f"  quark  pid={k[0]} fd={k[1]} target={v}")
 
-    # Compare I/O on Balatro.exe fds
     def io_on_file(data, fd_map, filename_match):
         ops = []
         for op in data["io"]:
@@ -356,124 +362,98 @@ def diff_io(stock_data, amp_data):
         return ops
 
     stock_bal_io = io_on_file(stock_data, stock_fds, "balatro")
-    amp_bal_io = io_on_file(amp_data, amp_fds, "balatro")
+    quark_bal_io = io_on_file(quark_data, quark_fds, "balatro")
 
-    print(f"\n  I/O operations on Balatro.exe:")
-    print(f"    Stock: {len(stock_bal_io)} operations")
+    def fmt_op(op):
+        sc = op["syscall"]
+        if sc == "lseek":
+            wn = {0: "SET", 1: "CUR", 2: "END"}.get(int(op["whence"]) if op["whence"] else -1, op["whence"])
+            return f"{sc} offset={op['count']} {wn} -> {op['result']}"
+        if sc in ("read", "pread64"):
+            return f"{sc} count={op['count']} -> {op['result']} bytes"
+        if sc in ("newfstat", "fstat"):
+            return f"fstat -> result={op['result']} st_size={op['count']}"
+        return f"{sc} count={op['count']} -> {op['result']}"
+
+    log_info(f"Balatro.exe I/O ops: stock={len(stock_bal_io)} quark={len(quark_bal_io)}")
     for op in stock_bal_io[:15]:
-        sc = op["syscall"]
-        if sc == "lseek":
-            wn = {0: "SET", 1: "CUR", 2: "END"}.get(int(op["whence"]) if op["whence"] else -1, op["whence"])
-            print(f"      {sc}(offset={op['count']}, {wn}) → {op['result']}")
-        elif sc in ("read", "pread64"):
-            print(f"      {sc}(count={op['count']}) → {op['result']} bytes")
-        elif sc in ("newfstat", "fstat"):
-            print(f"      fstat() → result={op['result']} st_size={op['count']}")
-        else:
-            print(f"      {sc}(count={op['count']}) → {op['result']}")
-
-    print(f"\n    Amp:   {len(amp_bal_io)} operations")
-    for op in amp_bal_io[:15]:
-        sc = op["syscall"]
-        if sc == "lseek":
-            wn = {0: "SET", 1: "CUR", 2: "END"}.get(int(op["whence"]) if op["whence"] else -1, op["whence"])
-            print(f"      {sc}(offset={op['count']}, {wn}) → {op['result']}")
-        elif sc in ("read", "pread64"):
-            print(f"      {sc}(count={op['count']}) → {op['result']} bytes")
-        elif sc in ("newfstat", "fstat"):
-            print(f"      fstat() → result={op['result']} st_size={op['count']}")
-        else:
-            print(f"      {sc}(count={op['count']}) → {op['result']}")
+        log_info(f"  stock {fmt_op(op)}")
+    for op in quark_bal_io[:15]:
+        log_info(f"  quark  {fmt_op(op)}")
 
     # The verdict
-    if stock_bal_io and not amp_bal_io:
-        print(f"\n  >>> VERDICT: Stock has I/O on Balatro.exe, quark has NONE.")
-        print(f"      PhysFS never reads the exe under triskelion — file not opened or fd not tracked.")
-    elif not stock_bal_io and not amp_bal_io:
-        print(f"\n  >>> VERDICT: Neither has I/O on Balatro.exe in this snapshot.")
-        print(f"      The I/O may have completed before the snapshot. Try --timeout 30.")
-    elif stock_bal_io and amp_bal_io:
-        # Compare the operations
+    if stock_bal_io and not quark_bal_io:
+        log_warn("verdict: stock has I/O on Balatro.exe, quark has NONE")
+        log_warn("  PhysFS never reads the exe under triskelion - file not opened or fd not tracked")
+    elif not stock_bal_io and not quark_bal_io:
+        log_warn("verdict: neither has I/O on Balatro.exe in this snapshot")
+        log_warn("  the I/O may have completed before the snapshot. Try --timeout 30.")
+    elif stock_bal_io and quark_bal_io:
         stock_results = [(o["syscall"], o["count"], o["result"]) for o in stock_bal_io]
-        amp_results = [(o["syscall"], o["count"], o["result"]) for o in amp_bal_io]
-        if stock_results == amp_results:
-            print(f"\n  >>> VERDICT: I/O sequences MATCH. PhysFS does the same thing.")
-            print(f"      Bug is elsewhere (not in file I/O on the exe).")
+        quark_results = [(o["syscall"], o["count"], o["result"]) for o in quark_bal_io]
+        if stock_results == quark_results:
+            log_info("verdict: I/O sequences MATCH. PhysFS does the same thing in both runs.")
+            log_info("  bug is elsewhere (not in file I/O on the exe).")
         else:
-            print(f"\n  >>> VERDICT: I/O sequences DIFFER. This is the bug.")
-            print(f"      Compare the operations above to find the divergence.")
+            log_warn("verdict: I/O sequences DIFFER. This is the bug.")
+            log_warn("  compare the operations above to find the divergence.")
 
 
 def main():
     if os.geteuid() != 0:
-        print("ERROR: This script requires sudo (montauk --trace needs CAP_SYS_ADMIN)")
-        print("Usage: sudo python3 tests/trace_fused_exe.py")
+        log_error("this script requires sudo (montauk --trace needs CAP_SYS_ADMIN)")
+        log_error("usage: sudo python3 tests/trace_fused_exe.py")
         sys.exit(1)
 
     if not MONTAUK.exists():
-        print(f"ERROR: montauk not found at {MONTAUK}")
+        log_error(f"montauk not found at {MONTAUK}")
         sys.exit(1)
 
     if not GAME_EXE.exists():
-        print(f"ERROR: Balatro not found at {GAME_EXE}")
+        log_error(f"Balatro not found at {GAME_EXE}")
         sys.exit(1)
 
     skip_stock = "--skip-stock" in sys.argv
-    skip_amp = "--skip-amp" in sys.argv
+    skip_quark = "--skip-quark" in sys.argv
 
-    # Clean previous traces
     if TRACE_DIR.exists():
         shutil.rmtree(TRACE_DIR)
     TRACE_DIR.mkdir(parents=True)
 
-    print("=" * 60)
-    print("  LÖVE Fused-Exe Trace: Stock vs Triskelion")
-    print(f"  montauk v5.2.0 — eBPF file I/O + BPF-side pattern matching")
-    print("=" * 60)
-    print(f"  Game: {GAME_EXE.name} ({GAME_EXE.stat().st_size / 1024 / 1024:.1f} MB)")
-    print(f"  Prefix: {PFX}")
-    print(f"  Timeout: {TIMEOUT}s per run")
-    print(f"  Montauk: {MONTAUK}")
+    log_info("LÖVE fused-exe trace: stock proton vs triskelion")
+    log_info(f"  game={GAME_EXE.name} size={GAME_EXE.stat().st_size / 1024 / 1024:.1f}MB")
+    log_info(f"  prefix={PFX}")
+    log_info(f"  timeout={TIMEOUT}s per run")
+    log_info(f"  montauk={MONTAUK}")
 
     stock_data = {"processes": {}, "threads": {}, "fds": {}, "io": []}
-    amp_data = {"processes": {}, "threads": {}, "fds": {}, "io": []}
+    quark_data = {"processes": {}, "threads": {}, "fds": {}, "io": []}
 
-    # Stock wineserver run
     if not skip_stock:
-        print(f"\n{'='*60}")
-        print(f"  STOCK WINESERVER")
-        print(f"{'='*60}")
+        log_info("phase: stock wineserver")
         stock_dir = run_trace("stock", STOCK_TRACE, None, use_stock_proton=True)
         stock_data = parse_trace_prom(stock_dir)
-        analyze_fds(stock_data, "STOCK")
-        analyze_io(stock_data, "STOCK")
-        analyze_threads(stock_data, "STOCK")
+        analyze_fds(stock_data, "stock")
+        analyze_io(stock_data, "stock")
+        analyze_threads(stock_data, "stock")
 
-    # Triskelion run
-    if not skip_amp:
-        print(f"\n{'='*60}")
-        print(f"  TRISKELION (quark)")
-        print(f"{'='*60}")
-        amp_dir = run_trace("amp", AMP_TRACE, AMP_DIR, use_stock_proton=False)
-        amp_data = parse_trace_prom(amp_dir)
-        analyze_fds(amp_data, "AMP")
-        analyze_io(amp_data, "AMP")
-        analyze_threads(amp_data, "AMP")
+    if not skip_quark:
+        log_info("phase: triskelion (quark)")
+        quark_dir = run_trace("quark", QUARK_TRACE, QUARK_DIR, use_stock_proton=False)
+        quark_data = parse_trace_prom(quark_dir)
+        analyze_fds(quark_data, "quark")
+        analyze_io(quark_data, "quark")
+        analyze_threads(quark_data, "quark")
 
-    # Comparison
-    if not skip_stock and not skip_amp:
-        diff_io(stock_data, amp_data)
+    if not skip_stock and not skip_quark:
+        diff_io(stock_data, quark_data)
 
-    # Summary
-    print(f"\n{'='*60}")
-    print(f"  TRACE FILES")
-    print(f"{'='*60}")
-    for label, d in [("Stock", STOCK_TRACE), ("Amp", AMP_TRACE)]:
+    log_info("trace files:")
+    for label, d in [("stock", STOCK_TRACE), ("quark", QUARK_TRACE)]:
         if d.exists():
-            print(f"  {label}: {d}/")
+            log_info(f"  {label}: {d}/")
             for f in sorted(d.glob("*")):
-                print(f"    {f.name} ({f.stat().st_size // 1024}K)")
-    print()
+                log_info(f"    {f.name} ({f.stat().st_size // 1024}K)")
 
 
 if __name__ == "__main__":

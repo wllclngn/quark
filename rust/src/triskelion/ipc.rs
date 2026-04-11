@@ -18,15 +18,16 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
 
-/// Compile-time protocol version (from whichever Wine source was used to build).
-/// At runtime, the actual version sent to clients comes from ProtocolRemap
-/// which detects the deployed ntdll.so's version dynamically.
-pub const COMPILED_PROTOCOL_VERSION: u32 = 930;
+/// Compile-time protocol version. Re-exported from the build.rs-generated
+/// protocol module, which reads SERVER_PROTOCOL_VERSION from the Wine source
+/// at build time. Always matches the wineserver protocol version this build
+/// was compiled against.
+pub use crate::protocol::COMPILED_PROTOCOL_VERSION;
 
 /// Runtime protocol version — set by detect_and_remap() at startup.
 /// Defaults to COMPILED_PROTOCOL_VERSION; updated before accepting connections.
 static RUNTIME_PROTOCOL_VERSION: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(930);
+    std::sync::atomic::AtomicU32::new(COMPILED_PROTOCOL_VERSION);
 
 pub fn set_runtime_protocol_version(ver: u32) {
     RUNTIME_PROTOCOL_VERSION.store(ver, std::sync::atomic::Ordering::Relaxed);

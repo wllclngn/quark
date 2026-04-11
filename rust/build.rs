@@ -13,10 +13,14 @@
 //
 // Wine source resolution order:
 //   1. WINE_SRC env var
-//   2. ~/.local/share/quark/wine-src/
-//   3. /tmp/proton-wine/
+//   2. /tmp/quark-wine-build/wine-src/   (cloned by install.py step_sync_wine_source)
+//   3. ~/.local/share/quark/wine-src/
+//   4. /tmp/proton-wine/
 //
-// If no Wine source found, uses src/protocol_generated.rs.fallback.
+// install.py sets WINE_SRC explicitly when invoking cargo so the build always
+// regenerates against the freshly-cloned wine source matching system Wine.
+// If no Wine source is reachable the build aborts with a clear "run install.py
+// first" message — there is no checked-in fallback to fall through to.
 
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -120,64 +124,38 @@ struct RequestDef {
 fn main() {
     let out_dir = env::var("OUT_DIR").unwrap();
     let out_path = PathBuf::from(&out_dir).join("protocol_generated.rs");
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
-    let fallback_path = PathBuf::from(&manifest_dir)
-        .join("src")
-        .join("protocol_generated.rs.fallback");
 
-    let wine_src = find_wine_src();
+    let wine_root = find_wine_src().unwrap_or_else(|| {
+        panic!(
+            "build.rs: no Wine source found. Set WINE_SRC or run install.py first \
+             (it clones Wine to /tmp/quark-wine-build/wine-src in step_sync_wine_source)."
+        );
+    });
 
-    match wine_src {
-        Some(wine_root) => {
-            println!(
-                "cargo:warning=Generating protocol from {}",
-                wine_root.display()
-            );
+    println!("cargo:warning=Generating protocol from {}", wine_root.display());
 
-            let generated = generate_from_wine_src(&wine_root);
-            fs::write(&out_path, &generated).expect("Failed to write generated protocol");
+    let generated = generate_from_wine_src(&wine_root);
+    fs::write(&out_path, &generated).expect("Failed to write generated protocol");
 
-            // Update fallback for future builds without Wine source
-            if let Err(e) = fs::write(&fallback_path, &generated) {
-                println!("cargo:warning=Cannot update fallback file: {e}");
-            }
-
-            // Re-run if sources change
-            let protocol_def = wine_root.join("server").join("protocol.def");
-            let header = wine_root
-                .join("include")
-                .join("wine")
-                .join("server_protocol.h");
-            if protocol_def.exists() {
-                println!("cargo:rerun-if-changed={}", protocol_def.display());
-            }
-            if header.exists() {
-                println!("cargo:rerun-if-changed={}", header.display());
-            }
-        }
-        None => {
-            if fallback_path.exists() {
-                println!("cargo:warning=Wine source not found, using committed fallback");
-                fs::copy(&fallback_path, &out_path).expect("Failed to copy fallback");
-            } else {
-                panic!(
-                    "No Wine source found and no fallback at {}. \
-                     Set WINE_SRC or run: triskelion clone",
-                    fallback_path.display()
-                );
-            }
-        }
+    // Re-run if the source headers change
+    let protocol_def = wine_root.join("server").join("protocol.def");
+    let header = wine_root.join("include").join("wine").join("server_protocol.h");
+    if protocol_def.exists() {
+        println!("cargo:rerun-if-changed={}", protocol_def.display());
     }
-
-    // Re-run if these change
+    if header.exists() {
+        println!("cargo:rerun-if-changed={}", header.display());
+    }
     println!("cargo:rerun-if-env-changed=WINE_SRC");
-    println!("cargo:rerun-if-changed=src/protocol_generated.rs.fallback");
 }
 
 /// Find the Wine source root directory.
 fn find_wine_src() -> Option<PathBuf> {
     let candidates: Vec<PathBuf> = vec![
         env::var("WINE_SRC").ok().map(PathBuf::from).unwrap_or_default(),
+        // install.py clones wine source here in step_sync_wine_source.
+        // Matches WINE_SRC_DIR in install.py.
+        PathBuf::from("/tmp/quark-wine-build/wine-src"),
         home_dir()
             .map(|h| {
                 h.join(".local")
@@ -202,6 +180,20 @@ fn home_dir() -> Option<PathBuf> {
     env::var("HOME").ok().map(PathBuf::from)
 }
 
+/// Parse `#define SERVER_PROTOCOL_VERSION N` from server_protocol.h.
+/// Returns None if the header is missing or the line can't be found.
+fn parse_server_protocol_version(header_path: &Path) -> Option<u32> {
+    let content = fs::read_to_string(header_path).ok()?;
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("#define SERVER_PROTOCOL_VERSION") {
+            let num = rest.trim().split_whitespace().next()?;
+            return num.parse().ok();
+        }
+    }
+    None
+}
+
 // ── Top-level generation ─────────────────────────────────────────────────────
 
 fn generate_from_wine_src(wine_root: &Path) -> String {
@@ -218,6 +210,26 @@ fn generate_from_wine_src(wine_root: &Path) -> String {
          // Wine root: {}\n\
          // Generated by build.rs at compile time.\n\n",
         wine_root.display()
+    ));
+
+    // SERVER_PROTOCOL_VERSION from server_protocol.h.
+    // This bakes the wineserver protocol version this triskelion build speaks
+    // into the binary. Used by ipc.rs to identify itself on the handshake.
+    // Hardcoding it (the previous bug) meant the daemon would tell Wine "I
+    // speak 930" no matter what version it was actually compiled against, so
+    // any system Wine that moved versions would kick the daemon at the first
+    // byte. Now it's parsed from the same source the rest of the protocol
+    // codegen reads, so they always agree.
+    let proto_version = parse_server_protocol_version(&header_path).unwrap_or(0);
+    if proto_version != 0 {
+        println!("cargo:warning=  SERVER_PROTOCOL_VERSION: {proto_version}");
+    } else {
+        println!("cargo:warning=  SERVER_PROTOCOL_VERSION: not found in header — using 0");
+    }
+    out.push_str(&format!(
+        "/// Wine wineserver protocol version this build was compiled against.\n\
+         /// Read from server_protocol.h's SERVER_PROTOCOL_VERSION at build time.\n\
+         pub const COMPILED_PROTOCOL_VERSION: u32 = {proto_version};\n\n"
     ));
 
     let types = type_map();

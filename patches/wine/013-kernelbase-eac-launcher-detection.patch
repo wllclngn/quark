@@ -19,7 +19,7 @@ Simplified from wine-valve (Proton).
 +     * game process will NOT have this set, so it uses the builtin bridge. */
 +    {
 +        static const WCHAR protectedW[] = L"start_protected_game.exe";
-+        const WCHAR *exe_base = app_name ? wcsrchr( app_name, L'\' ) : NULL;
++        const WCHAR *exe_base = app_name ? wcsrchr( app_name, L'\\' ) : NULL;
 +        if (!exe_base) exe_base = app_name ? wcsrchr( app_name, L'/' ) : NULL;
 +        exe_base = exe_base ? exe_base + 1 : app_name;
 +        if (exe_base && !wcsicmp( exe_base, protectedW ))

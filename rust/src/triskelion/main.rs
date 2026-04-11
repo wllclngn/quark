@@ -16,11 +16,13 @@ mod ntsync;
 mod objects;
 mod registry;
 mod event_loop;
-mod intel;
 mod ipc;
 mod shm;
 mod csp_loop;
-mod parallax_display;
+mod sent_messages;
+mod display;
+mod intel;
+mod com_classes;
 
 use std::sync::atomic::AtomicBool;
 
@@ -112,7 +114,7 @@ fn run_server() {
     };
 
     // Read PARALLAX display data if available
-    let display_data = parallax_display::read_parallax_shm(&prefix_hash);
+    let display_data = display::read_parallax_shm(&prefix_hash);
     if let Some(ref dd) = display_data {
         let (w, h) = dd.primary_resolution();
         log_info!("display: using PARALLAX data — GPU {} {:04x}:{:04x}, primary {}x{}",
@@ -204,94 +206,6 @@ fn resolve_socket_path() -> std::path::PathBuf {
     }
 
     server_dir.join("socket")
-}
-
-#[allow(dead_code)]
-fn _create_fsync_shm(_prefix_hash: &str) {
-    let prefix = std::env::var("WINEPREFIX")
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").expect("HOME not set");
-            format!("{home}/.wine")
-        });
-    let stat = std::fs::metadata(&prefix).expect("WINEPREFIX does not exist");
-    use std::os::unix::fs::MetadataExt;
-    let ino = stat.ino();
-
-    let shm_name = if ino != (ino as u32) as u64 {
-        format!("/wine-{:x}{:08x}-fsync", (ino >> 32) as u32, ino as u32)
-    } else {
-        format!("/wine-{:x}-fsync", ino as u32)
-    };
-
-    let c_name = std::ffi::CString::new(shm_name.as_str()).unwrap();
-    let fd = unsafe {
-        libc::shm_open(c_name.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o644)
-    };
-    if fd < 0 {
-        log_warn!("fsync shm: failed to create {shm_name}: {}", std::io::Error::last_os_error());
-        return;
-    }
-    let initial_size: usize = 4 * 1024 * 1024;
-    unsafe { libc::ftruncate(fd, initial_size as libc::off_t); }
-
-    let base = unsafe {
-        libc::mmap(std::ptr::null_mut(), initial_size, libc::PROT_READ | libc::PROT_WRITE,
-                   libc::MAP_SHARED, fd, 0)
-    };
-    if base != libc::MAP_FAILED {
-        unsafe { FSYNC_SHM_BASE = base as *mut u8; }
-        unsafe { FSYNC_SHM_SIZE = initial_size; }
-        log_info!("fsync shm: created and mmap'd {shm_name} ({initial_size} bytes)");
-    } else {
-        log_warn!("fsync shm: mmap failed: {}", std::io::Error::last_os_error());
-    }
-    unsafe { FSYNC_SHM_FD = fd; }
-}
-
-static mut FSYNC_SHM_BASE: *mut u8 = std::ptr::null_mut();
-static mut FSYNC_SHM_SIZE: usize = 0;
-#[allow(dead_code)]
-static mut FSYNC_SHM_FD: i32 = -1;
-
-pub fn fsync_shm_write(idx: u32, low: i32, high: i32) {
-    let offset = (idx as usize) * 16;
-    let size = unsafe { FSYNC_SHM_SIZE };
-    let base = unsafe { FSYNC_SHM_BASE };
-    if base.is_null() || offset + 16 > size { return; }
-    unsafe {
-        let slot = base.add(offset) as *mut i32;
-        *slot = low;
-        *slot.add(1) = high;
-        *slot.add(2) = 1;
-        *slot.add(3) = 0;
-    }
-}
-
-pub fn fsync_signal(idx: u32) {
-    let offset = (idx as usize) * 16;
-    let size = unsafe { FSYNC_SHM_SIZE };
-    let base = unsafe { FSYNC_SHM_BASE };
-    if base.is_null() || offset + 16 > size || idx == 0 { return; }
-    unsafe {
-        let signaled_ptr = base.add(offset) as *mut i32;
-        let old = std::sync::atomic::AtomicI32::from_ptr(signaled_ptr)
-            .swap(1, std::sync::atomic::Ordering::SeqCst);
-        if old == 0 {
-            libc::syscall(libc::SYS_futex, signaled_ptr, 1 /*FUTEX_WAKE*/, i32::MAX, 0, 0, 0);
-        }
-    }
-}
-
-pub fn fsync_clear(idx: u32) {
-    let offset = (idx as usize) * 16;
-    let size = unsafe { FSYNC_SHM_SIZE };
-    let base = unsafe { FSYNC_SHM_BASE };
-    if base.is_null() || offset + 16 > size || idx == 0 { return; }
-    unsafe {
-        let signaled_ptr = base.add(offset) as *mut i32;
-        std::sync::atomic::AtomicI32::from_ptr(signaled_ptr)
-            .store(0, std::sync::atomic::Ordering::SeqCst);
-    }
 }
 
 fn compute_prefix_hash() -> String {

@@ -1,29 +1,30 @@
 From: quark <quark@localhost>
-Subject: [PATCH] win32u: Guard against NULL shared object dereference in seqlock functions
+Subject: [PATCH] win32u: guard NULL shared object dereference with sentinel
 
-During early thread initialization (particularly winedevice service
-threads), shared session object lookups can return NULL when the
-server returns a zero locator for a thread whose queue or input
-hasn't been created yet.
+During early thread initialization, shared session object lookups
+return NULL when the server returns a zero locator. Downstream
+callers dereference this NULL pointer at offset 0x18, crashing
+winedevice service threads.
 
-The seqlock acquire/release functions and shared_object_get_id
-unconditionally dereference the object pointer, causing a page
-fault at address 0x0 (seq field) or 0x8 (id field). Downstream
-callers that access object->shm.input.focus crash at 0x18.
-
-Add NULL guards to all three primitives. acquire_seqlock sets
-seq=0 and returns. release_seqlock returns TRUE to break retry
-loops. get_id returns 0. All callers already handle zero/invalid
-ids as cache misses, so this safely degrades to a server round-trip.
+Return a static zeroed sentinel instead of NULL from
+find_shared_session_object. All fields read as zero: seqlock
+sees seq=0 (even), get_id returns 0, callers treat id=0 as
+cache miss and fall back to server round-trip. NULL guards on
+seqlock/get_id remain as defense-in-depth.
 
 Signed-off-by: quark <quark@localhost>
 ---
 diff --git a/dlls/win32u/winstation.c b/dlls/win32u/winstation.c
-index 6190e45..96cf683 100644
+index 6190e45..275cb2f 100644
 --- a/dlls/win32u/winstation.c
 +++ b/dlls/win32u/winstation.c
-@@ -81,18 +81,21 @@ static struct session_thread_data *get_session_thread_data(void)
+@@ -79,20 +79,26 @@ static struct session_thread_data *get_session_thread_data(void)
+     return thread_info->session_data;
+ }
 
++/* Sentinel: returned when session lookup fails. All fields zero. */
++static const shared_object_t null_shared_object;
++
  void shared_object_acquire_seqlock( const shared_object_t *object, UINT64 *seq )
  {
 +    if (!object) { *seq = 0; return; }
@@ -44,3 +45,12 @@ index 6190e45..96cf683 100644
      struct object_lock lock = OBJECT_LOCK_INIT;
      do
      {
+@@ -185,7 +191,7 @@ const shared_object_t *find_shared_session_object( object_id_t id, mem_size_t of
+         WARN( "Session object id doesn't match expected id %s\n", wine_dbgstr_longlong(id) );
+     }
+
+-    return NULL;
++    return &null_shared_object;
+ }
+
+ void shared_session_init(void)

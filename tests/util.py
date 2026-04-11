@@ -23,8 +23,8 @@ REFERENCE_DIR = TESTS_DIR / "reference"
 
 _USER_HOME = Path(f"/home/{os.environ.get('SUDO_USER', os.environ.get('USER', 'mod'))}")
 STEAM_ROOT = _USER_HOME / ".local/share/Steam"
-AMP_DIR = STEAM_ROOT / "compatibilitytools.d/quark"
-AMP_DIR_STR = str(AMP_DIR)
+COMPAT_DIR = STEAM_ROOT / "compatibilitytools.d/quark"
+COMPAT_DIR_STR = str(COMPAT_DIR)
 
 PROTON_DIR = STEAM_ROOT / "steamapps/common/Proton 10.0"
 PROTON_BIN = PROTON_DIR / "proton"
@@ -48,9 +48,9 @@ def kill_quark_processes(graceful_timeout=0.3):
                    capture_output=True, timeout=5)
     time.sleep(graceful_timeout)
 
-    for pattern in [f"{AMP_DIR_STR}/proton",
-                    f"{AMP_DIR_STR}/lib/wine",
-                    f"{AMP_DIR_STR}/bin/wine",
+    for pattern in [f"{COMPAT_DIR_STR}/proton",
+                    f"{COMPAT_DIR_STR}/lib/wine",
+                    f"{COMPAT_DIR_STR}/bin/wine",
                     "triskelion"]:
         subprocess.run(["pkill", "-9", "-f", pattern],
                        capture_output=True, timeout=5)
@@ -58,7 +58,7 @@ def kill_quark_processes(graceful_timeout=0.3):
 
     # Straggler sweep scoped to our directory
     try:
-        result = subprocess.run(["pgrep", "-a", "-f", AMP_DIR_STR],
+        result = subprocess.run(["pgrep", "-a", "-f", COMPAT_DIR_STR],
                                 capture_output=True, text=True, timeout=5)
         if result.returncode == 0 and result.stdout.strip():
             for line in result.stdout.strip().splitlines():
@@ -128,8 +128,32 @@ def make_game_env(appid="2379780", winedebug="-all", extra=None):
     return env
 
 
+# Helper executables shipped alongside games — never the actual game.
+# Mirrors EXE_BLACKLIST in iterate.py. Without filtering, get_game_exe
+# can pick UnityCrashHandler64.exe for Unity games or
+# DukeWorkshopUploader.exe for Duke Nukem, then every downstream test
+# launches the wrong .exe and the game never even tries to run.
+GAME_EXE_BLACKLIST = {
+    "unitycrashhandler64.exe", "unitycrashhandler32.exe",
+    "crashreport.exe", "crashhandler.exe", "crashpad_handler.exe",
+    "ue4prereqsetup_x64.exe", "ue4prereqsetup_x86.exe",
+    "installermessage.exe",
+    "dxsetup.exe", "vcredist_x64.exe", "vcredist_x86.exe",
+    "dukeworkshopuploader.exe",
+    "dotnetfx35.exe", "dotnetfx35setup.exe",
+    "beservice.exe", "beservice_x64.exe",
+    "easyanticheat_setup.exe", "easyanticheat.exe",
+    "uninstall.exe", "unins000.exe",
+}
+
+
 def get_game_exe(appid="2379780"):
-    """Find the game executable for a Steam appid."""
+    """Find the actual game executable for a Steam appid.
+
+    Picks the largest .exe in the install directory (up to 3 levels deep)
+    that is NOT a known helper / installer / crash reporter. Returns None
+    if no valid candidate exists.
+    """
     steamapps = STEAM_ROOT / "steamapps"
     manifest = steamapps / f"appmanifest_{appid}.acf"
     if not manifest.exists():
@@ -145,15 +169,17 @@ def get_game_exe(appid="2379780"):
     if not install_dir.exists():
         return None
 
-    # Find largest .exe (same heuristic as iterate.py)
     candidates = []
     for exe in install_dir.rglob("*.exe"):
-        # Skip depth > 3
+        # Skip depth > 3 (avoid bundled vendor tools deep in subdirs)
         try:
-            exe.relative_to(install_dir).parts
-            if len(exe.relative_to(install_dir).parts) > 3:
+            depth = len(exe.relative_to(install_dir).parts)
+            if depth > 3:
                 continue
         except ValueError:
+            continue
+        # Skip known-helper exes
+        if exe.name.lower() in GAME_EXE_BLACKLIST:
             continue
         candidates.append(exe)
 

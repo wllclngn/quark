@@ -1,0 +1,27 @@
+From: quark <quark@localhost>
+Subject: [PATCH] win32u: guard scroll info pointer before field access
+
+get_scroll_info_ptr can return a pointer derived from an
+uninitialized pScroll field in the WND structure. When pScroll
+is garbage (non-zero but invalid), &pScroll->horz produces a
+near-NULL pointer. Subsequent field access at offset 0x18
+(curVal) causes a page fault.
+
+Add explicit validation that the returned pointer is in a
+reasonable address range before dereferencing.
+
+Signed-off-by: quark <quark@localhost>
+---
+diff --git a/dlls/win32u/scroll.c b/dlls/win32u/scroll.c
+index 1234567..abcdefg 100644
+--- a/dlls/win32u/scroll.c
++++ b/dlls/win32u/scroll.c
+@@ -870,7 +870,7 @@ BOOL get_scroll_info( HWND hwnd, int bar, SCROLLINFO *info )
+     struct scroll_info *scroll;
+ 
+     /* handle invalid data structure */
+-    if (!validate_scroll_info( info ) || !(scroll = get_scroll_info_ptr( hwnd, bar, FALSE )))
++    if (!validate_scroll_info( info ) || !(scroll = get_scroll_info_ptr( hwnd, bar, FALSE )) || (ULONG_PTR)scroll < 0x10000)
+         return FALSE;
+ 
+     /* fill in the desired scroll info structure */

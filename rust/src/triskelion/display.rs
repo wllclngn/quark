@@ -11,7 +11,7 @@ pub struct DisplayData {
     pub gpu: GpuData,
     pub connectors: Vec<ConnectorData>,
     pub driver_choice: u8,  // 0 = auto, 1 = winex11.drv, 2 = winewayland.drv
-    pub session_type: u32,  // 0 = unknown, 1 = x11, 2 = wayland
+    pub _session_type: u32,  // 0 = unknown, 1 = x11, 2 = wayland
 }
 
 pub struct GpuData {
@@ -28,12 +28,12 @@ pub struct GpuData {
 
 pub struct ConnectorData {
     pub name: String,
-    pub connector_type: u32,
-    pub mm_width: u32,
-    pub mm_height: u32,
+    pub _connector_type: u32,
+    pub _mm_width: u32,
+    pub _mm_height: u32,
     pub edid: Vec<u8>,
     pub modes: Vec<ModeData>,
-    pub current_mode_index: usize,
+    pub _current_mode_index: usize,
     pub current_width: u32,
     pub current_height: u32,
     pub current_refresh: u32,
@@ -45,7 +45,7 @@ pub struct ModeData {
     pub refresh: u32,
 }
 
-const SHM_MAGIC: u32 = 0x504C4158; // "PLAX"
+const SHM_MAGIC: u32 = 0x5359424C; // "SYBL"
 const HEADER_SIZE: usize = 64;
 const GPU_ENTRY_SIZE: usize = 256;
 const CONNECTOR_HEADER_SIZE: usize = 128;
@@ -78,6 +78,9 @@ pub fn read_parallax_shm(prefix_hash: &str) -> Option<DisplayData> {
     let result = unsafe { parse_shm(base as *const u8) };
 
     unsafe { libc::munmap(base, SHM_SIZE); }
+
+    // Data is in memory now. Unlink the shm segment — PARALLAX already exited.
+    unsafe { libc::shm_unlink(c_name.as_ptr()); }
 
     result
 }
@@ -159,19 +162,19 @@ unsafe fn parse_shm(base: *const u8) -> Option<DisplayData> {
 
             connectors.push(ConnectorData {
                 name,
-                connector_type: connector_type,
-                mm_width: mm_width,
-                mm_height: mm_height,
+                _connector_type: connector_type,
+                _mm_width: mm_width,
+                _mm_height: mm_height,
                 edid,
                 modes,
-                current_mode_index: cur_mode_idx,
+                _current_mode_index: cur_mode_idx,
                 current_width: cur_w,
                 current_height: cur_h,
                 current_refresh: cur_r,
             });
         }
 
-        Some(DisplayData { gpu, connectors, driver_choice, session_type })
+        Some(DisplayData { gpu, connectors, driver_choice, _session_type: session_type })
     }
 }
 

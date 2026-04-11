@@ -6,21 +6,24 @@ easyanticheat.dll, check if the corresponding .so bridge exists.
 If so, load as builtin (uses the Wine bridge). If not, or if this
 is the EAC launcher process, load as native.
 
-Ported from wine-valve (Proton).
+Ported from wine-valve (Proton). Reanchored for Wine 11.6:
+get_load_order's signature changed to take is_system_dir and pe_mapping,
+so the EAC bridge block is inserted right after the \??\ prefix strip
+and BEFORE the module buffer allocation.
 
 diff --git a/dlls/ntdll/unix/loadorder.c b/dlls/ntdll/unix/loadorder.c
-index 11c3ab9..d2f3c77 100644
+index 7605913..de3bd8b 100644
 --- a/dlls/ntdll/unix/loadorder.c
 +++ b/dlls/ntdll/unix/loadorder.c
-@@ -58,6 +58,7 @@ static HANDLE std_key;
+@@ -75,6 +75,7 @@ static HANDLE std_key;
  static HANDLE app_key;
  static BOOL init_done;
  static BOOL main_exe_loaded;
 +static BOOL eac_launcher_process;
  
- 
  /***************************************************************************
-@@ -362,10 +363,23 @@ static enum loadorder get_load_order_value( HANDLE std_key, HANDLE app_key, WCHA
+  *	get_version_entry
+@@ -465,10 +466,23 @@ static BOOL prefer_native_heuristics( const UNICODE_STRING *nt_name,
  void set_load_order_app_name( const WCHAR *app_name )
  {
      const WCHAR *p;
@@ -44,73 +47,71 @@ index 11c3ab9..d2f3c77 100644
  }
  
  
-@@ -378,10 +392,14 @@ void set_load_order_app_name( const WCHAR *app_name )
- enum loadorder get_load_order( const UNICODE_STRING *nt_name )
+@@ -482,6 +496,10 @@ enum loadorder get_load_order( const UNICODE_STRING *nt_name, BOOL is_system_dir
+                                const struct pe_mapping_info *pe_mapping )
  {
      static const WCHAR prefixW[] = {'\\','?','?','\\'};
 +    static const WCHAR easyanticheat_x86W[] = {'e','a','s','y','a','n','t','i','c','h','e','a','t','_','x','8','6','.','d','l','l',0};
 +    static const WCHAR easyanticheat_x64W[] = {'e','a','s','y','a','n','t','i','c','h','e','a','t','_','x','6','4','.','d','l','l',0};
-+    static const WCHAR easyanticheatW[] = {'e','a','s','y','a','n','t','i','c','h','e','a','t','.','d','l','l',0};
++    static const WCHAR easyanticheatW[]    = {'e','a','s','y','a','n','t','i','c','h','e','a','t','.','d','l','l',0};
 +    static const WCHAR soW[] = {'s','o',0};
      enum loadorder ret = LO_INVALID;
      const WCHAR *path = nt_name->Buffer;
-     unsigned int i, len = nt_name->Length / sizeof(WCHAR);
--    WCHAR *module, *basename;
-+    WCHAR *module, *basename, *eac_basename;
- 
-     if (!init_done) init_load_order();
- 
-@@ -391,6 +409,53 @@ enum loadorder get_load_order( const UNICODE_STRING *nt_name )
+     unsigned int len = nt_name->Length / sizeof(WCHAR);
+@@ -495,6 +513,56 @@ enum loadorder get_load_order( const UNICODE_STRING *nt_name, BOOL is_system_dir
          len -= 4;
      }
  
 +    /* EAC bridge: load as builtin if the .so bridge exists, native otherwise */
-+    eac_basename = get_basename( (WCHAR *)path );
-+    if (!wcsicmp(eac_basename, easyanticheat_x86W) || !wcsicmp(eac_basename, easyanticheat_x64W) || !wcsicmp(eac_basename, easyanticheatW))
 +    {
-+        UNICODE_STRING eac_unix_name, out_nt_name;
-+        OBJECT_ATTRIBUTES attr;
-+        char *unix_path = NULL;
-+        NTSTATUS status;
-+        int eac_len;
-+
-+        if (eac_launcher_process)
++        WCHAR *eac_basename = get_basename( (WCHAR *)path );
++        if (!wcsicmp(eac_basename, easyanticheat_x86W) || !wcsicmp(eac_basename, easyanticheat_x64W) || !wcsicmp(eac_basename, easyanticheatW))
 +        {
-+            ret = LO_NATIVE;
-+            TRACE("got hardcoded %s for %s, as this is the EAC launcher process\n", debugstr_loadorder(ret), debugstr_w(path) );
-+            return ret;
-+        }
++            UNICODE_STRING eac_unix_name, out_nt_name;
++            OBJECT_ATTRIBUTES attr;
++            char *unix_path = NULL;
++            NTSTATUS status;
++            int eac_len;
++            WCHAR *eac_bn;
 +
-+        eac_len = wcslen(nt_name->Buffer);
-+        eac_unix_name.Buffer = malloc( (eac_len + 5) * sizeof(WCHAR) );
-+        wcscpy(eac_unix_name.Buffer, nt_name->Buffer);
++            if (eac_launcher_process)
++            {
++                ret = LO_NATIVE;
++                TRACE("got hardcoded %s for %s, as this is the EAC launcher process\n", debugstr_loadorder(ret), debugstr_w(path) );
++                return ret;
++            }
 +
-+        basename = get_basename(eac_unix_name.Buffer);
-+        if (!wcsicmp(basename, easyanticheatW))
-+            wcscpy(basename, easyanticheat_x64W);
-+        wcscpy(&basename[18], soW);
-+        eac_unix_name.Length = eac_unix_name.MaximumLength = wcslen(eac_unix_name.Buffer) * sizeof(WCHAR);
-+        InitializeObjectAttributes(&attr, &eac_unix_name, 0, NULL, NULL);
++            eac_len = wcslen(nt_name->Buffer);
++            eac_unix_name.Buffer = malloc( (eac_len + 5) * sizeof(WCHAR) );
++            wcscpy(eac_unix_name.Buffer, nt_name->Buffer);
 +
-+        status = get_nt_and_unix_names( &attr, &out_nt_name, &unix_path, FILE_OPEN, FALSE );
-+        free( out_nt_name.Buffer );
-+        free( unix_path );
-+        if (!status)
-+        {
-+            free(eac_unix_name.Buffer);
-+            ret = LO_BUILTIN;
-+            TRACE( "got hardcoded %s for %s, as the eac unix library is present\n", debugstr_loadorder(ret), debugstr_w(path) );
-+            return ret;
-+        }
-+        else
-+        {
-+            ret = LO_NATIVE;
-+            TRACE( "got hardcoded %s for %s, as the eac unix library (%s) is not present. status %x\n", debugstr_loadorder(ret), debugstr_w(path), debugstr_w(eac_unix_name.Buffer), (int)status );
-+            free(eac_unix_name.Buffer);
-+            return ret;
++            eac_bn = get_basename(eac_unix_name.Buffer);
++            if (!wcsicmp(eac_bn, easyanticheatW))
++                wcscpy(eac_bn, easyanticheat_x64W);
++            wcscpy(&eac_bn[18], soW);
++            eac_unix_name.Length = eac_unix_name.MaximumLength = wcslen(eac_unix_name.Buffer) * sizeof(WCHAR);
++            InitializeObjectAttributes(&attr, &eac_unix_name, 0, NULL, NULL);
++
++            status = get_nt_and_unix_names( &attr, &out_nt_name, &unix_path, FILE_OPEN, FALSE );
++            free( out_nt_name.Buffer );
++            free( unix_path );
++            if (!status)
++            {
++                free(eac_unix_name.Buffer);
++                ret = LO_BUILTIN;
++                TRACE( "got hardcoded %s for %s, as the eac unix library is present\n", debugstr_loadorder(ret), debugstr_w(path) );
++                return ret;
++            }
++            else
++            {
++                ret = LO_NATIVE;
++                TRACE( "got hardcoded %s for %s, as the eac unix library (%s) is not present. status %x\n", debugstr_loadorder(ret), debugstr_w(path), debugstr_w(eac_unix_name.Buffer), (int)status );
++                free(eac_unix_name.Buffer);
++                return ret;
++            }
 +        }
 +    }
 +
-     /* Strip path information if the module resides in the system directory
-      */
-     if (len > wcslen(system_dir) - 4 && !wcsnicmp( system_dir + 4, path, wcslen(system_dir) - 4 ))
+     if (!(module = malloc( (len + 2) * sizeof(WCHAR) ))) return ret;
+     memcpy( module + 1, path, len * sizeof(WCHAR) );  /* reserve module[0] for the wildcard char */
+     module[len + 1] = 0;

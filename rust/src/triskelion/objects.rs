@@ -45,11 +45,21 @@ impl HandleEntry {
 
 // Per-mapping metadata (memfd or dup'd file fd, size, flags)
 pub struct MappingInfo {
-    pub _fd: RawFd,
+    pub fd: RawFd,
     pub size: u64,
     pub flags: u32,    // SEC_* flags
     pub pe_image_info: Option<Vec<u8>>,  // Serialized pe_image_info for SEC_IMAGE
     pub nt_name: Option<Vec<u8>>,        // UTF-16LE encoded NT path (for find_builtin_dll)
+    pub shared_fd: Option<RawFd>,        // backing fd for shared writable PE sections
+}
+
+impl Drop for MappingInfo {
+    fn drop(&mut self) {
+        if self.fd >= 0 { unsafe { libc::close(self.fd); } }
+        if let Some(sfd) = self.shared_fd {
+            if sfd >= 0 { unsafe { libc::close(sfd); } }
+        }
+    }
 }
 
 // Named object entry (e.g. USD section)
@@ -120,11 +130,12 @@ pub struct Job {
 // The message queue lives in shared memory (ShmManager), not here.
 pub struct Thread {
     pub pid: process_id_t,
+    pub suspend_count: i32,
 }
 
 impl Thread {
     pub fn new(pid: process_id_t) -> Self {
-        Self { pid }
+        Self { pid, suspend_count: 0 }
     }
 }
 
@@ -136,6 +147,7 @@ impl Thread {
 
 pub struct HandleTable {
     slab: crate::slab::HeapSlab<HandleEntry>,
+    fd_refcounts: FxHashMap<RawFd, u32>,
 }
 
 impl HandleTable {
@@ -144,7 +156,7 @@ impl HandleTable {
         // Skip index 0 so handle values start at 0x4 (index 1 << 2).
         // Handle 0 is invalid in Wine's protocol.
         slab.skip_index_zero();
-        Self { slab }
+        Self { slab, fd_refcounts: FxHashMap::default() }
     }
 
     pub fn allocate(&mut self, object_id: object_id_t) -> obj_handle_t {
@@ -155,6 +167,9 @@ impl HandleTable {
     }
 
     pub fn allocate_full(&mut self, entry: HandleEntry) -> obj_handle_t {
+        if let Some(fd) = entry.fd {
+            *self.fd_refcounts.entry(fd).or_insert(0) += 1;
+        }
         let (idx, _gen) = self.slab.insert_bump(entry);
         idx << 2
     }
@@ -163,7 +178,21 @@ impl HandleTable {
         let idx = handle >> 2;
         let entry = self.slab.remove_unchecked(idx)?;
         if let Some(fd) = entry.fd {
-            unsafe { libc::close(fd); }
+            let close_fd = match self.fd_refcounts.get_mut(&fd) {
+                Some(count) => {
+                    *count -= 1;
+                    if *count == 0 { self.fd_refcounts.remove(&fd); true } else { false }
+                }
+                None => {
+                    // Not tracked — entry was created through a path that
+                    // bypassed allocate_full. Scan remaining entries before
+                    // closing to avoid invalidating shared mappings.
+                    !self.slab.iter().any(|e| e.fd == Some(fd))
+                }
+            };
+            if close_fd {
+                unsafe { libc::close(fd); }
+            }
         }
         Some(entry)
     }
@@ -182,11 +211,25 @@ impl HandleTable {
 
     pub fn insert_at(&mut self, handle: obj_handle_t, entry: HandleEntry) {
         let idx = handle >> 2;
-        // Close existing fd if overwriting
+        // Decrement refcount for old fd if overwriting an occupied slot
         if let Some(old) = self.slab.get_unchecked(idx) {
             if let Some(fd) = old.fd {
-                unsafe { libc::close(fd); }
+                match self.fd_refcounts.get_mut(&fd) {
+                    Some(count) => {
+                        *count -= 1;
+                        if *count == 0 { self.fd_refcounts.remove(&fd); unsafe { libc::close(fd); } }
+                    }
+                    None => {
+                        if !self.slab.iter().any(|e| e.fd == Some(fd)) {
+                            unsafe { libc::close(fd); }
+                        }
+                    }
+                }
             }
+        }
+        // Track new entry's fd
+        if let Some(fd) = entry.fd {
+            *self.fd_refcounts.entry(fd).or_insert(0) += 1;
         }
         self.slab.insert_at(idx, entry);
     }

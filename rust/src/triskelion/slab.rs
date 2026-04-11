@@ -91,16 +91,6 @@ impl<T> HeapSlab<T> {
         g
     }
 
-    #[allow(dead_code)]
-    pub fn remove(&mut self, index: u32, expected_gen: u32) -> Option<T> {
-        let slot = self.slots.get_mut(index as usize)?;
-        match slot {
-            HeapSlot::Occupied { generation, .. } if *generation == expected_gen => {}
-            _ => return None,
-        }
-        self.remove_inner(index)
-    }
-
     pub fn remove_unchecked(&mut self, index: u32) -> Option<T> {
         if (index as usize) >= self.slots.len() { return None; }
         match &self.slots[index as usize] {
@@ -129,28 +119,10 @@ impl<T> HeapSlab<T> {
     }
 
     #[inline]
-    #[allow(dead_code)]
-    pub fn get(&self, index: u32, expected_gen: u32) -> Option<&T> {
-        match self.slots.get(index as usize)? {
-            HeapSlot::Occupied { generation, value } if *generation == expected_gen => Some(value),
-            _ => None,
-        }
-    }
-
-    #[inline]
     pub fn get_unchecked(&self, index: u32) -> Option<&T> {
         match self.slots.get(index as usize)? {
             HeapSlot::Occupied { value, .. } => Some(value),
             HeapSlot::Vacant { .. } => None,
-        }
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    pub fn get_mut(&mut self, index: u32, expected_gen: u32) -> Option<&mut T> {
-        match self.slots.get_mut(index as usize)? {
-            HeapSlot::Occupied { generation, value } if *generation == expected_gen => Some(value),
-            _ => None,
         }
     }
 
@@ -163,11 +135,14 @@ impl<T> HeapSlab<T> {
     }
 
     #[inline]
-    #[allow(dead_code)]
-    pub fn len(&self) -> u32 { self.len }
-
-    #[inline]
     pub fn capacity(&self) -> usize { self.slots.len() }
+
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.slots.iter().filter_map(|slot| match slot {
+            HeapSlot::Occupied { value, .. } => Some(value),
+            HeapSlot::Vacant { .. } => None,
+        })
+    }
 }
 
 
@@ -226,16 +201,6 @@ impl MmapSlab {
         self.len -= 1;
         true
     }
-
-    #[inline]
-    #[allow(dead_code)]
-    pub fn is_occupied(&self, index: u32) -> bool {
-        self.meta.get(index as usize).map(|m| m.next_free == FREE_END).unwrap_or(false)
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    pub fn len(&self) -> u32 { self.len }
 
     #[inline]
     pub fn high_water(&self) -> u32 { self.bump }

@@ -1,0 +1,43 @@
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index fc129df..c315437 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -107,9 +107,11 @@ static BOOL is_valid_entry_uniq( HANDLE handle, unsigned short type, UINT64 uniq
+ 
+ static BOOL is_valid_entry( HANDLE handle, unsigned short type )
+ {
+-    const volatile struct user_entry *entries = shared_session->user_entries;
++    const volatile struct user_entry *entries;
+     WORD index = USER_HANDLE_TO_INDEX( handle );
+     if (index >= MAX_USER_HANDLES) return FALSE;
++    if (!shared_session) return FALSE;
++    entries = shared_session->user_entries;
+     return is_valid_entry_uniq( handle, type, ReadAcquire64( (LONG64 *)&entries[index].uniq ) );
+ }
+ 
+@@ -128,10 +130,11 @@ static BOOL read_acquire_user_entry( HANDLE handle, unsigned short type, const v
+ 
+ static BOOL get_user_entry( HANDLE handle, unsigned short type, struct user_entry *entry, HANDLE *full )
+ {
+-    const volatile struct user_entry *entries = shared_session->user_entries;
++    const volatile struct user_entry *entries;
+     WORD index = USER_HANDLE_TO_INDEX( handle );
+-
+     if (index >= MAX_USER_HANDLES) return FALSE;
++    if (!shared_session) return FALSE;
++    entries = shared_session->user_entries;
+     if (!read_acquire_user_entry( handle, type, entries + index, entry )) return FALSE;
+     *full = USER_HANDLE_FROM_INDEX( index, entry->generation );
+     return TRUE;
+@@ -139,8 +142,10 @@ static BOOL get_user_entry( HANDLE handle, unsigned short type, struct user_entr
+ 
+ static BOOL get_user_entry_at( WORD index, unsigned short type, struct user_entry *entry, HANDLE *full )
+ {
+-    const volatile struct user_entry *entries = shared_session->user_entries;
++    const volatile struct user_entry *entries;
+     if (index >= MAX_USER_HANDLES) return FALSE;
++    if (!shared_session) return FALSE;
++    entries = shared_session->user_entries;
+     if (!read_acquire_user_entry( 0, type, entries + index, entry )) return FALSE;
+     *full = USER_HANDLE_FROM_INDEX( index, entry->generation );
+     return TRUE;

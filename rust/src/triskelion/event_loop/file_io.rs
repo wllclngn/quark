@@ -63,7 +63,7 @@ impl EventLoop {
     /// Returns an auto-reset event handle that can be signaled on successful read/write.
     /// Cached per (pid, pipe_handle) so it's reused across operations on the same pipe.
     pub(super) fn get_pipe_wait_handle(&mut self, pid: u32, pipe_handle: u32) -> u32 {
-        if let Some(&wh) = self.pipe_io_wait_handles.get(&(pid, pipe_handle)) {
+        if let Some(&wh) = self.side_tables.io_wait_handles.get(&(pid, pipe_handle)) {
             return wh;
         }
         if let Some(evt) = self.get_or_create_event(false, false) {
@@ -75,7 +75,7 @@ impl EventLoop {
                 let h = process.handles.allocate_full(entry);
                 if h != 0 {
                     self.insert_recyclable_event(pid, h, evt, 1); // INTERNAL
-                    self.pipe_io_wait_handles.insert((pid, pipe_handle), h);
+                    self.side_tables.io_wait_handles.insert((pid, pipe_handle), h);
                     return h;
                 }
             }
@@ -158,6 +158,86 @@ fn fd_to_nt_name(fd: RawFd) -> Option<Vec<u8>> {
 }
 
 
+// Create a memfd backing shared writable PE sections.
+// Stock wineserver (mapping.c:635-695) does this so ntdll can mmap shared sections
+// from a server-provided fd. Without it, PE images with IMAGE_SCN_MEM_SHARED fail.
+fn create_shared_section_fd(pe_fd: RawFd) -> Option<RawFd> {
+    let mut buf = [0u8; 4096];
+    let n = unsafe { libc::pread(pe_fd, buf.as_mut_ptr() as *mut _, buf.len(), 0) };
+    if n < 64 { return None; }
+    let n = n as usize;
+
+    if &buf[0..2] != b"MZ" { return None; }
+    let e_lfanew = u32::from_le_bytes([buf[0x3C], buf[0x3D], buf[0x3E], buf[0x3F]]) as usize;
+    if e_lfanew + 24 > n { return None; }
+    if &buf[e_lfanew..e_lfanew+4] != b"PE\0\0" { return None; }
+
+    let num_sections = u16::from_le_bytes([buf[e_lfanew+6], buf[e_lfanew+7]]) as usize;
+    let opt_size = u16::from_le_bytes([buf[e_lfanew+20], buf[e_lfanew+21]]) as usize;
+    let opt = e_lfanew + 24;
+    let magic = u16::from_le_bytes([buf[opt], buf[opt+1]]);
+    let section_align = if magic == 0x20b {
+        u32::from_le_bytes([buf[opt+32], buf[opt+33], buf[opt+34], buf[opt+35]])
+    } else {
+        u32::from_le_bytes([buf[opt+32], buf[opt+33], buf[opt+34], buf[opt+35]])
+    };
+    let align_mask = if section_align > 0 { section_align - 1 } else { 0 };
+
+    let sec_start = opt + opt_size;
+    const IMAGE_SCN_MEM_SHARED: u32 = 0x10000000;
+    const IMAGE_SCN_MEM_WRITE: u32 = 0x80000000;
+
+    // First pass: compute total size of shared writable sections
+    let mut total_size: u64 = 0;
+    let mut shared_sections: Vec<(u64, u32, u32)> = Vec::new(); // (map_offset, raw_ptr, raw_size)
+    for i in 0..num_sections {
+        let off = sec_start + i * 40;
+        if off + 40 > n { break; }
+        let vsize = u32::from_le_bytes([buf[off+8], buf[off+9], buf[off+10], buf[off+11]]);
+        let raw_size = u32::from_le_bytes([buf[off+16], buf[off+17], buf[off+18], buf[off+19]]);
+        let raw_ptr = u32::from_le_bytes([buf[off+20], buf[off+21], buf[off+22], buf[off+23]]);
+        let chars = u32::from_le_bytes([buf[off+36], buf[off+37], buf[off+38], buf[off+39]]);
+        if (chars & IMAGE_SCN_MEM_SHARED != 0) && (chars & IMAGE_SCN_MEM_WRITE != 0) {
+            let map_size = ((vsize as u64) + align_mask as u64) & !(align_mask as u64);
+            let file_size = raw_size.min(map_size as u32);
+            shared_sections.push((total_size, raw_ptr, file_size));
+            total_size += map_size;
+        }
+    }
+    if total_size == 0 { return None; }
+
+    // Create memfd and copy section data
+    let memfd = unsafe {
+        libc::memfd_create(b"wine_shared\0".as_ptr() as *const libc::c_char, 0)
+    };
+    if memfd < 0 { return None; }
+    unsafe { libc::ftruncate(memfd, total_size as libc::off_t); }
+
+    let mut copy_buf = vec![0u8; 65536];
+    for &(write_offset, raw_ptr, file_size) in &shared_sections {
+        if raw_ptr == 0 || file_size == 0 { continue; }
+        let mut remaining = file_size as usize;
+        let mut read_pos = raw_ptr as i64;
+        let mut write_pos = write_offset as i64;
+        while remaining > 0 {
+            let chunk = remaining.min(copy_buf.len());
+            let rd = unsafe {
+                libc::pread(pe_fd, copy_buf.as_mut_ptr() as *mut _, chunk, read_pos)
+            };
+            if rd <= 0 { break; }
+            let rd = rd as usize;
+            unsafe {
+                libc::pwrite(memfd, copy_buf.as_ptr() as *const _, rd, write_pos);
+            }
+            remaining -= rd;
+            read_pos += rd as i64;
+            write_pos += rd as i64;
+        }
+    }
+
+    Some(memfd)
+}
+
 // Read PE headers from an fd and build PeImageInfo. Returns None on failure.
 fn read_pe_image_info(fd: RawFd) -> Option<(PeImageInfo, u64)> {
     let mut buf = [0u8; 4096];
@@ -223,6 +303,52 @@ fn read_pe_image_info(fd: RawFd) -> Option<(PeImageInfo, u64)> {
          u16::from_le_bytes([buf[opt+50], buf[opt+51]]))
     };
 
+    // Check for CLR/.NET COM descriptor directory (index 14).
+    // Stock Wine reads the CLR header to set loader_flags and image_flags
+    // for ComPlusILOnly/ComPlusNativeReady (mapping.c:1007,1052-1060).
+    // ntdll uses these to route through mscoree.dll instead of native entry.
+    let num_data_dirs = if is_pe32plus { r(108) } else { r(92) } as usize;
+    let data_dir_base = if is_pe32plus { 112 } else { 96 };
+    const IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR: usize = 14;
+    let (has_clr, clr_flags) = if IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR < num_data_dirs {
+        let dd_off = data_dir_base + IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR * 8;
+        if opt + dd_off + 8 <= n {
+            let clr_va = r(dd_off);
+            let clr_sz = r(dd_off + 4);
+            if clr_va != 0 && clr_sz != 0 {
+                // Read CLR header from file. Resolve VA to file offset via section table.
+                let num_sections = u16::from_le_bytes([buf[coff+2], buf[coff+3]]) as usize;
+                let sec_table = opt + opt_size;
+                let mut clr_file_off = 0u32;
+                for s in 0..num_sections {
+                    let sh = sec_table + s * 40;
+                    if sh + 40 > n { break; }
+                    let sec_va = u32::from_le_bytes([buf[sh+12], buf[sh+13], buf[sh+14], buf[sh+15]]);
+                    let sec_raw_sz = u32::from_le_bytes([buf[sh+16], buf[sh+17], buf[sh+18], buf[sh+19]]);
+                    let sec_raw_ptr = u32::from_le_bytes([buf[sh+20], buf[sh+21], buf[sh+22], buf[sh+23]]);
+                    if clr_va >= sec_va && clr_va < sec_va + sec_raw_sz {
+                        clr_file_off = sec_raw_ptr + (clr_va - sec_va);
+                        break;
+                    }
+                }
+                // Read COR20 header Flags field (offset 16 in IMAGE_COR20_HEADER)
+                if clr_file_off > 0 {
+                    let mut clr_buf = [0u8; 72];
+                    let clr_n = unsafe { libc::pread(fd, clr_buf.as_mut_ptr() as *mut _, 72, clr_file_off as i64) };
+                    if clr_n >= 20 {
+                        let flags = u32::from_le_bytes([clr_buf[16], clr_buf[17], clr_buf[18], clr_buf[19]]);
+                        (true, flags)
+                    } else { (true, 0) }
+                } else { (true, 0) }
+            } else { (false, 0) }
+        } else { (false, 0) }
+    } else { (false, 0) };
+    // COMIMAGE_FLAGS_ILONLY = 0x01, COMIMAGE_FLAGS_32BITREQUIRED = 0x02,
+    // COMIMAGE_FLAGS_32BITPREFERRED = 0x20000
+    let clr_il_only = has_clr && (clr_flags & 0x01) != 0;
+    let clr_native_ready = clr_il_only && (clr_flags & 0x02) == 0; // IL-only AND NOT 32bit-required
+    let clr_prefer32 = has_clr && (clr_flags & 0x20000) != 0;
+
     // File size from fstat
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     let file_size = if unsafe { libc::fstat(fd, &mut st) } == 0 { st.st_size as u32 } else { 0 };
@@ -231,13 +357,20 @@ fn read_pe_image_info(fd: RawFd) -> Option<(PeImageInfo, u64)> {
 
     // Wine builtin detection: "Wine builtin DLL" at DOS header offset 0x40
     let wine_builtin = if n > 0x50 && &buf[0x40..0x44] == b"Wine" { 1u8 } else { 0u8 };
-    log_info!("PE: machine={machine:#x} wine_builtin={wine_builtin} bytes_0x40=[{:02x} {:02x} {:02x} {:02x}] entry=0x{entry_point:x} size={file_size}",
-        buf[0x40], buf[0x41], buf[0x42], buf[0x43]);
+    log_info!("PE: machine={machine:#x} wine_builtin={wine_builtin} has_clr={has_clr} clr_il_only={clr_il_only} entry=0x{entry_point:x} size={file_size} charact={charact:#x}");
     // Wine fakedll detection: "Wine placeholder DLL" at offset 0x40
     let wine_fakedll = if n > 0x54 && &buf[0x40..0x50] == b"Wine placehold" { 1u8 } else { 0u8 };
 
     // image_flags_byte: bit 0 = contains_code, bit 1 = wine_builtin, bit 2 = wine_fakedll, bit 3 = is_hybrid
     let flags_byte = contains_code | (wine_builtin << 1) | (wine_fakedll << 2);
+
+    // image_flags: ComPlus bits from CLR header (stock: mapping.c:1052-1060)
+    // IMAGE_FLAGS_ComPlusNativeReady=0x01, IMAGE_FLAGS_ComPlusILOnly=0x02,
+    // IMAGE_FLAGS_ComPlusPrefer32bit=0x20
+    let mut image_flags: u8 = 0;
+    if clr_native_ready { image_flags |= 0x01; }
+    if clr_il_only { image_flags |= 0x02; }
+    if clr_prefer32 { image_flags |= 0x20; }
 
     // Round header_size up to section alignment for header_map_size
     let header_map_size = if section_align > 0 {
@@ -264,8 +397,8 @@ fn read_pe_image_info(fd: RawFd) -> Option<(PeImageInfo, u64)> {
         dll_charact,
         machine,
         image_flags_byte: flags_byte, // bit 0 = contains_code, bit 1 = wine_builtin, bit 2 = wine_fakedll
-        image_flags: 0,
-        loader_flags: 0,
+        image_flags,
+        loader_flags: if has_clr { 1 } else { 0 },
         header_size,
         header_map_size,                // Wine 11.4: aligned header size for mapping
         file_size,
@@ -354,7 +487,7 @@ impl EventLoop {
                     object_id: oid, fd: usd_fd,
                 });
                 self.state.mappings.insert(oid, crate::objects::MappingInfo {
-                    _fd: usd_fd, size: 0x1000, flags: 0x800000, pe_image_info: None, nt_name: None, // SEC_COMMIT
+                    fd: usd_fd, size: 0x1000, flags: 0x800000, pe_image_info: None, nt_name: None, shared_fd: None, // SEC_COMMIT
                 });
 
                 let pid = self.clients.get(&(client_fd as RawFd))
@@ -618,15 +751,50 @@ impl EventLoop {
             None
         };
 
+        // For SEC_IMAGE with shared writable sections, create a backing memfd.
+        let shared_fd = if mapping_flags & SEC_IMAGE != 0 {
+            create_shared_section_fd(mapping_fd)
+        } else {
+            None
+        };
 
         // Store mapping info
         self.state.mappings.insert(oid, crate::objects::MappingInfo {
-            _fd: mapping_fd,
+            fd: mapping_fd,
             size: mapping_size,
             flags: mapping_flags,
             pe_image_info: pe_info_bytes,
             nt_name,
+            shared_fd,
         });
+
+        // Register as named object so open_mapping can find sections by name.
+        // Object attributes vararg: rootdir(u32) + attributes(u32) + sd_len(u32) + name_len(u32) + sd + name(UTF-16LE)
+        let vararg = if buf.len() > VARARG_OFF { &buf[VARARG_OFF..] } else { &[] as &[u8] };
+        if vararg.len() >= 16 {
+            let sd_len = u32::from_le_bytes(vararg[8..12].try_into().unwrap_or([0;4])) as usize;
+            let name_len = u32::from_le_bytes(vararg[12..16].try_into().unwrap_or([0;4])) as usize;
+            if name_len > 0 {
+                let name_off = 16 + sd_len;
+                if name_off + name_len <= vararg.len() {
+                    let name_bytes = &vararg[name_off..name_off + name_len];
+                    let name: String = name_bytes.chunks_exact(2)
+                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .collect::<Vec<u16>>()
+                        .iter()
+                        .map(|&c| char::from_u32(c as u32).unwrap_or('\0'))
+                        .collect();
+                    let name_lower = name.to_lowercase();
+                    let short = name_lower.rsplit('\\').next().unwrap_or(&name_lower).to_string();
+                    let dup_fd = unsafe { libc::dup(mapping_fd) };
+                    if dup_fd >= 0 {
+                        self.state.named_objects.insert(short, crate::objects::NamedObjectEntry {
+                            object_id: oid, fd: dup_fd,
+                        });
+                    }
+                }
+            }
+        }
 
         let handle_fd = unsafe { libc::dup(mapping_fd) };
         // Use file_access (not section access) for the handle entry.
@@ -674,15 +842,62 @@ impl EventLoop {
 
         let max_vararg = max_reply_vararg(buf);
 
-        if let Some(mapping) = oid.and_then(|id| self.state.mappings.get(&id)) {
-            // For SEC_IMAGE, return pe_image_info + nt_name as VARARG
-            // Layout: [pe_image_info bytes][nt_name UTF-16LE bytes]
-            if let Some(ref pe_info) = mapping.pe_image_info {
-                let name_bytes = mapping.nt_name.as_deref().unwrap_or(&[]);
+        // Extract mapping data (immutable borrow of self.state.mappings)
+        let mapping_data = oid.and_then(|id| self.state.mappings.get(&id)).map(|mapping| {
+            let pe_info = mapping.pe_image_info.clone();
+            let name = mapping.nt_name.clone();
+            let size = mapping.size;
+            let flags = mapping.flags;
+            let sfd = mapping.shared_fd;
+            (pe_info, name, size, flags, sfd)
+        });
+
+        if let Some((pe_info, nt_name, size, flags, shared_fd_opt)) = mapping_data {
+            // DIAG: dump every get_mapping_info call so we can correlate triskelion's
+            // reply with Wine's file lookup behavior. Decodes the NT name as a UTF-16LE
+            // suffix (best effort) so file paths are readable in the log.
+            let name_preview: String = nt_name.as_deref()
+                .map(|b| {
+                    let chars: Vec<u16> = b.chunks_exact(2)
+                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .collect();
+                    String::from_utf16_lossy(&chars)
+                })
+                .unwrap_or_else(|| "<no name>".into());
+            log_info!(
+                "get_mapping_info: handle={:#x} size={size:#x} flags={flags:#x} pe_info={} name_len={} name=\"{}\"",
+                req.handle,
+                pe_info.as_ref().map(|p| p.len()).unwrap_or(0),
+                nt_name.as_deref().map(|n| n.len()).unwrap_or(0),
+                if name_preview.len() > 80 { &name_preview[name_preview.len()-80..] } else { &name_preview }
+            );
+
+            // Allocate handle for shared file if present.
+            // The client calls server_get_unix_fd(shared_file) separately — that
+            // goes through get_handle_fd which sends the fd via pending_fd at the
+            // right time. We just allocate the handle with the fd attached.
+            let shared_file = if let Some(sfd) = shared_fd_opt {
+                // Use F_DUPFD_CLOEXEC with min=256 to avoid fd collisions with
+                // inherited handle fds that live in the low range.
+                let dup = unsafe { libc::fcntl(sfd, libc::F_DUPFD_CLOEXEC, 256) };
+                if dup >= 0 {
+                    let h = if let Some(process) = pid.and_then(|p| self.state.processes.get_mut(&p)) {
+                        process.handles.allocate_full(
+                            crate::objects::HandleEntry::with_fd(0, dup, crate::objects::FD_TYPE_FILE,
+                                0x12019F /* FILE_GENERIC_READ|FILE_GENERIC_WRITE */, 0)
+                        )
+                    } else { 0 };
+                    if h == 0 { unsafe { libc::close(dup); } }
+                    log_info!("get_mapping_info: shared_file handle={h:#x} dup_fd={dup} canonical_sfd={sfd} pid={pid:?}");
+                    h
+                } else { 0 }
+            } else { 0 };
+
+            if let Some(ref pe_info) = pe_info {
+                let name_bytes = nt_name.as_deref().unwrap_or(&[]);
                 let total_needed = pe_info.len() + name_bytes.len();
                 let total_available = total_needed.min(max_vararg as usize);
 
-                // Build combined vararg buffer
                 let mut vararg = Vec::with_capacity(total_available);
                 let pe_len = pe_info.len().min(total_available);
                 vararg.extend_from_slice(&pe_info[..pe_len]);
@@ -696,26 +911,36 @@ impl EventLoop {
 
                 let reply = GetMappingInfoReply {
                     header: ReplyHeader { error: 0, reply_size: vararg.len() as u32 },
-                    size: mapping.size,
-                    flags: mapping.flags,
-                    shared_file: 0,
+                    size,
+                    flags,
+                    shared_file,
                     name_len: name_len as u32,
+                    ver_len: 0, // no version resource shipped
                     total: total_needed as u32,
+                    _pad_0: [0; 4],
                 };
+                log_info!(
+                    "  reply: vararg={} pe={} name={} total={} max_avail={} shared_file={:#x}",
+                    vararg.len(), pe_len, name_len, total_needed, max_vararg, shared_file
+                );
                 return reply_vararg(&reply, &vararg);
             }
             let reply = GetMappingInfoReply {
                 header: ReplyHeader { error: 0, reply_size: 0 },
-                size: mapping.size,
-                flags: mapping.flags,
-                shared_file: 0,
+                size,
+                flags,
+                shared_file,
                 name_len: 0,
+                ver_len: 0,
                 total: 0,
+                _pad_0: [0; 4],
             };
             return reply_fixed(&reply);
         }
 
-        // Fallback: return empty mapping info (size from fstat if possible)
+        // Fallback: return empty mapping info (size from fstat if possible).
+        // This path means the handle has no MappingInfo registered — Wine
+        // is asking about something we never went through create_mapping for.
         let fd = pid.and_then(|p| self.state.processes.get(&p))
             .and_then(|p| p.handles.get(req.handle))
             .and_then(|e| e.fd);
@@ -724,13 +949,19 @@ impl EventLoop {
             let mut st: libc::stat = unsafe { std::mem::zeroed() };
             let ret = unsafe { libc::fstat(fd, &mut st) };
             let size = if ret == 0 { st.st_size as u64 } else { 0x1000 };
+            log_info!(
+                "get_mapping_info: handle={:#x} FALLBACK (no MappingInfo) fd={fd} size={size:#x}",
+                req.handle
+            );
             let reply = GetMappingInfoReply {
                 header: ReplyHeader { error: 0, reply_size: 0 },
                 size,
                 flags: 0x800000, // SEC_COMMIT
                 shared_file: 0,
                 name_len: 0,
+                ver_len: 0,
                 total: 0,
+                _pad_0: [0; 4],
             };
             return reply_fixed(&reply);
         }
@@ -829,6 +1060,31 @@ impl EventLoop {
             header: ReplyHeader { error: 0, reply_size: 0 },
         };
         reply_fixed(&reply)
+    }
+
+
+    pub(crate) fn handle_get_mapping_committed_range(&mut self, _client_fd: i32, buf: &[u8]) -> Reply {
+        let req = if buf.len() >= std::mem::size_of::<GetMappingCommittedRangeRequest>() {
+            unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const GetMappingCommittedRangeRequest) }
+        } else {
+            return reply_fixed(&ReplyHeader { error: 0xC000000D, reply_size: 0 });
+        };
+        // Return "everything is committed" from the requested offset.
+        // Stock Wine tracks per-page commit state for SEC_RESERVE mappings,
+        // but game images (SEC_IMAGE, SEC_COMMIT) are always fully committed.
+        // Mono's GC depends on this to know which pages are safe to access.
+        reply_fixed(&GetMappingCommittedRangeReply {
+            header: ReplyHeader { error: 0, reply_size: 0 },
+            size: 0x7FFF_FFFF_FFFF_u64.saturating_sub(req.offset), // rest of address space
+            committed: 1,
+            _pad_0: [0; 4],
+        })
+    }
+
+    pub(crate) fn handle_add_mapping_committed_range(&mut self, _client_fd: i32, _buf: &[u8]) -> Reply {
+        // Client tells us pages were committed. We don't track per-page state,
+        // so just ack. get_mapping_committed_range returns "all committed" anyway.
+        reply_fixed(&ReplyHeader { error: 0, reply_size: 0 })
     }
 
 
@@ -1256,4 +1512,5 @@ impl EventLoop {
     pub(crate) fn handle_is_same_mapping(&mut self, _client_fd: i32, _buf: &[u8]) -> Reply {
         reply_fixed(&ReplyHeader { error: 0, reply_size: 0 })
     }
+
 }

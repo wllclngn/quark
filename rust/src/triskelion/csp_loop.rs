@@ -14,7 +14,6 @@
 //     - drain request channel
 //     - dispatch each request via ev.dispatch()
 //     - push replies + effects back via reply channel
-//     - drain ntsync completions from rtrb ring buffer
 //     - run housekeeping ticks
 //     - NEVER touches a file descriptor. NEVER blocks on I/O.
 //
@@ -88,7 +87,7 @@ enum Effect {
     WatchQueueFd {
         queue_fd: RawFd,
         shm_ptr: usize,   // pointer to queue shared_object_t base
-        queue_handle: u32,
+        _queue_handle: u32,
         ntsync_event_fd: RawFd, // dup'd ntsync event fd to signal
     },
     // Re-arm polling on a queue fd after set_queue_mask(poll_events=1).
@@ -166,10 +165,18 @@ fn authority_main(
     let mut tick_count: u64 = 0;
     // Track which client fds the I/O thread already knows about
     let mut known_io_fds = rustc_hash::FxHashSet::default();
+    // Throttle housekeeping to TICK_MS intervals — without this, every request
+    // burst causes check_win_timers to fire instantly, which restarts WM_TIMER
+    // timers with their minimum rate (10ms) AFTER the just-completed iteration,
+    // and the next housekeeping pass picks them up immediately. Result: ~30k
+    // req/sec spin on get_message + WM_TIMER. Stock wineserver runs housekeeping
+    // off poll() timeouts, not every request.
+    let mut last_housekeep = Instant::now();
+    let housekeep_interval = std::time::Duration::from_millis(TICK_MS as u64);
 
     loop {
         // Block waiting for a request (with timeout for housekeeping)
-        match req_rx.recv_timeout(std::time::Duration::from_millis(TICK_MS as u64)) {
+        match req_rx.recv_timeout(housekeep_interval) {
             Ok(msg) => {
                 process_request(ev, msg, &reply_tx, wake_write, &wake_byte, &mut known_io_fds);
 
@@ -186,7 +193,13 @@ fn authority_main(
             }
         }
 
-        // Housekeeping
+        // Housekeeping — only run on TICK_MS interval, not every request iteration
+        let now = Instant::now();
+        if now.duration_since(last_housekeep) < housekeep_interval {
+            continue;
+        }
+        last_housekeep = now;
+
         tick_count += 1;
         ev.idle_ticks = tick_count;
         ev.check_pending_waits();
@@ -249,8 +262,9 @@ fn process_request(
         // Check linger
         if ev.clients.is_empty() {
             if ev.linger_deadline.is_none() && ev.total_requests > 0 {
-                ev.linger_deadline = Some(Instant::now() + std::time::Duration::from_secs(5));
-                log_info!("disconnect: linger started (5s deadline)");
+                let linger_secs = ev.linger_secs;
+                ev.linger_deadline = Some(Instant::now() + std::time::Duration::from_secs(linger_secs));
+                log_info!("disconnect: linger started ({linger_secs}s deadline)");
             }
         } else {
             ev.linger_deadline = None;
@@ -320,7 +334,7 @@ fn process_request(
 
     // Drain pending queue fd watch/rearm requests
     for (queue_fd, shm_ptr, queue_handle, ntsync_event_fd) in ev.pending_queue_fd_watches.drain(..) {
-        effects.push(Effect::WatchQueueFd { queue_fd, shm_ptr, queue_handle, ntsync_event_fd });
+        effects.push(Effect::WatchQueueFd { queue_fd, shm_ptr, _queue_handle: queue_handle, ntsync_event_fd });
     }
     for queue_fd in ev.pending_queue_fd_rearms.drain(..) {
         effects.push(Effect::RearmQueueFd { queue_fd });
@@ -798,7 +812,7 @@ fn execute_reply(
                     }
                 }
             }
-            Effect::WatchQueueFd { queue_fd, shm_ptr, queue_handle: _, ntsync_event_fd } => {
+            Effect::WatchQueueFd { queue_fd, shm_ptr, _queue_handle: _, ntsync_event_fd } => {
                 if !queue_fd_watchers.contains_key(&queue_fd) {
                     let mut ev = libc::epoll_event {
                         events: libc::EPOLLIN as u32 | libc::EPOLLONESHOT as u32,

@@ -23,6 +23,10 @@ impl EventLoop {
         };
         let (hkey, created) = self.registry.create_key(parent, name);
 
+        if created && parent != 0 {
+            self.fire_registry_notifications(parent, 0x01); // REG_NOTIFY_CHANGE_NAME
+        }
+
         // Stock wineserver returns STATUS_OBJECT_NAME_EXISTS (0x40000000) when
         // the key already existed. Wine's ntdll uses this to distinguish
         // REG_CREATED_NEW_KEY vs REG_OPENED_EXISTING_KEY in NtCreateKey.
@@ -45,9 +49,10 @@ impl EventLoop {
 
         let vararg = &buf[VARARG_OFF..];
         // open_key VARARG is just unicode_str (no objattr wrapper)
-        let _name_str = crate::registry::utf16le_to_string_pub(vararg);
+        let name_str = crate::registry::utf16le_to_string_pub(vararg);
         if let Some(hkey) = self.registry.open_key(req.parent, vararg) {
-            let _path = self.registry.get_handle_path(hkey).unwrap_or_else(|| "<unknown>".to_string());
+            let path = self.registry.get_handle_path(hkey).unwrap_or_else(|| "<unknown>".to_string());
+            log_info!("open_key: '{name_str}' -> {path} (hkey={hkey})");
             let reply = OpenKeyReply {
                 header: ReplyHeader { error: 0, reply_size: 0 },
                 hkey,
@@ -55,6 +60,7 @@ impl EventLoop {
             };
             reply_fixed(&reply)
         } else {
+            log_info!("open_key: '{name_str}' NOT FOUND (parent={:#x})", req.parent);
             reply_fixed(&ReplyHeader { error: 0xC0000034, reply_size: 0 }) // STATUS_OBJECT_NAME_NOT_FOUND
         }
     }
@@ -102,9 +108,11 @@ impl EventLoop {
         if vararg.len() >= namelen {
             let name = &vararg[..namelen];
             let data = &vararg[namelen..];
-            let _name_str = crate::registry::utf16le_to_string_pub(name);
-            let _path = self.registry.get_handle_path(req.hkey).unwrap_or_else(|| "<unknown>".to_string());
+            let name_str = crate::registry::utf16le_to_string_pub(name);
+            let path = self.registry.get_handle_path(req.hkey).unwrap_or_else(|| "<unknown>".to_string());
+            log_info!("set_key_value: '{name_str}' in {path} type={}", req.r#type);
             self.registry.set_value(req.hkey, name, req.r#type as u32, data);
+            self.fire_registry_notifications(req.hkey, 0x04); // REG_NOTIFY_CHANGE_LAST_SET
 
             // Note: __wine_display_device_guid is pre-set at daemon startup with a
             // deterministic null GUID. No need to intercept explorer's dynamic GUID here.
@@ -220,6 +228,7 @@ impl EventLoop {
         } else { 0 };
 
         if hkey != 0 && self.registry.delete_key(hkey) {
+            self.fire_registry_notifications(hkey, 0x01); // REG_NOTIFY_CHANGE_NAME
             reply_fixed(&DeleteKeyReply { header: ReplyHeader { error: 0, reply_size: 0 } })
         } else {
             // STATUS_ACCESS_DENIED if has subkeys, or key not found
@@ -236,6 +245,7 @@ impl EventLoop {
         let name = if buf.len() > VARARG_OFF { &buf[VARARG_OFF..] } else { &[] as &[u8] };
 
         if hkey != 0 && self.registry.delete_value(hkey, name) {
+            self.fire_registry_notifications(hkey, 0x04); // REG_NOTIFY_CHANGE_LAST_SET
             reply_fixed(&DeleteKeyValueReply { header: ReplyHeader { error: 0, reply_size: 0 } })
         } else {
             reply_fixed(&DeleteKeyValueReply { header: ReplyHeader { error: 0xC0000034, reply_size: 0 } }) // NOT_FOUND
@@ -252,6 +262,41 @@ impl EventLoop {
         reply_fixed(&SaveRegistryReply {
             header: ReplyHeader { error: 0, reply_size: 0 },
         })
+    }
+
+
+    pub(crate) fn handle_set_registry_notification(&mut self, client_fd: i32, buf: &[u8]) -> Reply {
+        let req = if buf.len() >= std::mem::size_of::<SetRegistryNotificationRequest>() {
+            unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const SetRegistryNotificationRequest) }
+        } else {
+            return reply_fixed(&ReplyHeader { error: 0xC000000D, reply_size: 0 });
+        };
+
+        let pid = self.client_pid(client_fd as RawFd);
+
+        // Reset the event so it's unsignaled while waiting
+        if let Some((obj, _)) = self.ntsync_objects.get(&(pid, req.event)) {
+            let _ = obj.event_reset();
+        }
+
+        if self.registry.register_notify(req.hkey, pid, req.event, req.subtree != 0, req.filter) {
+            // STATUS_PENDING: notification registered, event will be signaled on change
+            reply_fixed(&SetRegistryNotificationReply {
+                header: ReplyHeader { error: 0x103, reply_size: 0 },
+            })
+        } else {
+            reply_fixed(&ReplyHeader { error: 0xC0000008, reply_size: 0 }) // STATUS_INVALID_HANDLE
+        }
+    }
+
+    // Signal ntsync events for registry notifications that match a mutation.
+    fn fire_registry_notifications(&mut self, changed_hkey: u32, change: u32) {
+        let fired = self.registry.collect_notifications(changed_hkey, change);
+        for (pid, event_handle) in fired {
+            if let Some((obj, _)) = self.ntsync_objects.get(&(pid, event_handle)) {
+                let _ = obj.event_set();
+            }
+        }
     }
 
 

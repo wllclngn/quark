@@ -64,96 +64,41 @@ OPCODE_STATS = Path("/tmp/quark/triskelion_opcode_stats.txt")
 SHM_GLOB = "/dev/shm/triskelion-*"
 WINE_INIT_GLOB = "/tmp/quark/wine_init_*.log"
 
-DEFAULT_APPID = "570940"  # DARK SOULS: REMASTERED
+DEFAULT_APPID = "2379780"  # Balatro
 DEFAULT_TIMEOUT = 30
 
 # ── Opcode implementation status ─────────────────────────────────────
-# Opcodes with REAL handlers (do actual server-side work, not just return
-# success with zeroed data). Anything hit that's NOT in this set is a stub
-# the game needs — that's your implementation priority list.
+# Auto-derived from rust/src/triskelion/event_loop/*.rs at module load time.
+# Anything iterate.py sees that's NOT in this set is a real coverage gap.
+#
+# The previous version was a hand-maintained set that drifted out of sync
+# with the actual code (handlers were added but the set wasn't updated),
+# making the gap analysis lie. Reading the source directly kills the drift
+# permanently — no human ever needs to remember to update this list.
 
-IMPLEMENTED_OPCODES = {
-    # Process/thread lifecycle
-    "new_process", "get_new_process_info", "new_thread",
-    "init_first_thread", "init_thread", "get_startup_info", "init_process_done",
-    "terminate_process", "terminate_thread",
-    "get_process_info", "get_thread_info",
-    "open_process", "open_thread",
-    "make_process_system",
-    # Handle management
-    "close_handle", "set_handle_info", "dup_handle",
-    # Sync (ntsync-backed)
-    "select",
-    "create_event", "event_op", "open_event",
-    "create_mutex", "release_mutex", "open_mutex",
-    "create_semaphore", "release_semaphore", "open_semaphore",
-    "create_keyed_event", "open_keyed_event",
-    "get_inproc_sync_fd", "get_inproc_alert_fd",
-    # Registry
-    "create_key", "open_key", "get_key_value", "set_key_value",
-    "enum_key_value", "enum_key", "flush_key", "load_registry",
-    "delete_key", "delete_key_value", "unload_registry", "save_registry",
-    # Files / mappings
-    "create_file", "alloc_file_handle", "get_handle_fd",
-    "create_mapping", "open_mapping", "get_mapping_info",
-    "map_image_view", "get_image_map_address", "map_view", "unmap_view",
-    "create_named_pipe", "ioctl",
-    # Atoms
-    "add_atom", "find_atom", "get_atom_information", "delete_atom",
-    "add_user_atom",
-    # Window management
-    "create_class", "create_window", "destroy_class",
-    "get_desktop_window", "get_thread_desktop", "get_process_winstation",
-    "create_desktop",
-    "set_window_pos", "get_window_rectangles", "get_visible_region",
-    "set_window_property", "get_window_property", "remove_window_property",
-    "init_window_info", "get_window_info", "set_window_info",
-    "set_parent", "get_window_tree", "set_window_owner",
-    "destroy_window", "alloc_user_handle", "free_user_handle",
-    "get_msg_queue", "set_queue_mask", "set_queue_fd",
-    "get_window_region", "set_window_region",
-    "set_winstation_monitors",
-    # Message pump
-    "get_message", "post_quit_message", "reply_message", "get_message_reply",
-    "get_update_region", "redraw_window",
-    "set_window_text", "get_window_text",
-    "get_clipboard_info", "add_clipboard_listener",
-    "get_window_list", "get_window_children_from_point",
-    # Input / cursor / caret
-    "set_cursor", "set_caret_info", "set_keyboard_repeat",
-    "get_thread_input",
-    # Thread / job
-    "set_thread_info", "kill_win_timer", "set_win_timer",
-    "set_job_limits", "set_job_completion_port",
-    # I/O completion
-    "add_completion", "remove_completion", "get_thread_completion",
-    # File ops
-    "set_fd_eof_info", "flush", "get_directory_cache_entry",
-    # User objects
-    "set_user_object_info",
-    # X11/display
-    "get_window_layered_info", "set_window_layered_info",
-    "send_message",
-    # Queue
-    "get_msg_queue_handle",
-    # Tokens / security
-    "get_token_sid", "open_token",
-    # Objects
-    "open_directory", "create_job", "create_completion",
-    "resume_thread", "allocate_locally_unique_id",
-    # Thread
-    "get_thread_times", "get_next_thread",
-    "get_process_debug_info",
-    "set_foreground_window",
-    # Pipe I/O
-    "open_file_object", "set_named_pipe_info", "write", "read", "cancel_async",
-    "get_async_result",
-    # Process/desktop
-    "get_process_idle_event", "create_winstation", "set_process_winstation",
-    "set_thread_desktop", "grant_process_admin_token",
-    # Compare
-    "compare_objects",
-}
+def _scan_implemented_opcodes() -> set:
+    """Find every `pub(crate) fn handle_<opcode>` in the event_loop modules.
+
+    The convention in triskelion: every real wineserver opcode handler is
+    a function named `handle_<opcode>` in some event_loop/*.rs file.
+    build.rs uses the same scan to wire up dispatch.
+    """
+    import re
+    impl = set()
+    el_dir = REPO_ROOT / "rust" / "src" / "triskelion" / "event_loop"
+    if not el_dir.exists():
+        return impl
+    pat = re.compile(r"pub\s*\(\s*crate\s*\)\s+fn\s+handle_([a-z_][a-z0-9_]*)\s*\(")
+    for rs in el_dir.glob("*.rs"):
+        try:
+            for m in pat.finditer(rs.read_text(errors="replace")):
+                impl.add(m.group(1))
+        except OSError:
+            pass
+    return impl
+
+
+IMPLEMENTED_OPCODES = _scan_implemented_opcodes()
 
 # x86_64 syscall numbers → names
 SYSCALL_NAMES = {
@@ -419,7 +364,7 @@ def cleanup_processes():
     Safe: we identify children by checking if their parent chain includes a process
     from the quark compat tool directory, OR if they're orphaned Wine processes
     from our prefix (compatdata/2379780)."""
-    amp_dir = str(COMPAT_DIR)
+    compat_dir = str(COMPAT_DIR)
     uid = os.getuid()
 
     # Phase 1: Graceful shutdown for triskelion
@@ -428,9 +373,9 @@ def cleanup_processes():
     time.sleep(0.3)
 
     # Phase 2: Kill quark-spawned processes (scoped to our directory)
-    for pattern in [f"{amp_dir}/proton",
-                     f"{amp_dir}/lib/wine",
-                     f"{amp_dir}/bin/wine",
+    for pattern in [f"{compat_dir}/proton",
+                     f"{compat_dir}/lib/wine",
+                     f"{compat_dir}/bin/wine",
                      "triskelion"]:
         subprocess.run(["pkill", "-9", "-f", pattern],
                        capture_output=True, timeout=5)
@@ -450,7 +395,7 @@ def cleanup_processes():
                     continue
                 pid_str, cmdline = parts
                 # Skip if it looks like a stock Proton process (contains Proton path but NOT quark)
-                if "Proton" in cmdline and amp_dir not in cmdline:
+                if "Proton" in cmdline and compat_dir not in cmdline:
                     continue
                 if any(pat in cmdline for pat in wine_exe_patterns):
                     try:
@@ -464,7 +409,7 @@ def cleanup_processes():
     # Phase 4: Final kill pass — daemon runs as "triskelion", not matched by Phase 2's patterns.
     # Also catch anything from our compat dir that survived earlier phases.
     subprocess.run(["pkill", "-9", "-f", "triskelion"], capture_output=True, timeout=5)
-    subprocess.run(["pkill", "-9", "-f", f"{amp_dir}"], capture_output=True, timeout=5)
+    subprocess.run(["pkill", "-9", "-f", f"{compat_dir}"], capture_output=True, timeout=5)
     time.sleep(1.0)
 
     # Phase 5: Clean stale sockets. Must come AFTER all kills + sleep so
@@ -754,6 +699,70 @@ def parse_daemon_log() -> DaemonReport:
 # ── Stderr analysis ──────────────────────────────────────────────────
 
 WINE_STDERR_LOG = Path("/tmp/quark/wine_stderr.log")
+WINE_STDOUT_LOG = Path("/tmp/quark/wine_stdout.log")
+
+# ── Screenshots ──────────────────────────────────────────────────────
+#
+# Capturing the screen at fixed checkpoints lets us see what the user sees
+# without having to type "white screen" / "title showing" / etc. The
+# screenshot tool is detected once at module load and the result is
+# cached. Failures are silent — a missing tool must never abort a run.
+
+SCREENSHOTS_DIR = Path("/tmp/quark/screenshots")
+SCREENSHOT_CHECKPOINTS_S = (5, 15, 30, 45)  # seconds after launch
+
+def _detect_screenshot_cmd():
+    """Return a callable that takes (path) and writes a PNG, or None.
+
+    Probe order is biased toward Wayland-native tools because the typical
+    setup runs games through XWayland, and ImageMagick's `import` cannot
+    grab the XWayland root window on most compositors (returns
+    "missing an image filename"). Wayland-native captures of the full
+    output work everywhere.
+
+      1. KDE `spectacle -b -n -f -o`  — Plasma/Wayland, no notification
+      2. `grim`                       — wlroots compositors (Sway, Hyprland)
+      3. `gnome-screenshot -f`        — GNOME Mutter
+      4. ImageMagick `import`         — pure-X11 fallback (last resort)
+    """
+    candidates = [
+        (["spectacle", "-b", "-n", "-f", "-o"], lambda c, p: c + [str(p)]),
+        (["grim"],                              lambda c, p: c + [str(p)]),
+        (["gnome-screenshot", "-f"],            lambda c, p: c + [str(p)]),
+        (["import", "-window", "root"],         lambda c, p: c + [str(p)]),
+    ]
+    for cmd, build in candidates:
+        if shutil.which(cmd[0]):
+            return (cmd, build)
+    return None
+
+_SCREENSHOT_CMD = _detect_screenshot_cmd()
+
+
+def take_screenshot(appid: str, ts_prefix: str, elapsed_s: int) -> Path | None:
+    """Grab a full-screen PNG into SCREENSHOTS_DIR.
+
+    Returns the written path on success, None on any failure (missing tool,
+    no display, command error). Never raises — screenshot capture is
+    best-effort and must not break a run.
+    """
+    if _SCREENSHOT_CMD is None:
+        return None
+    SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = SCREENSHOTS_DIR / f"{appid}_{ts_prefix}_t{elapsed_s:02d}s.png"
+    cmd, build = _SCREENSHOT_CMD
+    try:
+        full = build(cmd, out_path)
+        result = subprocess.run(full, capture_output=True, timeout=5)
+        if result.returncode == 0 and out_path.exists() and out_path.stat().st_size > 0:
+            return out_path
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    # Clean up zero-byte file if tool failed mid-write
+    if out_path.exists() and out_path.stat().st_size == 0:
+        try: out_path.unlink()
+        except OSError: pass
+    return None
 
 def _collect_stderr_analysis() -> str:
     """Parse daemon stderr + wine stderr for NOT_IMPLEMENTED opcodes and crashes."""
@@ -789,9 +798,14 @@ def _collect_stderr_analysis() -> str:
 
 # ── Launch & Monitor ─────────────────────────────────────────────────
 
+_LAST_LAUNCH_STAMP: str = ""
+
+
 def launch_and_monitor(app_id: str, game_name: str, exe_path: str,
                        timeout: int) -> tuple:
     """Launch game, monitor, return (verdict, elapsed, report, snapshots)."""
+    global _LAST_LAUNCH_STAMP
+    _LAST_LAUNCH_STAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
     log_info(f"launch: {game_name} ({app_id})")
     log_info(f"  exe: {exe_path}")
 
@@ -814,11 +828,14 @@ def launch_and_monitor(app_id: str, game_name: str, exe_path: str,
     t0 = clock_raw_ns()
 
     try:
+        # Capture both stdout and stderr to files. LOVE2D writes Lua errors
+        # to stdout via lua's print() and via callbacks.lua's error handler,
+        # so capturing stdout is essential for diagnosing fused-exe issues.
         proc = subprocess.Popen(
             [str(PROTON_BIN), "run", exe_path],
             env=env,
             cwd="/tmp",
-            stdout=subprocess.PIPE,
+            stdout=open("/tmp/quark/wine_stdout.log", "w"),
             stderr=open("/tmp/quark/wine_stderr.log", "w"),
         )
     except OSError as e:
@@ -866,19 +883,83 @@ def launch_and_monitor(app_id: str, game_name: str, exe_path: str,
         stall_str = f" STALL={stall_ticks}" if stall_ticks else ""
         live = tracer.format_live_status()
 
-        # Check wine_stderr for key milestones
+        # Screenshot checkpoints — capture full screen at fixed elapsed times
+        # so we can see what was actually rendered without the user typing it.
+        # Files land in /tmp/quark/screenshots/ with the same {appid}_{stamp}
+        # prefix as the archived daemon.log/wine_stderr.log.
+        for cp in SCREENSHOT_CHECKPOINTS_S:
+            if cp <= elapsed < cp + poll_interval:
+                shot = take_screenshot(app_id, _LAST_LAUNCH_STAMP, cp)
+                if shot:
+                    log_info(f"screenshot: {shot.name}")
+                break
+
+        # Check wine_stderr + daemon log for milestones.
+        #
+        # IMPORTANT: every milestone here must be a TRUE positive — substring
+        # matches that fire on error screens, helper windows, or unrelated
+        # codepaths are misleading and have caused multiple "looks playable"
+        # hallucinations. The bar:
+        #   - "RENDERING" must mean a real top-level visible window received
+        #     a real WM_PAINT, NOT just that wglSwapBuffers appeared (which
+        #     fires for SDL2 helper windows AND for the LOVE2D error screen)
+        #   - "STEAM_API" requires the bridge to actually answer, not just
+        #     for the string "steam_api64" to appear in a load message
+        #   - "CRASH" requires an actual exit/SIGSEGV, not "Unhandled" which
+        #     appears in stub fixme lines that don't crash anything
         milestones = []
         try:
             stderr_text = WINE_STDERR_LOG.read_text(errors="replace") if WINE_STDERR_LOG.exists() else ""
-            if "winex11.drv" in stderr_text: milestones.append("x11drv")
-            if "XRandR" in stderr_text: milestones.append("XRandR")
-            if "create_desktop" in stderr_text or "desktop_ready" in (DAEMON_LOG.read_text(errors="replace") if DAEMON_LOG.exists() else ""): milestones.append("DESKTOP")
-            if "NO GAME" in stderr_text or "love" in stderr_text.lower(): milestones.append("LÖVE")
-            if "wglSwapBuffers" in stderr_text: milestones.append("RENDERING")
-            if "page fault" in stderr_text or "Unhandled" in stderr_text: milestones.append("CRASH")
-            if "steam_api64" in stderr_text: milestones.append("STEAM_API")
-            if any(f"err:service" in l for l in stderr_text.splitlines()[-5:]): milestones.append("SVC_ERR")
-        except:
+            daemon_text = DAEMON_LOG.read_text(errors="replace") if DAEMON_LOG.exists() else ""
+            if "winex11.drv" in stderr_text:
+                milestones.append("x11drv")
+            if "XRandR" in stderr_text:
+                milestones.append("XRandR")
+            if "desktop_ready" in daemon_text:
+                milestones.append("DESKTOP")
+            if "NO GAME" in stderr_text or "love" in stderr_text.lower():
+                milestones.append("LÖVE")
+
+            # RENDERING: a real top-level visible window must have received a
+            # WM_PAINT delivery from the daemon. Helper windows (style=0,
+            # parent=desktop_msg_window 0x22) and the LOVE2D error screen do
+            # not count. Daemon logs WM_PAINT deliveries via:
+            #   "get_message: tid=... win=0x.... msg=WM_PAINT"
+            # Cross-reference with create_window logs to filter out windows
+            # whose parent is the desktop msg window (those are SDL2 helpers).
+            if "msg=WM_PAINT" in daemon_text:
+                # Walk the daemon log: collect parent_msg_window helper handles,
+                # find WM_PAINT deliveries to handles NOT in that set.
+                helper_wins = set()
+                for line in daemon_text.splitlines():
+                    if "create_window:" in line and "parent=0x0022" in line:
+                        m = re.search(r"create_window: handle=(0x[0-9a-fA-F]+)", line)
+                        if m:
+                            helper_wins.add(m.group(1).lower())
+                real_paint = False
+                for line in daemon_text.splitlines():
+                    if "msg=WM_PAINT" not in line:
+                        continue
+                    m = re.search(r"win=(0x[0-9a-fA-F]+) msg=WM_PAINT", line)
+                    if m and m.group(1).lower() not in helper_wins:
+                        real_paint = True
+                        break
+                if real_paint:
+                    milestones.append("RENDERING")
+
+            # CRASH: a real exit from the launcher with non-zero status, OR
+            # an actual SIGSEGV trace. "Unhandled" alone is too noisy.
+            if re.search(r'\[quark\] exit: [1-9]', stderr_text) or "SIGSEGV" in stderr_text:
+                milestones.append("CRASH")
+            # LOVE error screen specifically — different from a quark crash
+            if 'love "callbacks.lua"' in stderr_text or "module 'engine/object'" in stderr_text:
+                milestones.append("LOVE_ERROR")
+
+            if "steam_api64" in stderr_text:
+                milestones.append("STEAM_API")
+            if any(f"err:service" in l for l in stderr_text.splitlines()[-5:]):
+                milestones.append("SVC_ERR")
+        except Exception:
             pass
         ms_str = f" | {' '.join(milestones)}" if milestones else ""
 
@@ -1167,13 +1248,150 @@ def print_report(verdict: str, elapsed: float, report: DaemonReport,
 
 # ── Main ─────────────────────────────────────────────────────────────
 
+def discover_all_games() -> list[tuple[str, str, str]]:
+    """Find all playable Steam games. Returns [(appid, name, exe_path), ...]."""
+    _skip_appids = {
+        "228980", "1493710", "1887720", "1826330", "2180100",
+        "961940", "1391110", "1580130", "2348590",
+    }
+    _skip_names = {"proton", "steamworks", "steam linux runtime", "redistribut", "sdk"}
+    games = []
+    seen = set()
+    for manifest in sorted(STEAMAPPS.glob("appmanifest_*.acf")):
+        info = parse_appmanifest(manifest)
+        appid = info.get("appid", "")
+        name = info.get("name", "")
+        installdir = info.get("installdir", "")
+        if not appid or not name or not installdir:
+            continue
+        if appid in seen or appid in _skip_appids:
+            continue
+        if any(s in name.lower() for s in _skip_names):
+            continue
+        install_dir = STEAMAPPS / "common" / installdir
+        if not install_dir.exists():
+            continue
+        exe = find_game_exe(install_dir)
+        if not exe:
+            continue
+        seen.add(appid)
+        games.append((appid, name, exe))
+    games.sort(key=lambda g: g[1])
+    return games
+
+
+def run_single_game(appid, game_name, exe_path, timeout, skip_build):
+    """Run one game through iterate cycle. Returns result dict."""
+    if not build(skip=skip_build):
+        return {"appid": appid, "name": game_name, "verdict": "build_fail"}
+
+    if not install():
+        return {"appid": appid, "name": game_name, "verdict": "install_fail"}
+
+    result = launch_and_monitor(appid, game_name, exe_path, timeout)
+    verdict, elapsed, report, snapshots, err = result[:5]
+    tracer = result[5] if len(result) > 5 else None
+
+    # Check wine_stderr for key errors
+    stderr_text = ""
+    if WINE_STDERR_LOG.exists():
+        stderr_text = WINE_STDERR_LOG.read_text(errors="replace")
+    steam_auth_ok = "Failed to find steamclient_init_registry" not in stderr_text
+    has_crash = "Unhandled page fault" in stderr_text or "page fault" in stderr_text
+
+    # Archive — reuse the launch stamp so archived logs and screenshots
+    # captured during the run share the same {appid}_{stamp} prefix.
+    stamp = _LAST_LAUNCH_STAMP or datetime.now().strftime("%Y%m%d-%H%M%S")
+    archive_dir = Path("/tmp/quark/runs")
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    prefix = f"{appid}_{stamp}"
+    for src, suffix in [(DAEMON_LOG, "daemon.log"), (WINE_STDERR_LOG, "wine_stderr.log"), (WINE_STDOUT_LOG, "wine_stdout.log")]:
+        if src.exists() and src.stat().st_size > 0:
+            dst = archive_dir / f"{prefix}_{suffix}"
+            try:
+                shutil.copy2(src, dst)
+            except OSError:
+                pass
+
+    return {
+        "appid": appid,
+        "name": game_name,
+        "verdict": verdict,
+        "elapsed": elapsed,
+        "requests": report.total_requests,
+        "steam_auth": steam_auth_ok,
+        "crash": has_crash,
+        "tracer": tracer,
+    }
+
+
+def run_all_games(timeout, skip_build):
+    """Discover and test all Steam games. Print summary table."""
+    games = discover_all_games()
+    if not games:
+        log_error("no games found")
+        return
+
+    log_info(f"found {len(games)} games to test")
+    for appid, name, _ in games:
+        log_info(f"  {appid:>8}  {name}")
+    print()
+
+    # Build once
+    if not build(skip=skip_build):
+        log_error("build failed")
+        return
+    if not install():
+        log_error("install failed")
+        return
+
+    # Verify patches first
+    log_info("running patch verification...")
+    r = subprocess.run([sys.executable, str(REPO_ROOT / "tests" / "verify_patches.py")],
+                       capture_output=True, text=True)
+    for line in r.stdout.splitlines():
+        if "[FAIL]" in line or "RESULTS" in line:
+            print(f"  {line.strip()}")
+    if r.returncode != 0:
+        log_warn("patch verification had failures (continuing anyway for dev testing)")
+    else:
+        log_info("patch verification passed")
+    print()
+
+    results = []
+    for i, (appid, name, exe) in enumerate(games):
+        log_info(f"GAME {i+1}/{len(games)}: {name} ({appid})")
+        res = run_single_game(appid, name, exe, timeout, skip_build=True)
+        results.append(res)
+        print()
+
+    # Summary table
+    print(f"  {'Game':<40} {'Verdict':<10} {'Reqs':>8} {'Steam':>6} {'Crash':>6}")
+    for r in results:
+        name = r["name"][:39]
+        verdict = r["verdict"]
+        reqs = r.get("requests", 0)
+        steam = "OK" if r.get("steam_auth") else "FAIL"
+        crash = "YES" if r.get("crash") else "no"
+        print(f"  {name:<40} {verdict:<10} {reqs:>8} {steam:>6} {crash:>6}")
+
+    ok = sum(1 for r in results if r["verdict"] == "timeout" and not r.get("crash"))
+    crashed = sum(1 for r in results if r.get("crash"))
+    print(f"\n  {len(results)} games | {ok} running | {crashed} crashed")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Triskelion build-test-analyze cycle")
     parser.add_argument("--appid", default=DEFAULT_APPID, help=f"Steam app ID (default: {DEFAULT_APPID})")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help=f"Timeout in seconds (default: {DEFAULT_TIMEOUT})")
     parser.add_argument("--skip-build", action="store_true", help="Skip cargo build")
     parser.add_argument("--exe", type=str, default=None, help="Override game exe path")
+    parser.add_argument("--all", action="store_true", help="Test ALL installed Steam games")
     args = parser.parse_args()
+
+    if args.all:
+        run_all_games(args.timeout, args.skip_build)
+        return
 
     # Find game
     game_name, exe_path = find_game(args.appid)
@@ -1202,6 +1420,21 @@ def main():
 
     # Report
     print_report(verdict, elapsed, report, snapshots, tracer)
+
+    # Archive logs — reuse the launch stamp so archived logs and screenshots
+    # captured during the run share the same {appid}_{stamp} prefix.
+    stamp = _LAST_LAUNCH_STAMP or datetime.now().strftime("%Y%m%d-%H%M%S")
+    archive_dir = Path("/tmp/quark/runs")
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    prefix = f"{args.appid}_{stamp}"
+    for src, suffix in [(DAEMON_LOG, "daemon.log"), (WINE_STDERR_LOG, "wine_stderr.log"), (WINE_STDOUT_LOG, "wine_stdout.log")]:
+        if src.exists() and src.stat().st_size > 0:
+            dst = archive_dir / f"{prefix}_{suffix}"
+            try:
+                shutil.copy2(src, dst)
+            except OSError:
+                pass
+    log_info(f"logs archived: /tmp/quark/runs/{prefix}_*")
 
 
 if __name__ == "__main__":

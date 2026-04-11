@@ -1,0 +1,42 @@
+From: quark <quark@localhost>
+Subject: [PATCH] msctf: Tolerate WH_CBT focus hook failure
+
+In environments where Wine's hook infrastructure is not fully wired
+up (notably quark+triskelion on Wine 11.6), SetWindowsHookExW(WH_CBT)
+can return NULL. The original code returned E_FAIL, but the caller
+(ThreadMgr_AssociateFocus, ThreadMgr_ActivateEx) ignores the return
+value, so msctf shipped a half-built ITfThreadMgr to SDL2 via
+RoGetActivationFactory. SDL2 then dereferenced uninitialized focus
+state and triggered STATUS_ACCESS_VIOLATION (c0000005), caught by
+ntdll's user_callback_handler and silently swallowed — but the
+calling thread's state was already corrupted, leading to downstream
+crashes (Lua VM corruption in LOVE2D, etc.).
+
+Fix: report success on hook failure. msctf works in degraded mode
+without the focus hook — IME auto-focus tracking is disabled but
+the rest of TSF works. This eliminates the c0000005 cascade and
+returns a consistent (if reduced) ITfThreadMgr to the caller.
+
+diff --git a/dlls/msctf/threadmgr.c b/dlls/msctf/threadmgr.c
+index 11c79c0..9b29d9d 100644
+--- a/dlls/msctf/threadmgr.c
++++ b/dlls/msctf/threadmgr.c
+@@ -428,8 +428,16 @@ static HRESULT SetupWindowsHook(ThreadMgr *This)
+                              GetCurrentThreadId());
+         if (!This->focusHook)
+         {
+-            ERR("Unable to set focus hook\n");
+-            return E_FAIL;
++            /* The CBT hook can fail in environments where Wine's hook
++             * infrastructure is not fully wired up. Returning E_FAIL here
++             * leaves the caller (and SDL2 via RoGetActivationFactory) with
++             * a half-built ITfThreadMgr whose focus state never updates,
++             * leading to NULL derefs caught as STATUS_ACCESS_VIOLATION by
++             * user_callback_handler. msctf works in degraded mode without
++             * the hook — IME focus changes simply aren't auto-tracked.
++             * Report success so the caller proceeds with consistent state. */
++            WARN("Unable to set focus hook - continuing in degraded mode\n");
++            return S_OK;
+         }
+         return S_OK;
+     }

@@ -21,7 +21,6 @@ impl EventLoop {
         if let Some(process) = self.state.processes.get_mut(&pid) {
             process.parent_pid = parent_pid;
         }
-        self.process_init_count += 1;
 
         // Extract VARARG startup info.
         // VARARG layout: [object_attributes] [handles] [jobs] [startup_info] [env]
@@ -359,10 +358,7 @@ impl EventLoop {
                 }
                 to_wake.push((*parent_pid, *ih));
             }
-            // Wake fsync slots AFTER releasing ntsync_objects borrow
-            for (ppid, handle) in to_wake {
-                self.fsync_wake_handle(ppid, handle);
-            }
+            let _ = to_wake; // ntsync objects already signaled above
         }
 
         // DO NOT signal idle event here. The correct trigger is in handle_select
@@ -407,6 +403,12 @@ impl EventLoop {
 
         if let Some(pe_info) = pe_info {
             let vararg_len = pe_info.len().min(max_vararg as usize);
+            // Read machine type from pe_image_info (offset 64, u16).
+            // 32-bit games have 0x014c (i386), 64-bit have 0x8664 (AMD64).
+            // WoW64 depends on this to select the correct CPU translation DLL.
+            let exe_machine = if pe_info.len() >= 66 {
+                u16::from_le_bytes([pe_info[64], pe_info[65]])
+            } else { 0x8664 };
             let reply = GetProcessInfoReply {
                 header: ReplyHeader { error: 0, reply_size: vararg_len as u32 },
                 pid,
@@ -420,7 +422,7 @@ impl EventLoop {
                 priority: 8,
                 base_priority: 8,
                 disable_boost: 0,
-                machine: 0x8664,
+                machine: exe_machine,
             };
             return reply_vararg(&reply, &pe_info[..vararg_len]);
         }
@@ -462,10 +464,7 @@ impl EventLoop {
             if let Some(pid) = pid {
                 if let Some(process) = self.state.processes.get_mut(&pid) {
                     process.exit_code = req.exit_code;
-                    let before = process.threads.len();
                     process.threads.retain(|&t| t == tid);
-                    if before != process.threads.len() {
-                    }
                 }
             }
             1
@@ -492,16 +491,6 @@ impl EventLoop {
     }
 
 
-    pub(crate) fn handle_debug_process(&mut self, _client_fd: i32, _buf: &[u8]) -> Reply {
-        // EAC calls this to check if a process can be debugged.
-        // Return ACCESS_DENIED — we don't support debugging.
-        reply_fixed(&ReplyHeader { error: 0xC000_0022, reply_size: 0 })
-    }
-
-    pub(crate) fn handle_wait_debug_event(&mut self, _client_fd: i32, _buf: &[u8]) -> Reply {
-        // No debug port attached — return PORT_NOT_SET.
-        reply_fixed(&ReplyHeader { error: 0xC000_0353, reply_size: 0 })
-    }
 
     pub(crate) fn handle_grant_process_admin_token(&mut self, _client_fd: i32, _buf: &[u8]) -> Reply {
         // Stock always returns success. No real privilege check needed.
@@ -677,13 +666,178 @@ impl EventLoop {
 
 
     pub(crate) fn handle_list_processes(&mut self, _client_fd: i32, _buf: &[u8]) -> Reply {
-        reply_fixed(&ListProcessesReply {
-            header: ReplyHeader { error: 0, reply_size: 0 },
-            info_size: 0,
-            process_count: 0,
-            total_thread_count: 0,
-            total_name_len: 0,
-        })
+        // Build process list from known processes. Stock Wine iterates all
+        // server processes. Mono's Process.GetProcessesByName crashes if the
+        // list is empty (expects at least the current process).
+        //
+        // process_info layout (40 bytes, 8-byte aligned):
+        //   start_time: i64, name_len: u32, thread_count: i32,
+        //   priority: i32, pid: u32, parent_pid: u32,
+        //   session_id: u32, handle_count: i32, unix_pid: i32
+        // Followed by: name (UTF-16LE, name_len bytes)
+        // Followed by: thread_info[] (each 40 bytes):
+        //   start_time: i64, tid: u32, base_priority: i32,
+        //   current_priority: i32, unix_tid: i32, teb: u64, entry_point: u64
+
+        let mut vararg = Vec::new();
+        let mut process_count = 0u32;
+        let mut total_thread_count = 0u32;
+        let mut total_name_len = 0u32;
+
+        // Collect unique pids
+        let mut pids: Vec<u32> = self.state.processes.keys().copied().collect();
+        pids.sort_unstable();
+
+        for &pid in &pids {
+            let process = match self.state.processes.get(&pid) {
+                Some(p) => p,
+                None => continue,
+            };
+
+            // Process name: use a short placeholder (Wine uses exe basename)
+            let name_u16: Vec<u8> = "game.exe".encode_utf16()
+                .flat_map(|c| c.to_le_bytes()).collect();
+            let name_len = name_u16.len() as u32;
+
+            // Threads for this process
+            let threads: Vec<&u32> = process.threads.iter().collect();
+            let thread_count = threads.len() as i32;
+
+            // Align to 8 bytes before each process_info
+            while vararg.len() % 8 != 0 { vararg.push(0); }
+
+            // process_info (40 bytes)
+            vararg.extend_from_slice(&0i64.to_le_bytes());        // start_time
+            vararg.extend_from_slice(&name_len.to_le_bytes());    // name_len
+            vararg.extend_from_slice(&thread_count.to_le_bytes()); // thread_count
+            vararg.extend_from_slice(&8i32.to_le_bytes());        // priority
+            vararg.extend_from_slice(&pid.to_le_bytes());         // pid
+            vararg.extend_from_slice(&0u32.to_le_bytes());        // parent_pid
+            vararg.extend_from_slice(&0u32.to_le_bytes());        // session_id
+            vararg.extend_from_slice(&0i32.to_le_bytes());        // handle_count
+            let unix_pid = self.clients.values()
+                .find(|c| c.process_id == pid && c.unix_pid > 0)
+                .map(|c| c.unix_pid).unwrap_or(0);
+            vararg.extend_from_slice(&unix_pid.to_le_bytes());    // unix_pid
+
+            // name (UTF-16LE)
+            vararg.extend_from_slice(&name_u16);
+
+            // thread_info entries (40 bytes each)
+            for &tid in &threads {
+                let (unix_tid, teb, entry) = self.clients.values()
+                    .find(|c| c.thread_id == *tid)
+                    .map(|c| (c.unix_tid, c.teb, c.entry_point))
+                    .unwrap_or((0, 0, 0));
+                vararg.extend_from_slice(&0i64.to_le_bytes());    // start_time
+                vararg.extend_from_slice(&tid.to_le_bytes());     // tid
+                vararg.extend_from_slice(&0i32.to_le_bytes());    // base_priority
+                vararg.extend_from_slice(&0i32.to_le_bytes());    // current_priority
+                vararg.extend_from_slice(&unix_tid.to_le_bytes()); // unix_tid
+                vararg.extend_from_slice(&teb.to_le_bytes());     // teb
+                vararg.extend_from_slice(&entry.to_le_bytes());   // entry_point
+            }
+
+            process_count += 1;
+            total_thread_count += thread_count as u32;
+            total_name_len += name_len;
+        }
+
+        let info_size = vararg.len() as u32;
+        let reply = ListProcessesReply {
+            header: ReplyHeader { error: 0, reply_size: info_size },
+            info_size,
+            process_count: process_count as i32,
+            total_thread_count: total_thread_count as i32,
+            total_name_len,
+        };
+        reply_vararg(&reply, &vararg)
+    }
+
+
+    /// Returns the image name (executable path) of a process. Wine ref:
+    /// server/process.c:DECL_HANDLER(get_process_image_name).
+    ///
+    /// Lookup precedence: req.pid wins if non-zero, otherwise resolve via
+    /// req.handle. The path is read from /proc/<unix_pid>/exe (the kernel
+    /// keeps this symlink current for every process). Returned as UTF-16LE
+    /// in either NT form ("\??\Z:\unix\path") or Win32 form (drive-letter
+    /// path) depending on req.win32.
+    pub(crate) fn handle_get_process_image_name(&mut self, client_fd: i32, buf: &[u8]) -> Reply {
+        let req = if buf.len() >= std::mem::size_of::<GetProcessImageNameRequest>() {
+            unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const GetProcessImageNameRequest) }
+        } else {
+            return reply_fixed(&ReplyHeader { error: 0xC000000D, reply_size: 0 });
+        };
+
+        // Resolve target unix pid: req.pid takes precedence, then req.handle
+        let unix_pid: i32 = if req.pid != 0 {
+            self.clients.values()
+                .find(|c| c.process_id == req.pid && c.unix_pid > 0)
+                .map(|c| c.unix_pid)
+                .unwrap_or(0)
+        } else {
+            self.resolve_process_handle_to_unix_pid(client_fd, req.handle).unwrap_or(0)
+        };
+        if unix_pid <= 0 {
+            return reply_fixed(&GetProcessImageNameReply {
+                header: ReplyHeader { error: 0xC000_0008, reply_size: 0 },
+                len: 0,
+                _pad_0: [0; 4],
+            });
+        }
+
+        // /proc/<pid>/exe is a symlink the kernel maintains to the running binary
+        let proc_link = format!("/proc/{unix_pid}/exe");
+        let unix_path = match std::fs::read_link(&proc_link) {
+            Ok(p) => p,
+            Err(_) => {
+                return reply_fixed(&GetProcessImageNameReply {
+                    header: ReplyHeader { error: 0xC000_0008, reply_size: 0 },
+                    len: 0,
+                    _pad_0: [0; 4],
+                });
+            }
+        };
+        let unix_str = unix_path.to_string_lossy();
+
+        // Convert Unix path → Win32/NT path. Wine maps drive Z: to /, so
+        // the entire Linux filesystem is reachable as Z:\<unix path>.
+        // win32=true → "Z:\path\to\exe"
+        // win32=false → "\??\Z:\path\to\exe"
+        let mut win_path = String::with_capacity(unix_str.len() + 8);
+        if req.win32 == 0 {
+            win_path.push_str("\\??\\");
+        }
+        win_path.push_str("Z:");
+        for ch in unix_str.chars() {
+            win_path.push(if ch == '/' { '\\' } else { ch });
+        }
+        // Encode as UTF-16LE
+        let mut name_bytes: Vec<u8> = Vec::with_capacity(win_path.len() * 2);
+        for u in win_path.encode_utf16() {
+            name_bytes.extend_from_slice(&u.to_le_bytes());
+        }
+
+        let max_vararg = max_reply_vararg(buf);
+        let len_bytes = name_bytes.len() as u32;
+
+        // If the client's buffer is too small, return the required len with
+        // empty payload — Wine retries with a larger buffer.
+        if name_bytes.len() > max_vararg as usize {
+            return reply_fixed(&GetProcessImageNameReply {
+                header: ReplyHeader { error: 0, reply_size: 0 },
+                len: len_bytes,
+                _pad_0: [0; 4],
+            });
+        }
+
+        let reply = GetProcessImageNameReply {
+            header: ReplyHeader { error: 0, reply_size: name_bytes.len() as u32 },
+            len: len_bytes,
+            _pad_0: [0; 4],
+        };
+        reply_vararg(&reply, &name_bytes)
     }
 
 

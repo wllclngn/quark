@@ -5,7 +5,7 @@ Cargo.lock
 # Binaries (built by cargo build --release)
 /quark
 /triskelion
-/parallax
+/sybil
 /drv_init.dll
 
 # Runtime

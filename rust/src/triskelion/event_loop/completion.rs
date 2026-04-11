@@ -215,7 +215,7 @@ impl EventLoop {
             // Use compute_ntsync_timeout logic to convert Wine timeout to relative ns
             let mut mono_ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
             unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut mono_ts); }
-            let mono_now_ns = (mono_ts.tv_sec as u64) * 1_000_000_000 + (mono_ts.tv_nsec as u64);
+            let _mono_now_ns = (mono_ts.tv_sec as u64) * 1_000_000_000 + (mono_ts.tv_nsec as u64);
             let rel_ns = if req.expire < 0 {
                 ((-req.expire) as u64).saturating_mul(100)
             } else {
@@ -505,7 +505,7 @@ impl EventLoop {
         let pid = self.client_pid(client_fd as RawFd);
 
         // Store the binding: (pid, object_handle) → (completion_port_handle, key)
-        self.completion_bindings.insert((pid, req.handle), (req.chandle, req.ckey));
+        self.side_tables.completion_bindings.insert((pid, req.handle), (req.chandle, req.ckey));
 
         reply_fixed(&ReplyHeader { error: 0, reply_size: 0 })
     }
@@ -652,6 +652,78 @@ impl EventLoop {
         })
     }
 
+
+    /// Wine ref: server/debugger.c:DECL_HANDLER(debug_process)
+    ///
+    /// Attach or detach a debug object from a process. Triskelion doesn't
+    /// run a real debugger event loop — we never deliver debug events to
+    /// the attached debugger — so this is a stateless success ack. Games
+    /// that try to attach as their own debugger (Steam DRM, anti-tamper
+    /// integrity-check loops) get a green light but no events. Their wait
+    /// loops timeout cleanly via wait_debug_event below.
+    ///
+    /// The previous behavior was to fall through to the auto-stub path,
+    /// which returned STATUS_NOT_IMPLEMENTED and the calling Wine code
+    /// then NULL-derefed the missing debug_obj on the next operation.
+    pub(crate) fn handle_debug_process(&mut self, _client_fd: i32, buf: &[u8]) -> Reply {
+        if buf.len() < std::mem::size_of::<DebugProcessRequest>() {
+            return reply_fixed(&ReplyHeader { error: 0xC000000D, reply_size: 0 });
+        }
+        // We don't track the attach state — we have no debugger to deliver
+        // events to anyway. Always succeed; the caller proceeds with a valid
+        // (but inert) debug relationship.
+        reply_fixed(&ReplyHeader { error: 0, reply_size: 0 })
+    }
+
+
+    /// Wine ref: server/debugger.c:DECL_HANDLER(wait_debug_event)
+    ///
+    /// Polled by the debugger thread to fetch the next debug event. We never
+    /// queue events, so we always return the "no event yet" state — Wine's
+    /// reference does the same when its event_queue is empty by writing the
+    /// 4-byte `DbgIdle` (= 0) state code into the reply vararg slot. Pid/tid
+    /// stay zero; the debugger sees "no sender" and falls back to its idle
+    /// path. Reply struct: pid + tid (both u32), then VARARG(event,debug_event).
+    pub(crate) fn handle_wait_debug_event(&mut self, _client_fd: i32, buf: &[u8]) -> Reply {
+        if buf.len() < std::mem::size_of::<WaitDebugEventRequest>() {
+            return reply_fixed(&ReplyHeader { error: 0xC000000D, reply_size: 0 });
+        }
+        // 4-byte vararg = DbgIdle state. Wine: enum DEBUG_STATE { DbgIdle = 0, ... }
+        let dbg_idle: i32 = 0;
+        let vararg = dbg_idle.to_le_bytes();
+        let reply = WaitDebugEventReply {
+            header: ReplyHeader { error: 0, reply_size: vararg.len() as u32 },
+            pid: 0,
+            tid: 0,
+        };
+        reply_vararg(&reply, &vararg)
+    }
+
+
+    /// Wine ref: server/debugger.c:DECL_HANDLER(continue_debug_event)
+    ///
+    /// Resume a debugged process after the debugger handled a debug event.
+    /// Since wait_debug_event never returns events, this should never get
+    /// called with a real (pid, tid) — but games still call it after their
+    /// debugger setup as part of init. Validate the continue status (Wine's
+    /// reference rejects unknown values with STATUS_INVALID_PARAMETER) and
+    /// return success.
+    pub(crate) fn handle_continue_debug_event(&mut self, _client_fd: i32, buf: &[u8]) -> Reply {
+        let req = if buf.len() >= std::mem::size_of::<ContinueDebugEventRequest>() {
+            unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const ContinueDebugEventRequest) }
+        } else {
+            return reply_fixed(&ReplyHeader { error: 0xC000000D, reply_size: 0 });
+        };
+        // Wine accepts: DBG_EXCEPTION_NOT_HANDLED (0x80010001), DBG_EXCEPTION_HANDLED
+        // (0x00010001), DBG_CONTINUE (0x00010002), DBG_REPLY_LATER (0x40010001).
+        let valid = matches!(req.status, 0x80010001 | 0x00010001 | 0x00010002 | 0x40010001);
+        if !valid {
+            return reply_fixed(&ReplyHeader { error: 0xC000_000D, reply_size: 0 }); // STATUS_INVALID_PARAMETER
+        }
+        reply_fixed(&ReplyHeader { error: 0, reply_size: 0 })
+    }
+
+
     pub(crate) fn handle_create_device_manager(&mut self, client_fd: i32, _buf: &[u8]) -> Reply {
         // ntoskrnl calls create_device_manager to get a handle for device I/O.
         // It dereferences the returned handle — must be non-zero.
@@ -704,8 +776,8 @@ impl EventLoop {
         reply_fixed(&GetKernelObjectPtrReply { header: ReplyHeader { error: 0, reply_size: 0 }, user_ptr })
     }
 
-    pub(crate) fn handle_grab_kernel_object(&mut self, client_fd: i32, buf: &[u8]) -> Reply {
-        let req = if buf.len() >= std::mem::size_of::<GrabKernelObjectRequest>() {
+    pub(crate) fn handle_grab_kernel_object(&mut self, _client_fd: i32, buf: &[u8]) -> Reply {
+        let _req = if buf.len() >= std::mem::size_of::<GrabKernelObjectRequest>() {
             unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const GrabKernelObjectRequest) }
         } else {
             return reply_fixed(&GrabKernelObjectReply { header: ReplyHeader { error: 0xC000000D, reply_size: 0 } });

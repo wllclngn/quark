@@ -14,7 +14,21 @@ pub fn is_verbose() -> bool {
         if std::env::var("QUARK_VERBOSE").is_ok() {
             return true;
         }
-        // Flag file written by ./install.py --verbose
+        // Flag file written by `./install.py --verbose`. Lives in CACHE_DIR
+        // so it survives step_clean (which wipes STEAM_COMPAT_DIR — the
+        // previous location — and silently disabled verbose every install).
+        if let Ok(home) = std::env::var("HOME") {
+            let flag = std::path::Path::new(&home)
+                .join(".cache")
+                .join("quark")
+                .join("verbose_enabled");
+            if flag.exists() {
+                return true;
+            }
+        }
+        // Legacy fallback: old installs put the flag next to the binary.
+        // Kept for one release cycle so freshly-built launchers still see
+        // any leftover flag from a pre-fix install.
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
                 if dir.join("verbose_enabled").exists() {

@@ -75,7 +75,12 @@ impl EventLoop {
         });
 
         let tid = self.state.create_thread(target_pid);
-        self.thread_init_count += 1;
+        // CREATE_SUSPENDED: track so init_thread returns suspend=1
+        if req.flags & 0x01 != 0 {
+            if let Some(thread) = self.state.threads.get_mut(&tid) {
+                thread.suspend_count = 1;
+            }
+        }
         // Thread handles are waitable (WaitForSingleObject)
         let handle = self.alloc_waitable_handle_for_client(client_fd);
         // Store tid in handle so resume_thread can find the target thread
@@ -260,8 +265,6 @@ impl EventLoop {
             if let Some(client) = self.clients.get(&(client_fd as RawFd)) {
                 if let Some(wait_fd) = client.wait_fd {
                     for (cookie, signaled) in wakes {
-                        #[repr(C)]
-                        struct WakeUpReply { cookie: u64, signaled: i32, _pad: i32 }
                         let reply = WakeUpReply { cookie, signaled, _pad: 0 };
                         unsafe {
                             libc::write(wait_fd, &reply as *const _ as *const _, 16);
@@ -299,7 +302,6 @@ impl EventLoop {
         let existing_tid = self.clients.get(&(client_fd as RawFd))
             .and_then(|c| if c.thread_id != 0 { Some(c.thread_id) } else { None });
         let tid = existing_tid.unwrap_or_else(|| self.state.create_thread(pid));
-        self.thread_init_count += 1;
 
         // Allocate SHM queue slot keyed by Wine thread ID (not unix_tid).
         // Message delivery uses Wine tid for lookup, so the key must match.
@@ -382,31 +384,23 @@ impl EventLoop {
             })
             .unwrap_or(0);
 
-        // Only the FIRST unparented process should get info_size=0 (triggers run_wineboot).
-        // Subsequent unparented connections (WoW64 helper) get info_size=1 to skip it.
-        if is_unparented && info_size == 0 {
-            if self.boot_process_claimed {
-                // Non-boot unparented process (WoW64 helper, explorer, etc.).
-                // Return info_size=0 like stock Wine. ntdll calls
-                // build_initial_params() which reads the exe name from the
-                // process's own argv — no server-provided imagepath needed.
-                // ntdll triggers wineboot, but wineboot finds the daemon
-                // already running (exit code 2) and skips the full boot.
-                info_size = 0;
-            } else {
-                self.boot_process_claimed = true;
-                // Assign desktop window to this thread so WM_NULL sent messages
-                // have a valid dest_tid. Wine's get_window_thread reads tid/pid
-                // from SHM. With tid=0, send_message drops the message silently,
-                // blocking load_desktop_driver forever.
-                self.reassign_user_handle_owner(self.desktop_top_window, tid, pid);
-                self.reassign_user_handle_owner(self.desktop_msg_window, tid, pid);
-                // The boot process needs info_size=0 in the reply to trigger wineboot,
-                // but ALSO needs the game exe imagepath for get_startup_info later.
-                // Set startup_info now; override info_size to 0 below.
+        // First unparented process: assign desktop ownership. info_size=0
+        // triggers ntdll's build_initial_params() → run_wineboot() →
+        // virtual_init_user_shared_data(). __wineboot_event is NOT
+        // pre-signaled, so run_wineboot() creates it fresh, calls
+        // virtual_init_user_shared_data(), then spawns wineboot.exe --init.
+        // Wineboot runs with QUARK_FAST_BOOT=1 (patch 016) and finishes
+        // in milliseconds, then signals the event. This gives us proper
+        // KUSER_SHARED_DATA + fast boot without BSODs.
+        if is_unparented && !self.boot_process_claimed {
+            self.boot_process_claimed = true;
+            self.reassign_user_handle_owner(self.desktop_top_window, tid, pid);
+            self.reassign_user_handle_owner(self.desktop_msg_window, tid, pid);
+            // Store startup info for get_startup_info later, but keep info_size=0
+            // so ntdll takes the build_initial_params path.
+            if info_size == 0 {
                 if let Ok(game_exe) = std::env::var("TRISKELION_GAME_EXE") {
                     let nt_path = format!("\\??\\Z:{}", game_exe.replace('/', "\\"));
-                    // Game directory: parent of game exe
                     let game_dir = if let Some(pos) = nt_path.rfind('\\') {
                         &nt_path[..pos]
                     } else {
@@ -418,20 +412,15 @@ impl EventLoop {
                         .flat_map(|c| c.to_le_bytes()).collect();
                     let cmdline_u16: Vec<u8> = nt_path.encode_utf16()
                         .flat_map(|c| c.to_le_bytes()).collect();
-                    // startup_info_data layout (96-byte fixed header + variable strings):
-                    // offset 64: curdir_len, 68: dllpath_len, 72: imagepath_len, 76: cmdline_len
-                    // offset 96: [curdir][dllpath][imagepath][cmdline][title][desktop][shellinfo][runtime]
                     let struct_size = 96usize;
                     let total = struct_size + curdir_u16.len() + imagepath_u16.len() + cmdline_u16.len();
                     let mut si = vec![0u8; total];
                     si[64..68].copy_from_slice(&(curdir_u16.len() as u32).to_le_bytes());
-                    // dllpath_len = 0 (offset 68, already zero)
                     si[72..76].copy_from_slice(&(imagepath_u16.len() as u32).to_le_bytes());
                     si[76..80].copy_from_slice(&(cmdline_u16.len() as u32).to_le_bytes());
                     let mut off = struct_size;
                     si[off..off + curdir_u16.len()].copy_from_slice(&curdir_u16);
                     off += curdir_u16.len();
-                    // dllpath: 0 bytes (skipped)
                     si[off..off + imagepath_u16.len()].copy_from_slice(&imagepath_u16);
                     off += imagepath_u16.len();
                     si[off..off + cmdline_u16.len()].copy_from_slice(&cmdline_u16);
@@ -440,7 +429,21 @@ impl EventLoop {
                         process.startup_info = Some(si);
                     }
                 }
-                info_size = 0; // Override: wineboot trigger
+                // Keep info_size=0 — ntdll needs build_initial_params path
+                info_size = 0;
+                log_info!("boot: info_size=0 for first process (wineboot runs with QUARK_FAST_BOOT)");
+            }
+        } else if is_unparented && self.boot_process_claimed {
+            // Game process (second+ unparented): reassign desktop ownership so
+            // get_window_thread(desktop) returns a LIVE tid. The boot process
+            // (wineboot) already exited, leaving the desktop with a stale tid.
+            self.reassign_user_handle_owner(self.desktop_top_window, tid, pid);
+            self.reassign_user_handle_owner(self.desktop_msg_window, tid, pid);
+            if let Some(ws) = self.window_states.get_mut(&self.desktop_top_window) {
+                ws.tid = tid;
+            }
+            if let Some(ws) = self.window_states.get_mut(&self.desktop_msg_window) {
+                ws.tid = tid;
             }
         }
 
@@ -535,8 +538,6 @@ impl EventLoop {
             if let Some(client) = self.clients.get(&(client_fd as RawFd)) {
                 if let Some(wait_fd) = client.wait_fd {
                     for (cookie, signaled) in wakes {
-                        #[repr(C)]
-                        struct WakeUpReply { cookie: u64, signaled: i32, _pad: i32 }
                         let reply = WakeUpReply { cookie, signaled, _pad: 0 };
                         unsafe {
                             libc::write(wait_fd, &reply as *const _ as *const _, 16);
@@ -604,9 +605,16 @@ impl EventLoop {
         // Eagerly create alert event so pipe completion can signal it.
         self.get_or_create_alert(client_fd as RawFd);
 
+        // Tell ntdll whether this thread was created suspended.
+        // ntdll will call select() with context data to park itself.
+        let tid = self.client_thread_id(client_fd as RawFd).unwrap_or(0);
+        let suspended = self.state.threads.get(&tid)
+            .map(|t| t.suspend_count > 0)
+            .unwrap_or(false);
+
         let reply = InitThreadReply {
             header: ReplyHeader { error: 0, reply_size: 0 },
-            suspend: 0,
+            suspend: if suspended { 1 } else { 0 },
             _pad_0: [0; 4],
         };
         reply_fixed(&reply)
@@ -689,7 +697,12 @@ impl EventLoop {
                         .map(|c| u16::from_le_bytes([c[0], c[1]]))
                         .collect::<Vec<u16>>()
                 );
-                log_info!("get_startup_info: imagepath=\"{imagepath}\" (len={imagepath_len})");
+                // Also decode curdir
+                let curdir_str = if curdir_len > 0 && struct_size + curdir_len <= vararg.len() {
+                    let cb = &vararg[struct_size..struct_size + curdir_len];
+                    String::from_utf16_lossy(&cb.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect::<Vec<u16>>())
+                } else { String::new() };
+                log_info!("get_startup_info: imagepath=\"{imagepath}\" curdir=\"{curdir_str}\" (len={imagepath_len})");
             } else {
                 log_warn!("get_startup_info: imagepath not found (struct_size={struct_size} curdir={curdir_len} dllpath={dllpath_len} imagepath_len={imagepath_len} vararg_len={})", vararg.len());
             }
@@ -721,13 +734,12 @@ impl EventLoop {
             // or by scanning the client table for handles from new_thread.
             let target_tid = self.thread_handle_tids.get(&handle).copied()
                 .or_else(|| {
-                    // Try resolving through process handle table
+                    // Resolve through process handle table. new_thread stores
+                    // tid as object_id (thread.rs:85), so read it back here.
                     let caller_pid = self.client_pid(client_fd as RawFd);
-                    let oid = self.state.processes.get(&caller_pid)
+                    self.state.processes.get(&caller_pid)
                         .and_then(|p| p.handles.get(handle))
-                        .map(|e| e.object_id);
-                    // Search clients by thread_id matching any known thread
-                    oid.and_then(|_| None) // handle table doesn't map to tids directly yet
+                        .map(|e| e.object_id as u32)
                 });
             if let Some(target_tid) = target_tid {
                 // Find the client fd for this tid
@@ -784,8 +796,20 @@ impl EventLoop {
             .and_then(|p| p.handles.get(req.handle))
             .map(|e| e.object_id as u32);
 
+        log_info!("resume_thread: handle={:#x} caller_pid={caller_pid} target_tid={target_tid:?}", req.handle);
+
+        let mut old_count = 0i32;
+
         if let Some(ttid) = target_tid {
-            // Find the specific thread by tid, not any thread in the process
+            // Decrement suspend_count on the Thread object
+            if let Some(thread) = self.state.threads.get_mut(&ttid) {
+                old_count = thread.suspend_count;
+                if thread.suspend_count > 0 {
+                    thread.suspend_count -= 1;
+                }
+            }
+
+            // If thread is connected and blocked in select (suspend_cookie != 0), wake it
             let suspended: Option<(RawFd, i32, u64)> = self.clients.iter()
                 .find(|(_, c)| c.thread_id == ttid && c.suspend_cookie != 0)
                 .map(|(&fd, c)| (fd, c.wait_fd.unwrap_or(-1), c.suspend_cookie));
@@ -801,13 +825,19 @@ impl EventLoop {
                         client.suspend_cookie = 0;
                     }
                 }
-                // DO NOT signal alert here — non-APC wake. See send_select_wake.
+            } else if old_count > 0 {
+                // Thread hasn't called select yet — suspend_count is decremented,
+                // so init_thread/select will see it's no longer suspended.
+                log_info!("resume_thread: tid={ttid} decremented suspend_count {old_count} -> {} (not yet blocked)",
+                    old_count - 1);
             }
+        } else {
+            log_warn!("resume_thread: handle={:#x} not found in pid={caller_pid} handle table", req.handle);
         }
 
         reply_fixed(&ResumeThreadReply {
             header: ReplyHeader { error: 0, reply_size: 0 },
-            count: 1,
+            count: old_count,
             _pad_0: [0; 4],
         })
     }
@@ -880,13 +910,45 @@ impl EventLoop {
     }
 
 
-    pub(crate) fn handle_suspend_thread(&mut self, _client_fd: i32, _buf: &[u8]) -> Reply {
-        let reply = SuspendThreadReply {
-            header: ReplyHeader { error: 0, reply_size: 0 },
-            count: 0,
-            _pad_0: [0; 4],
+    pub(crate) fn handle_suspend_thread(&mut self, client_fd: i32, buf: &[u8]) -> Reply {
+        let req = if buf.len() >= std::mem::size_of::<SuspendThreadRequest>() {
+            unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const SuspendThreadRequest) }
+        } else {
+            return reply_fixed(&ReplyHeader { error: 0xC000000D, reply_size: 0 });
         };
-        reply_fixed(&reply)
+
+        // Resolve thread handle to tid
+        let caller_pid = self.client_pid(client_fd as RawFd);
+        let target_tid = self.state.processes.get(&caller_pid)
+            .and_then(|p| p.handles.get(req.handle))
+            .map(|e| e.object_id as u32)
+            .or_else(|| self.thread_handle_tids.get(&req.handle).copied());
+
+        let prev_count = if let Some(tid) = target_tid {
+            let count = self.state.threads.get(&tid)
+                .map(|t| t.suspend_count).unwrap_or(0);
+            if let Some(thread) = self.state.threads.get_mut(&tid) {
+                thread.suspend_count += 1;
+            }
+            // Send SIGUSR1 to actually suspend the thread (stock: thread.c:389)
+            // Wine's SIGUSR1 handler calls wait_suspend -> server_select(INTERRUPTIBLE)
+            if count == 0 {
+                if let Some(client) = self.clients.values().find(|c| c.thread_id == tid) {
+                    let unix_pid = client.unix_pid;
+                    let unix_tid = client.unix_tid;
+                    if unix_pid > 0 && unix_tid > 0 {
+                        unsafe { libc::syscall(libc::SYS_tgkill, unix_pid, unix_tid, libc::SIGUSR1); }
+                    }
+                }
+            }
+            count
+        } else { 0 };
+
+        reply_fixed(&SuspendThreadReply {
+            header: ReplyHeader { error: 0, reply_size: 0 },
+            count: prev_count as i32,
+            _pad_0: [0; 4],
+        })
     }
 
     pub(crate) fn handle_get_next_thread(&mut self, client_fd: i32, buf: &[u8]) -> Reply {
@@ -929,10 +991,12 @@ impl EventLoop {
 
         match next_tid {
             Some(tid) => {
-                // Allocate a handle for this thread in the caller's process
-                let oid = self.state.alloc_object_id();
+                // Allocate a handle for this thread in the caller's process.
+                // Store tid as object_id so get_thread_info can resolve the
+                // handle back to the correct thread (for TEB lookup in
+                // alloc_tls_slot's NtQueryInformationThread calls).
                 let handle = if let Some(proc) = self.state.processes.get_mut(&caller_pid) {
-                    proc.handles.allocate(oid)
+                    proc.handles.allocate(tid as u64)
                 } else { 0 };
 
                 if handle == 0 {

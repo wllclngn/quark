@@ -10,15 +10,18 @@ Runs as user. Only montauk needs sudo (for BPF) -- prompted automatically.
 Stock phase launches through Proton 10.0 (not bare wine).
 
 Usage:
-    python3 tests/montauk_compare.py                # Both runs, 30s each
-    python3 tests/montauk_compare.py --stock-only   # Stock Proton only
-    python3 tests/montauk_compare.py --amph-only    # Quark only
-    python3 tests/montauk_compare.py --timeout 45   # Longer capture
-    python3 tests/montauk_compare.py --appid 2320   # Different game
+    python3 tests/montauk_compare.py                    # Both runs, 30s each
+    python3 tests/montauk_compare.py --stock-only       # Stock Proton only
+    python3 tests/montauk_compare.py --quark-only        # Quark only
+    python3 tests/montauk_compare.py --timeout 45       # Longer capture
+    python3 tests/montauk_compare.py --appid 2320       # Different game
+    python3 tests/montauk_compare.py --all              # ALL games, quark-only, Prometheus output
+    python3 tests/montauk_compare.py --all --timeout 30 # ALL games, 30s each
 """
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import time
@@ -29,6 +32,59 @@ from datetime import datetime
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from util import (kill_quark_processes, get_game_exe, STEAM_ROOT, _USER_HOME)
+
+
+# Non-game filters for --all mode
+
+_NON_GAME_NAMES = {
+    "steam linux runtime", "proton", "steamworks common redistributables",
+    "proton easyanticheat runtime", "proton hotfix", "proton experimental",
+}
+
+_NON_GAME_APPIDS = {
+    "228980", "1070560", "1391110", "1493710", "1628350",
+    "1826330", "2180100", "2348590", "2805730", "3658110",
+    "1580130", "1887720",
+}
+
+
+def discover_all_games() -> list[tuple[str, str]]:
+    """Find all playable Steam games. Returns [(appid, name), ...] sorted by name."""
+    steamapps = STEAM_ROOT / "steamapps"
+    games: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    for manifest in sorted(steamapps.glob("appmanifest_*.acf")):
+        try:
+            text = manifest.read_text(errors="replace")
+        except OSError:
+            continue
+        info: dict[str, str] = {}
+        for key in ("appid", "name", "installdir"):
+            m = re.search(rf'"{key}"\s+"([^"]+)"', text)
+            if m:
+                info[key] = m.group(1)
+
+        appid = info.get("appid", "")
+        name = info.get("name", "")
+        installdir = info.get("installdir", "")
+        if not appid or not name or not installdir:
+            continue
+        if appid in seen or appid in _NON_GAME_APPIDS:
+            continue
+        if any(skip in name.lower() for skip in _NON_GAME_NAMES):
+            continue
+        install_path = steamapps / "common" / installdir
+        if not install_path.exists():
+            continue
+        exe = get_game_exe(appid)
+        if not exe:
+            continue
+        seen.add(appid)
+        games.append((appid, name))
+
+    games.sort(key=lambda g: g[1])
+    return games
 
 def _timestamp() -> str:
     return datetime.now().strftime("[%H:%M:%S]")
@@ -412,12 +468,12 @@ def run_quark(timeout, appid, trace_pattern):
     log_info(f"quark [{trace_pattern}]")
 
     kill_all()
-    log_dir = OUT_DIR / "amph_logs"
+    log_dir = OUT_DIR / "quark_logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     for f in log_dir.glob("*.prom"):
         f.unlink()
 
-    stderr_log = OUT_DIR / "amph_montauk_stderr.txt"
+    stderr_log = OUT_DIR / "quark_montauk_stderr.txt"
 
     montauk_cmd = ["sudo", "montauk",
                    "--trace", trace_pattern,
@@ -614,63 +670,63 @@ def print_fd_table(label, fd_map):
                 count += 1
 
 
-def diff_traces(stock_dir, amph_dir):
+def diff_traces(stock_dir, quark_dir):
     """Full structured comparison between stock and quark traces."""
     log_info("comparison: stock wine vs quark")
 
     stock_snaps = load_trace(stock_dir)
-    amph_snaps = load_trace(amph_dir)
+    quark_snaps = load_trace(quark_dir)
 
-    log_info(f"stock: {len(stock_snaps)} snapshots, quark: {len(amph_snaps)} snapshots")
+    log_info(f"stock: {len(stock_snaps)} snapshots, quark: {len(quark_snaps)} snapshots")
 
     # Process names
     stock_procs = process_names(stock_snaps)
-    amph_procs = process_names(amph_snaps)
+    quark_procs = process_names(quark_snaps)
 
     log_info("process names")
-    print(f"  stock only:       {sorted(stock_procs - amph_procs) or '(none)'}")
-    print(f"  quark only: {sorted(amph_procs - stock_procs) or '(none)'}")
-    print(f"  both:             {sorted(stock_procs & amph_procs) or '(none)'}")
+    print(f"  stock only:       {sorted(stock_procs - quark_procs) or '(none)'}")
+    print(f"  quark only: {sorted(quark_procs - stock_procs) or '(none)'}")
+    print(f"  both:             {sorted(stock_procs & quark_procs) or '(none)'}")
 
     # Thread state
     stock_threads = thread_state_summary(stock_snaps)
-    amph_threads = thread_state_summary(amph_snaps)
+    quark_threads = thread_state_summary(quark_snaps)
     print_thread_table("Stock Wine", stock_threads)
-    print_thread_table("Quark", amph_threads)
+    print_thread_table("Quark", quark_threads)
 
     # Thread differences
     stock_comms = set(stock_threads.keys())
-    amph_comms = set(amph_threads.keys())
+    quark_comms = set(quark_threads.keys())
     log_info("thread differences")
-    print(f"  stock only:       {sorted(stock_comms - amph_comms) or '(none)'}")
-    print(f"  quark only: {sorted(amph_comms - stock_comms) or '(none)'}")
+    print(f"  stock only:       {sorted(stock_comms - quark_comms) or '(none)'}")
+    print(f"  quark only: {sorted(quark_comms - stock_comms) or '(none)'}")
 
     # I/O comparison
     stock_io = io_summary(stock_snaps)
-    amph_io = io_summary(amph_snaps)
+    quark_io = io_summary(quark_snaps)
     print_io_table("Stock Wine", stock_io)
-    print_io_table("Quark", amph_io)
+    print_io_table("Quark", quark_io)
 
     # I/O differences: comms that do I/O in one but not the other
     stock_io_comms = set(stock_io.keys())
-    amph_io_comms = set(amph_io.keys())
-    if stock_io_comms != amph_io_comms:
+    quark_io_comms = set(quark_io.keys())
+    if stock_io_comms != quark_io_comms:
         log_info("i/o thread differences")
-        diff_stock = stock_io_comms - amph_io_comms
-        diff_amph = amph_io_comms - stock_io_comms
+        diff_stock = stock_io_comms - quark_io_comms
+        diff_quark = quark_io_comms - stock_io_comms
         if diff_stock:
             print(f"  i/o in stock only:       {sorted(diff_stock)}")
-        if diff_amph:
-            print(f"  i/o in quark only: {sorted(diff_amph)}")
+        if diff_quark:
+            print(f"  i/o in quark only: {sorted(diff_quark)}")
 
     # FD tables
     stock_fds = fd_summary(stock_snaps)
-    amph_fds = fd_summary(amph_snaps)
+    quark_fds = fd_summary(quark_snaps)
     print_fd_table("Stock Wine", stock_fds)
-    print_fd_table("Quark", amph_fds)
+    print_fd_table("Quark", quark_fds)
 
     # Peak snapshot (most threads)
-    for label, snaps in [("Stock Wine", stock_snaps), ("Quark", amph_snaps)]:
+    for label, snaps in [("Stock Wine", stock_snaps), ("Quark", quark_snaps)]:
         if snaps:
             peak = max(snaps, key=lambda s: len(s.threads))
             log_info(f"peak snapshot: {label} ({len(peak.threads)} threads, "
@@ -692,11 +748,161 @@ def print_single(label, log_dir):
     print_fd_table(label, fds)
 
 
+def run_all_games(timeout, prom_path):
+    """Run quark trace for ALL installed games and write Prometheus output."""
+    games = discover_all_games()
+    if not games:
+        log_error("no playable games found")
+        return
+
+    log_info(f"found {len(games)} games to trace")
+    for appid, name in games:
+        log_info(f"  {appid:>8}  {name}")
+    print()
+
+    all_results: list[dict] = []
+    ts = int(time.time() * 1000)
+
+    for i, (appid, name) in enumerate(games, 1):
+        print()
+        log_info(f"GAME {i}/{len(games)}: {name} ({appid})")
+
+        kill_all()
+        kill_stale_wineserver(appid)
+
+        game_dir = OUT_DIR / f"all_{appid}"
+        game_dir.mkdir(parents=True, exist_ok=True)
+
+        quark_dir = run_quark(timeout, appid, "wine")
+        snaps = load_trace(quark_dir)
+
+        # Collect results
+        result = {
+            "appid": appid, "name": name,
+            "snapshots": len(snaps),
+            "peak_threads": max((len(s.threads) for s in snaps), default=0),
+            "peak_procs": max((len(s.procs) for s in snaps), default=0),
+            "total_io": sum(len(s.io_events) for s in snaps),
+            "comms": set(),
+            "syscalls": Counter(),
+        }
+        for snap in snaps:
+            for th in snap.threads:
+                result["comms"].add(th["comm"])
+            for sc in snap.syscalls:
+                result["syscalls"][sc["syscall"]] += 1
+        all_results.append(result)
+
+        # Per-game .prom in game_dir
+        _write_game_prom(game_dir / f"{appid}.prom", result, snaps, ts)
+
+        log_info(f"  {len(snaps)} snapshots, peak {result['peak_threads']} threads, "
+                 f"{result['total_io']} I/O events")
+
+        # Also read iterate.py opcode stats if available
+        opcode_stats = Path("/tmp/quark/triskelion_opcode_stats.txt")
+        if opcode_stats.exists():
+            import shutil
+            shutil.copy2(opcode_stats, game_dir / "opcode_stats.txt")
+
+        daemon_log = Path("/tmp/quark/daemon.log")
+        if daemon_log.exists():
+            import shutil
+            shutil.copy2(daemon_log, game_dir / "daemon.log")
+
+    # Write combined Prometheus output
+    _write_combined_prom(prom_path, all_results, ts)
+
+    # Summary table
+    print()
+    
+    print("  quark montauk diagnostic — all games")
+    
+    print(f"  {'Game':<35} {'Snaps':>6} {'Threads':>8} {'Procs':>6} {'I/O':>7} {'Comms'}")
+    
+    for r in all_results:
+        name = r["name"][:33] + ".." if len(r["name"]) > 35 else r["name"]
+        comms = ", ".join(sorted(r["comms"])[:5])
+        if len(r["comms"]) > 5:
+            comms += f" +{len(r['comms']) - 5}"
+        print(f"  {name:<35} {r['snapshots']:>6} {r['peak_threads']:>8} "
+              f"{r['peak_procs']:>6} {r['total_io']:>7} {comms}")
+    
+    print(f"  {len(all_results)} games | Prometheus: {prom_path}")
+    
+    print()
+
+
+def _escape_prom(s: str) -> str:
+    return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def _write_game_prom(path, result, snaps, ts):
+    """Write per-game Prometheus metrics."""
+    lines = []
+    appid = result["appid"]
+    name = _escape_prom(result["name"])
+
+    lines.append(f'# game: {result["name"]} ({appid})')
+    lines.append(f'quark_trace_snapshots{{appid="{appid}",game="{name}"}} {result["snapshots"]} {ts}')
+    lines.append(f'quark_trace_peak_threads{{appid="{appid}",game="{name}"}} {result["peak_threads"]} {ts}')
+    lines.append(f'quark_trace_peak_procs{{appid="{appid}",game="{name}"}} {result["peak_procs"]} {ts}')
+    lines.append(f'quark_trace_io_events{{appid="{appid}",game="{name}"}} {result["total_io"]} {ts}')
+
+    for syscall, count in result["syscalls"].most_common(20):
+        lines.append(f'quark_trace_syscall{{appid="{appid}",game="{name}",syscall="{syscall}"}} {count} {ts}')
+
+    path.write_text("\n".join(lines) + "\n")
+
+
+def _write_combined_prom(path, all_results, ts):
+    """Write combined Prometheus metrics for all games."""
+    lines = []
+    lines.append("# HELP quark_trace_snapshots Montauk trace snapshots captured")
+    lines.append("# TYPE quark_trace_snapshots gauge")
+    for r in all_results:
+        name = _escape_prom(r["name"])
+        lines.append(f'quark_trace_snapshots{{appid="{r["appid"]}",game="{name}"}} {r["snapshots"]} {ts}')
+
+    lines.append("")
+    lines.append("# HELP quark_trace_peak_threads Peak thread count observed")
+    lines.append("# TYPE quark_trace_peak_threads gauge")
+    for r in all_results:
+        name = _escape_prom(r["name"])
+        lines.append(f'quark_trace_peak_threads{{appid="{r["appid"]}",game="{name}"}} {r["peak_threads"]} {ts}')
+
+    lines.append("")
+    lines.append("# HELP quark_trace_peak_procs Peak process count observed")
+    lines.append("# TYPE quark_trace_peak_procs gauge")
+    for r in all_results:
+        name = _escape_prom(r["name"])
+        lines.append(f'quark_trace_peak_procs{{appid="{r["appid"]}",game="{name}"}} {r["peak_procs"]} {ts}')
+
+    lines.append("")
+    lines.append("# HELP quark_trace_io_events Total I/O events captured")
+    lines.append("# TYPE quark_trace_io_events gauge")
+    for r in all_results:
+        name = _escape_prom(r["name"])
+        lines.append(f'quark_trace_io_events{{appid="{r["appid"]}",game="{name}"}} {r["total_io"]} {ts}')
+
+    lines.append("")
+    lines.append("# HELP quark_trace_syscall Per-game syscall counts")
+    lines.append("# TYPE quark_trace_syscall gauge")
+    for r in all_results:
+        name = _escape_prom(r["name"])
+        for syscall, count in r["syscalls"].most_common(20):
+            lines.append(f'quark_trace_syscall{{appid="{r["appid"]}",game="{name}",syscall="{syscall}"}} {count} {ts}')
+
+    path.write_text("\n".join(lines) + "\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description="montauk eBPF trace comparison (v5.2.0)")
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--stock-only", action="store_true")
-    parser.add_argument("--amph-only", action="store_true")
+    parser.add_argument("--quark-only", action="store_true")
+    parser.add_argument("--all", action="store_true",
+                        help="Trace ALL installed games (quark only, Prometheus output)")
     parser.add_argument("--appid", default="2379780", help="Steam app ID (default: Balatro)")
     parser.add_argument("--pattern", default=None,
                         help="montauk --trace pattern (default: auto from appid)")
@@ -706,57 +912,52 @@ def main():
         log_error("montauk not found in PATH")
         sys.exit(1)
 
-    # Pre-authenticate sudo so montauk launches don't block on password.
-    # sudo -v validates credentials and extends the ticket.
     log_info("authenticating sudo (needed for montauk eBPF)")
     if subprocess.run(["sudo", "-v"]).returncode != 0:
         log_error("sudo authentication failed")
         sys.exit(1)
 
-    # Auto-detect trace pattern from game exe name if not specified
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # --all mode: trace every game, quark only, Prometheus output
+    if args.all:
+        prom_path = OUT_DIR / f"quark_all_{datetime.now().strftime('%Y%m%d_%H%M%S')}.prom"
+        run_all_games(args.timeout, prom_path)
+        return
+
+    # Single-game mode (original behavior)
     trace_pattern = args.pattern
     if not trace_pattern:
-        # For stock: trace "wineserver", for quark: trace "triskelion"
-        # Use a broad pattern that catches both wine process trees
         game_exe = get_game_exe(args.appid)
         if game_exe:
             trace_pattern = game_exe.stem.lower()
         else:
             trace_pattern = "wine"
 
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Kill zombies from previous runs before starting
     kill_all()
     kill_stale_wineserver(args.appid)
 
     stock_dir = None
-    amph_dir = None
+    quark_dir = None
 
-    if not args.amph_only:
-        # Stock Proton: trace "wine" to catch the full process tree
-        # (wineserver, wine-preloader, wine64, all .exe clients).
-        # Phases run sequentially so "wine" won't cross-match quark.
+    if not args.quark_only:
         stock_dir = run_stock_wine(args.timeout, args.appid, "wine")
 
     if not args.stock_only:
-        # Quark: trace "wine" to catch wineserver (daemon), wine-preloader
-        # (client loader), and all Wine threads (wine_rpcrt4_ser, etc.).
-        # BPF matches exec path AND comm — "wine" covers the full process group.
-        amph_dir = run_quark(args.timeout, args.appid, "wine")
+        quark_dir = run_quark(args.timeout, args.appid, "wine")
 
-    if stock_dir and amph_dir:
-        diff_traces(stock_dir, amph_dir)
+    if stock_dir and quark_dir:
+        diff_traces(stock_dir, quark_dir)
     elif stock_dir:
         print_single("Stock Wine", stock_dir)
-    elif amph_dir:
-        print_single("Quark", amph_dir)
+    elif quark_dir:
+        print_single("Quark", quark_dir)
 
     log_info("files:")
     if stock_dir:
         print(f"  stock logs:  {stock_dir}")
-    if amph_dir:
-        print(f"  amph logs:   {amph_dir}")
+    if quark_dir:
+        print(f"  amph logs:   {quark_dir}")
     print(f"  output dir:  {OUT_DIR}")
 
 

@@ -282,6 +282,13 @@ pub fn run(verb: &str, args: &[String]) -> i32 {
         let mut cmd = Command::new(&wine64);
         cmd.arg(game_exe);
         cmd.args(&args[1..]);
+        // Set working directory to game's parent folder. Games like Balatro
+        // (LOVE2D) resolve their own exe and data files relative to cwd.
+        if let Some(game_dir) = Path::new(game_exe).parent() {
+            if game_dir.exists() {
+                cmd.current_dir(game_dir);
+            }
+        }
         for (k, v) in &env_vars {
             cmd.env(k, v);
         }
@@ -1051,6 +1058,10 @@ fn build_env_vars(
         ("WINELOADER", wine64.display().to_string()),
         ("WINEDLLPATH", dll_path),
         ("PATH", format!("{}:{}", wine_bin.display(), cur_path)),
+        // WINEDLLDIR0: our patched libs take priority over system Wine's compiled-in path.
+        // Without this, Wine loads /usr/lib/wine/x86_64-unix/win32u.so (unpatched) instead
+        // of our patched version with NULL shared object guards.
+        ("WINEDLLDIR0", quark_wine_lib.as_ref().map(|p| p.join("wine").display().to_string()).unwrap_or_default()),
         ("LD_LIBRARY_PATH", ld_path),
         ("WINEDEBUG", std::env::var("WINEDEBUG").unwrap_or_else(|_| if trace { "+server,+timestamp".into() } else { "+module,+server".into() })),
         ("WINEDLLOVERRIDES", dll_overrides),

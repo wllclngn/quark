@@ -11,7 +11,7 @@ use rustc_hash::FxHashMap;
 // Windows registry is case-insensitive for lookup but preserves original case.
 // We store original case for enumeration, and use lowercased form for Hash/Eq.
 #[derive(Clone)]
-struct RegName {
+pub(crate) struct RegName {
     original: String, // preserved case (for NtEnumerateKey)
     lower: String,    // lowercase (for case-insensitive matching)
 }
@@ -67,6 +67,14 @@ struct RegistryValue {
     data: Vec<u8>,
 }
 
+pub(crate) struct RegNotify {
+    pub(crate) path: Vec<RegName>,
+    pub(crate) pid: u32,
+    pub(crate) event_handle: u32,
+    pub(crate) subtree: bool,
+    pub(crate) filter: u32,
+}
+
 pub struct Registry {
     // Root keys: HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER, etc.
     // Wine uses path strings like "\Registry\Machine\..." — we store the root node.
@@ -79,6 +87,8 @@ pub struct Registry {
     write_seq: u64,
     // User SID for HKCU paths, stored for apply_display_driver reuse.
     user_sid: String,
+    // Registry change notifications: one-shot, fired then removed.
+    notify_list: Vec<RegNotify>,
 }
 
 impl Registry {
@@ -89,6 +99,7 @@ impl Registry {
             next_hkey: 1,
             write_seq: 1,
             user_sid: user_sid.to_string(),
+            notify_list: Vec::new(),
         };
         // Create symlinks FIRST so .reg loader can resolve CurrentControlSet → ControlSet001
         reg.init_runtime_keys(user_sid);
@@ -394,6 +405,29 @@ impl Registry {
             }
         }
 
+        // COM class registrations: 589 entries extracted from Proton 10.0's default_pfx.
+        // QUARK_FAST_BOOT skips wineboot's FakeDlls pass, so we inject all CLSIDs here.
+        let com_classes = crate::com_classes::COM_CLASSES;
+        let clsid_base = "Registry\\Machine\\Software\\Classes\\CLSID";
+        for (clsid, dll_path, threading) in com_classes {
+            let key_path = format!("{clsid_base}\\{clsid}\\InprocServer32");
+            let segments: Vec<RegName> = key_path.split('\\')
+                .filter(|s| !s.is_empty())
+                .map(|s| RegName::new(s))
+                .collect();
+            let node = self.walk_mut_create(&segments);
+            let default_name = RegName::new("");
+            if !node.values.contains_key(&default_name) {
+                node.value_names.push(default_name.clone());
+            }
+            node.values.insert(default_name, reg_sz(dll_path));
+            let tm_name = RegName::new("ThreadingModel");
+            if !node.values.contains_key(&tm_name) {
+                node.value_names.push(tm_name.clone());
+            }
+            node.values.insert(tm_name, reg_sz(threading));
+        }
+
         log_info!("registry: initialized runtime keys (SID: {user_sid})");
     }
 
@@ -568,24 +602,6 @@ impl Registry {
         node.values.get(&vname).map(|v| (v.data_type, v.data.as_slice()))
     }
 
-    /// Look up a value by full key path + value name (no hkey needed).
-    pub fn _get_value_by_path(&self, key_path: &[u8], value_name: &[u8]) -> Option<Vec<u8>> {
-        let segments = Self::path_to_segments(key_path);
-        let node = self.walk(&segments)?;
-        let vname = RegName::from_utf16le(value_name);
-        node.values.get(&vname).map(|v| v.data.clone())
-    }
-
-    #[allow(dead_code)]
-    fn path_to_segments(path: &[u8]) -> Vec<RegName> {
-        let s = String::from_utf8_lossy(&path.chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .take_while(|&c| c != 0)
-            .flat_map(|c| std::char::from_u32(c as u32))
-            .collect::<String>().into_bytes()).to_string();
-        s.split('\\').filter(|p| !p.is_empty()).map(|p| RegName::new(p)).collect()
-    }
-
     /// Monotonic write counter for LastWriteTime in NtQueryKey.
     pub fn write_counter(&self) -> u64 { self.write_seq }
 
@@ -715,6 +731,50 @@ impl Registry {
         self.open_keys.get(&hkey).map(|p| {
             p.iter().map(|s| s.original.as_str()).collect::<Vec<_>>().join("\\")
         })
+    }
+
+    // Register a change notification. Returns true if the hkey is valid.
+    pub fn register_notify(&mut self, hkey: u32, pid: u32, event_handle: u32, subtree: bool, filter: u32) -> bool {
+        if let Some(path) = self.open_keys.get(&hkey) {
+            self.notify_list.push(RegNotify {
+                path: path.clone(), pid, event_handle, subtree, filter,
+            });
+            true
+        } else {
+            false
+        }
+    }
+
+    // Remove all pending notifications for a dead process.
+    pub fn remove_notifications_for_pid(&mut self, pid: u32) {
+        self.notify_list.retain(|n| n.pid != pid);
+    }
+
+    // Collect notifications that match a mutation at changed_hkey with the given
+    // change type (REG_NOTIFY_CHANGE_NAME=0x01, REG_NOTIFY_CHANGE_LAST_SET=0x04).
+    // Returns (pid, event_handle) pairs. Removes fired entries (one-shot).
+    pub fn collect_notifications(&mut self, changed_hkey: u32, change: u32) -> Vec<(u32, u32)> {
+        let changed_path = match self.open_keys.get(&changed_hkey) {
+            Some(p) => p.clone(),
+            None => return Vec::new(),
+        };
+        let mut fired = Vec::new();
+        self.notify_list.retain(|n| {
+            let matches = if n.path == changed_path {
+                (n.filter & change) != 0
+            } else if n.subtree && changed_path.starts_with(&n.path) {
+                (n.filter & change) != 0
+            } else {
+                false
+            };
+            if matches {
+                fired.push((n.pid, n.event_handle));
+                false
+            } else {
+                true
+            }
+        });
+        fired
     }
 
     /// Load prefix .reg files into the in-memory registry.
@@ -1196,7 +1256,7 @@ impl Registry {
         video_node.values.insert(gfx_drv_name, RegistryValue { data_type: 1, data: gfx_drv_val });
     }
 
-    pub fn apply_display_registry(&mut self, dd: &crate::parallax_display::DisplayData) {
+    pub fn apply_display_registry(&mut self, dd: &crate::display::DisplayData) {
         let gpu = &dd.gpu;
         let guid = dd.gpu_guid();
 
@@ -1246,32 +1306,30 @@ impl Registry {
             set_reg_dword(source_node, "DefaultSettings.VRefresh", conn.current_refresh);
             set_reg_dword(source_node, "DefaultSettings.Flags", 0);
             let state_flags: u32 = if i == 0 { 0x5 } else { 0x1 };
-            set_reg_dword(source_node, "StateFlags", state_flags);
-            set_reg_dword(source_node, "Dpi", 96);
-            set_reg_dword(source_node, "Depth", 32);
 
             // DEVMODEW mode array — Wine's NtUserEnumDisplaySettings reads from here
             let modes_data: Vec<u8> = conn.modes.iter()
                 .map(|m| build_devmodew(m.width, m.height, m.refresh, 32))
                 .flat_map(|dm| dm.to_vec())
                 .collect();
-            set_reg_dword(source_node, "ModeCount", conn.modes.len() as u32);
-            set_reg_binary(source_node, "Modes", modes_data);
-
-            // Current/Registry mode (116 bytes: dmFields through end of DEVMODEW)
             let current_dm = build_devmodew(conn.current_width, conn.current_height, conn.current_refresh, 32);
-            let mode_tail = current_dm[0x48..].to_vec(); // 116 bytes from dmFields
-            set_reg_binary(source_node, "Current", mode_tail.clone());
-            set_reg_binary(source_node, "Registry", mode_tail);
-
-            // GPUID — Wine uses this to look up the GPU device path
+            let mode_tail = current_dm[0x48..].to_vec();
             let gpu_path = format!(
                 "\\Registry\\Machine\\System\\CurrentControlSet\\Enum\\PCI\\VEN_{:04X}&DEV_{:04X}&SUBSYS_{:04X}{:04X}&REV_{:02X}\\0000",
                 dd.gpu.pci_vendor, dd.gpu.pci_device,
                 dd.gpu.pci_subsys_device, dd.gpu.pci_subsys_vendor,
                 dd.gpu.pci_revision
             );
+
+            // Write mode data to source node
+            set_reg_dword(source_node, "ModeCount", conn.modes.len() as u32);
+            set_reg_binary(source_node, "Modes", modes_data.clone());
+            set_reg_binary(source_node, "Current", mode_tail.clone());
+            set_reg_binary(source_node, "Registry", mode_tail.clone());
             set_reg_sz(source_node, "GPUID", &gpu_path);
+            set_reg_dword(source_node, "StateFlags", state_flags);
+            set_reg_dword(source_node, "Dpi", 96);
+            set_reg_dword(source_node, "Depth", 32);
 
             // Write same data to Hardware Profiles\Current path (Wine reads via config_key)
             let hp_source_path = format!(
@@ -1281,24 +1339,18 @@ impl Registry {
             let hp_segs: Vec<RegName> = hp_source_path.split('\\')
                 .filter(|s| !s.is_empty()).map(|s| RegName::new(s)).collect();
             let hp_node = self.walk_mut_create(&hp_segs);
+            set_reg_dword(hp_node, "ModeCount", conn.modes.len() as u32);
+            set_reg_binary(hp_node, "Modes", modes_data);
+            set_reg_binary(hp_node, "Current", mode_tail.clone());
+            set_reg_binary(hp_node, "Registry", mode_tail);
+            set_reg_sz(hp_node, "GPUID", &gpu_path);
             set_reg_dword(hp_node, "StateFlags", state_flags);
             set_reg_dword(hp_node, "Dpi", 96);
             set_reg_dword(hp_node, "Depth", 32);
-            let modes_data2: Vec<u8> = conn.modes.iter()
-                .map(|m| build_devmodew(m.width, m.height, m.refresh, 32))
-                .flat_map(|dm| dm.to_vec())
-                .collect();
-            set_reg_dword(hp_node, "ModeCount", conn.modes.len() as u32);
-            set_reg_binary(hp_node, "Modes", modes_data2);
-            let current_dm2 = build_devmodew(conn.current_width, conn.current_height, conn.current_refresh, 32);
-            let mode_tail2 = current_dm2[0x48..].to_vec();
-            set_reg_binary(hp_node, "Current", mode_tail2.clone());
-            set_reg_binary(hp_node, "Registry", mode_tail2);
-            set_reg_sz(hp_node, "GPUID", &gpu_path);
 
             // Monitor with EDID
-            let mfr = crate::parallax_display::DisplayData::edid_manufacturer(&conn.edid);
-            let prod = crate::parallax_display::DisplayData::edid_product(&conn.edid);
+            let mfr = crate::display::DisplayData::edid_manufacturer(&conn.edid);
+            let prod = crate::display::DisplayData::edid_product(&conn.edid);
             let mon_path = format!(
                 "Registry\\Machine\\System\\ControlSet001\\Enum\\DISPLAY\\{}\\{:04X}&{:04X}",
                 mfr, prod, i

@@ -97,12 +97,6 @@ impl DeployPlan {
 
         let is_nvidia = std::path::Path::new("/proc/driver/nvidia/version").exists();
 
-        // Check imports directly (handles multi-API games correctly)
-        let _has_any_d3d = scan.imports.iter().any(|s|
-            s == "d3d11.dll" || s == "d3d10core.dll" || s == "d3d10.dll" ||
-            s == "d3d9.dll" || s == "d3d8.dll" || s == "dxgi.dll" ||
-            s == "d3d12.dll" || s == "d3d12core.dll"
-        );
         // Always deploy both DXVK and VKD3D-Proton. Many games discover D3D12
         // at runtime via DXGI (no direct d3d12.dll import), and launcher stubs
         // often have zero D3D imports. The translation layers are harmless when
@@ -312,9 +306,17 @@ pub fn run(verb: &str, args: &[String]) -> i32 {
     // The daemon loads .reg files once at startup — keys must be present by then.
     inject_registry_keys(&pfx);
 
+    // Deploy steam.exe and lsteamclient.dll BEFORE wineboot runs.
+    // Wineboot's entry command is steam.exe — it must exist in system32 first.
+    deploy_steam_exe(&self_exe, &pfx);
+    deploy_lsteamclient_to_prefix(&self_exe, &pfx);
+
     if !wine_valid {
         setup_prefix(&wine_dir, &pfx, &wine64, &self_exe);
     }
+    // Re-deploy after setup_prefix (wineboot may overwrite system32)
+    deploy_steam_exe(&self_exe, &pfx);
+    deploy_lsteamclient_to_prefix(&self_exe, &pfx);
 
     // Always ensure user profile directories exist — cheap no-op if already present.
     // Must be unconditional: setup_prefix is gated by cache but games always need these.
@@ -404,6 +406,9 @@ pub fn run(verb: &str, args: &[String]) -> i32 {
     repair_steamclient64(&pfx);
     // Ensure our steam_bridge exists in prefix system32 (overwrites Proton's).
     deploy_steam_exe(&self_exe, &pfx);
+    // lsteamclient.dll must exist in system32 so build_module's LdrLoadDll can find it.
+    // Without this, the steamclient trampoline (patch 009) never activates.
+    deploy_lsteamclient_to_prefix(&self_exe, &pfx);
     let t_steam = t4.elapsed();
 
     // Registry keys already injected before wineboot (daemon loads them at startup)
@@ -428,7 +433,7 @@ pub fn run(verb: &str, args: &[String]) -> i32 {
     let env_vars = build_env_vars(
         &wine_dir, proton_dir.as_deref(), &steam_dir, &pfx, &self_exe,
         &dxvk_deployed, &vkd3d_deployed, &nvapi_deployed, &dlss_deployed,
-        trace, shader_cache_enabled,
+        shader_cache_enabled,
     );
     let custom_env = parse_env_config(&self_exe);
 
@@ -454,13 +459,6 @@ pub fn run(verb: &str, args: &[String]) -> i32 {
             t_discover.as_millis(), t_prefix.as_millis(),
             t_dxvk.as_millis(), t_steam.as_millis(), t_total_setup.as_millis());
 
-        let _game_exe = if verb == "waitforexitandrun" || verb == "run" {
-            args.first().map(|s| s.as_str())
-        } else {
-            None
-        };
-
-        // Prometheus generation removed — montauk handles tracing now.
     }
 
     // Phase 5b: Sync prefix with env config (display driver changes etc.)
@@ -568,7 +566,7 @@ pub fn run(verb: &str, args: &[String]) -> i32 {
         // 4. Spawns the game as a child via CreateProcess()
         // Without this, SteamAPI_IsSteamRunning() fails.
 
-        let mut cmd = Command::new(&wine64);
+        let mut cmd = build_wine_command(&wine64, &wine_dir);
         cmd.arg("C:\\windows\\system32\\steam.exe");
         cmd.arg(game_exe);
         cmd.args(&args[1..]);
@@ -584,6 +582,10 @@ pub fn run(verb: &str, args: &[String]) -> i32 {
         cmd.env("WINEPREFIX", &pfx);
         cmd.env("WINESERVER", triskelion_exe());
         cmd.env("WINE_NTSYNC", "1");
+        // Hint game exe size to triskelion for adaptive linger timer
+        if let Ok(meta) = std::fs::metadata(game_path) {
+            cmd.env("QUARK_LINGER_HINT", meta.len().to_string());
+        }
         let steam_app_id = std::env::var("SteamGameId")
             .or_else(|_| std::env::var("SteamAppId"))
             .or_else(|_| std::env::var("STEAM_COMPAT_APP_ID"))
@@ -601,6 +603,39 @@ pub fn run(verb: &str, args: &[String]) -> i32 {
             libc::signal(libc::SIGTERM, libc::SIG_IGN);
         }
         cmd.env("WINEDEBUG", &winedebug);
+
+        // WINEDLLPATH: quark-specific modules (lsteamclient.so, steam.exe) live
+        // in our tree, not system Wine. Without this, LoadLibraryW("lsteamclient")
+        // creates an empty stub and Steam auth fails.
+        {
+            let quark_unix = wine_dir.join("lib/wine/x86_64-unix");
+            let quark_win = wine_dir.join("lib/wine/x86_64-windows");
+            let sys_unix = Path::new("/usr/lib/wine/x86_64-unix");
+            let sys_win = Path::new("/usr/lib/wine/x86_64-windows");
+            let mut dll_parts: Vec<String> = Vec::new();
+            if quark_unix.exists() { dll_parts.push(quark_unix.display().to_string()); }
+            if quark_win.exists() { dll_parts.push(quark_win.display().to_string()); }
+            if sys_unix.exists() { dll_parts.push(sys_unix.display().to_string()); }
+            if sys_win.exists() { dll_parts.push(sys_win.display().to_string()); }
+            if !dll_parts.is_empty() {
+                cmd.env("WINEDLLPATH", dll_parts.join(":"));
+            }
+        }
+
+        // LD_LIBRARY_PATH: Wine .so modules need ntdll.so via NEEDED
+        {
+            let unix_dir = wine_dir.join("lib/wine/x86_64-unix");
+            let lib_dir = wine_dir.join("lib");
+            let mut ld_parts: Vec<String> = Vec::new();
+            if unix_dir.exists() { ld_parts.push(unix_dir.display().to_string()); }
+            if lib_dir.exists() { ld_parts.push(lib_dir.display().to_string()); }
+            if let Ok(existing) = std::env::var("LD_LIBRARY_PATH") {
+                ld_parts.push(existing);
+            }
+            if !ld_parts.is_empty() {
+                cmd.env("LD_LIBRARY_PATH", ld_parts.join(":"));
+            }
+        }
 
         // Strip Steam overlay from LD_PRELOAD — it hooks SDL/GL calls and
         // crashes before the Wayland surface is configured.
@@ -642,11 +677,14 @@ pub fn run(verb: &str, args: &[String]) -> i32 {
             pcmd.stdout(std::process::Stdio::null());
             pcmd.stderr(std::process::Stdio::null());
             match pcmd.spawn() {
-                Ok(_pc) => {
-                    // PARALLAX writes shm then holds it open. Don't wait for exit —
-                    // give it 200ms for DRM enumeration, then proceed.
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                    log_verbose!("PARALLAX: enumerated display hardware");
+                Ok(mut pc) => {
+                    // PARALLAX enumerates DRM/KMS, writes SHM, exits.
+                    // Wait for it so triskelion is guaranteed a warm SHM.
+                    match pc.wait() {
+                        Ok(s) if s.success() => log_verbose!("PARALLAX: enumerated display hardware"),
+                        Ok(s) => log_warn!("PARALLAX: exited with {s}"),
+                        Err(e) => log_warn!("PARALLAX: wait failed: {e}"),
+                    }
                 }
                 Err(e) => log_warn!("PARALLAX: failed to start: {e}"),
             }
@@ -663,10 +701,15 @@ pub fn run(verb: &str, args: &[String]) -> i32 {
         // desktop_ready is set by the daemon at init_first_thread.
 
         // Now wait for the game to exit
+        let child_pid = child.id() as i32;
         let status = child.wait().unwrap_or_else(|e| {
             log_error!("Failed to wait for wine64: {e}");
             std::process::exit(1);
         });
+        // Kill the entire session spawned by wine64 (setsid at line 596).
+        // Without this, orphaned Wine children (services.exe, game .exe)
+        // survive after triskelion exits and spin at 100%+ CPU.
+        unsafe { libc::kill(-child_pid, libc::SIGKILL); }
 
         // Update stderr symlink and log exit status
         if let Some(ref log_path) = stderr_log_path {
@@ -859,6 +902,23 @@ fn setup_prefix(wine_dir: &Path, pfx: &Path, wine64: &Path, self_exe: &Path) {
         let _ = std::fs::create_dir_all(pfx.join("drive_c/Program Files"));
         let _ = std::fs::create_dir_all(pfx.join("drive_c/Program Files (x86)"));
 
+        // Copy quark's baked prefix template .reg files (COM registrations).
+        // These contain 500+ CLSID entries from Wine's FakeDlls pass, baked
+        // at install time by install.py's step_bake_prefix_template.
+        let quark_template = self_exe.parent().map(|d| d.join("default_pfx"));
+        if let Some(ref tpl) = quark_template {
+            if tpl.join("system.reg").exists() {
+                for reg in ["system.reg", "user.reg", "userdef.reg"] {
+                    let src = tpl.join(reg);
+                    let dst = pfx.join(reg);
+                    if src.exists() && !dst.exists() {
+                        let _ = std::fs::copy(&src, &dst);
+                    }
+                }
+                log_verbose!("Prefix: loaded baked registry template from {}", tpl.display());
+            }
+        }
+
         // Skip wineboot --init if prefix has a FULL init (Fonts dir exists).
         // Our stub system.reg doesn't count — it's just for service injection.
         let prefix_fully_initialized = pfx.join("drive_c/windows/Fonts").exists();
@@ -866,10 +926,11 @@ fn setup_prefix(wine_dir: &Path, pfx: &Path, wine64: &Path, self_exe: &Path) {
             log_verbose!("Prefix fully initialized (Fonts dir exists), skipping wineboot --init");
         } else {
         log_verbose!("No default_pfx template, running wineboot --init...");
-        let mut cmd = Command::new(wine64);
+        let mut cmd = build_wine_command(wine64, wine_dir);
         cmd.args(["wineboot", "--init"]);
         cmd.env("WINEPREFIX", pfx.as_os_str());
         cmd.env("WINESERVER", triskelion_exe());
+        cmd.env("QUARK_FAST_BOOT", "1");
         // Unix .so modules (ws2_32.so etc.) need ntdll.so via NEEDED — set LD_LIBRARY_PATH
         let unix_dir = wine_dir.join("lib/wine/x86_64-unix");
         let wine_lib = wine_dir.join("lib");
@@ -1362,11 +1423,26 @@ fn deploy_steam_exe(self_exe: &Path, pfx: &Path) {
 // Environment construction
 // ---------------------------------------------------------------------------
 
+fn deploy_lsteamclient_to_prefix(self_exe: &Path, pfx: &Path) {
+    let src = self_exe.parent()
+        .map(|d| d.join("lib/wine/x86_64-windows/lsteamclient.dll"));
+    let src = match src {
+        Some(ref p) if p.exists() => p,
+        _ => return,
+    };
+    let sys32 = pfx.join("drive_c/windows/system32");
+    let _ = std::fs::create_dir_all(&sys32);
+    let dst = sys32.join("lsteamclient.dll");
+    if let Err(e) = std::fs::copy(src, &dst) {
+        log_warn!("lsteamclient.dll: failed to deploy to system32: {e}");
+    }
+}
+
 fn build_env_vars(
     wine_dir: &Path, proton_dir: Option<&Path>, steam_dir: &Path,
     pfx: &Path, self_exe: &Path,
     dxvk: &[&str], vkd3d: &[&str], nvapi: &[&str], dlss: &[&str],
-    _trace: bool, shader_cache_enabled: bool,
+    shader_cache_enabled: bool,
 ) -> Vec<(&'static str, String)> {
     let cur_path = std::env::var("PATH").unwrap_or_default();
     let cur_ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
@@ -1489,9 +1565,10 @@ fn build_env_vars(
         ("PATH", format!("{}:{}", wine_bin.display(), cur_path)),
         ("LD_LIBRARY_PATH", ld_path),
         ("WINEDLLOVERRIDES", dll_overrides),
-        ("DXVK_LOG_LEVEL", "none".into()),
+        ("DXVK_LOG_LEVEL", std::env::var("DXVK_LOG_LEVEL").unwrap_or_else(|_| "none".into())),
         ("VKD3D_DEBUG", "none".into()),
         ("WINE_LARGE_ADDRESS_AWARE", "1".into()),
+        ("QUARK_FAST_BOOT", "1".into()),
         ("PROTON_VERSION", format!("quark {}", env!("CARGO_PKG_VERSION"))),
 
     ];
@@ -1712,7 +1789,7 @@ fn _sync_prefix_env(
     }
 
     log_verbose!("prefix env changed — running wineboot --update to sync");
-    let mut cmd = Command::new(wine64);
+    let mut cmd = build_wine_command(wine64, wine_dir);
     cmd.args(["wineboot", "--update"]);
     cmd.env("WINEPREFIX", pfx.as_os_str());
     cmd.env("WINESERVER", triskelion_exe());
@@ -1735,9 +1812,24 @@ fn _sync_prefix_env(
     if !ld_path.is_empty() {
         cmd.env("LD_LIBRARY_PATH", &ld_path);
     }
-    // System Wine finds its own DLLs — don't set WINEDLLPATH.
+    // WINEDLLPATH: system Wine finds its own builtins, but quark-specific modules
+    // (lsteamclient.so, steam.exe) live in our tree. Wine needs this to find them.
+    {
+        let quark_unix = wine_dir.join("lib/wine/x86_64-unix");
+        let quark_win = wine_dir.join("lib/wine/x86_64-windows");
+        let sys_unix = Path::new("/usr/lib/wine/x86_64-unix");
+        let sys_win = Path::new("/usr/lib/wine/x86_64-windows");
+        let mut dll_parts: Vec<String> = Vec::new();
+        if quark_unix.exists() { dll_parts.push(quark_unix.display().to_string()); }
+        if quark_win.exists() { dll_parts.push(quark_win.display().to_string()); }
+        if sys_unix.exists() { dll_parts.push(sys_unix.display().to_string()); }
+        if sys_win.exists() { dll_parts.push(sys_win.display().to_string()); }
+        if !dll_parts.is_empty() {
+            cmd.env("WINEDLLPATH", dll_parts.join(":"));
+        }
+    }
 
-    // Apply game env vars, but skip DLL paths (confuse system Wine's builtin search)
+    // Apply game env vars, but skip DLL path overrides from Steam (would conflict with ours)
     for (k, v) in env_vars {
         if *k == "WINEDLLPATH" || *k == "WINEDLLDIR0" || *k == "WINEDLLDIR1" { continue; }
         cmd.env(k, v);
@@ -1781,6 +1873,54 @@ fn wine_binary(dir: &Path) -> PathBuf {
     if unix_wine.exists() { return unix_wine; }
     let w64 = dir.join("bin/wine64");
     if w64.exists() { w64 } else { dir.join("bin/wine") }
+}
+
+/// Build a Command that runs `wine_bin` inside a bwrap mount namespace where
+/// `/usr/lib/wine` and `/usr/share/wine` are bind-mounted from quark's tree.
+///
+/// This is the architectural fix for "patched DLLs got poisoned in /usr."
+/// Wine's loader has /usr/lib/wine baked in at compile time and ignores most
+/// override knobs for the early bootstrap (ntdll.so, win32u.so). bwrap solves
+/// it at the kernel level: inside the namespace, /usr/lib/wine *is* quark's
+/// tree, so the unmodified system Wine binary loads quark's patched DLLs
+/// without ever touching the real /usr.
+///
+/// Falls back to direct exec (no bwrap) if:
+///   - bwrap is not installed
+///   - quark's lib/wine or share/wine tree is missing (install.py never ran)
+/// In the fallback case the user runs against unpatched system Wine, which
+/// is ugly but not poisonous.
+fn build_wine_command(wine_bin: &Path, wine_dir: &Path) -> Command {
+    let bwrap = Path::new("/usr/bin/bwrap");
+    let quark_lib_wine = wine_dir.join("lib/wine");
+    let quark_share_wine = wine_dir.join("share/wine");
+
+    if !bwrap.exists() {
+        log_warn!("bwrap not found at /usr/bin/bwrap — exec'ing wine directly.");
+        log_warn!("Patched DLLs will NOT be loaded. Install bubblewrap (pacman -S bubblewrap).");
+        return Command::new(wine_bin);
+    }
+    if !quark_lib_wine.exists() || !quark_share_wine.exists() {
+        log_warn!("quark Wine tree incomplete (missing {} or {}) — exec'ing wine directly.",
+            quark_lib_wine.display(), quark_share_wine.display());
+        log_warn!("Re-run install.py to populate the compat tree.");
+        return Command::new(wine_bin);
+    }
+
+    let mut cmd = Command::new(bwrap);
+    // Pass through the entire host filesystem first.
+    cmd.arg("--dev-bind").arg("/").arg("/");
+    // Overlay quark's Wine tree on top. Inside the namespace, when Wine's
+    // loader opens /usr/lib/wine/x86_64-unix/ntdll.so it gets quark's patched
+    // copy. The actual /usr on disk is never touched.
+    cmd.arg("--bind").arg(&quark_lib_wine).arg("/usr/lib/wine");
+    cmd.arg("--bind").arg(&quark_share_wine).arg("/usr/share/wine");
+    // bwrap exits when its parent (this launcher) exits. Belt-and-braces
+    // alongside the existing death-pipe.
+    cmd.arg("--die-with-parent");
+    cmd.arg("--");
+    cmd.arg(wine_bin);
+    cmd
 }
 
 /// Find Wine binaries. Priority:

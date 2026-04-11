@@ -34,12 +34,12 @@ impl EventLoop {
                 };
                 // Clean up ntsync object
                 self.remove_ntsync_obj(pid, req.handle);
-                // Clean up pipe I/O wait handle and flags for this handle
-                if let Some(wh) = self.pipe_io_wait_handles.remove(&(pid, req.handle)) {
+                // Side tables: pipe data fd, io wait handle cache, fd_sent,
+                // completion binding. purge() returns the io_wait_handle (if any)
+                // so we can release its ntsync object too.
+                if let Some(wh) = self.side_tables.purge(pid, req.handle) {
                     self.remove_ntsync_obj(pid, wh);
                 }
-                self.pipe_handle_flags.remove(&(pid, req.handle));
-                self.fd_sent.remove(&(pid, req.handle));
                 if let Some(process) = self.state.processes.get_mut(&pid) {
                     process.handles.close(req.handle);
                 }
@@ -50,14 +50,36 @@ impl EventLoop {
     }
 
 
-    #[inline]
-    pub(crate) fn handle_set_handle_info(&mut self, _client_fd: i32, _buf: &[u8]) -> Reply {
-        let reply = SetHandleInfoReply {
-            header: ReplyHeader { error: 0, reply_size: 0 },
-            old_flags: 0,
-            _pad_0: [0; 4],
+    pub(crate) fn handle_set_handle_info(&mut self, client_fd: i32, buf: &[u8]) -> Reply {
+        let req = if buf.len() >= std::mem::size_of::<SetHandleInfoRequest>() {
+            unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const SetHandleInfoRequest) }
+        } else {
+            return reply_fixed(&ReplyHeader { error: 0xC000000D, reply_size: 0 });
         };
-        reply_fixed(&reply)
+        let pid = self.client_pid(client_fd as RawFd);
+        let old_options = self.state.processes.get(&pid)
+            .and_then(|p| p.handles.get(req.handle))
+            .map(|e| e.options)
+            .unwrap_or(0);
+        // HANDLE_FLAG_INHERIT = 1 maps to OBJ_INHERIT = 0x02 in options
+        let old_flags = if old_options & 0x02 != 0 { 1i32 } else { 0i32 };
+        // Apply mask: only change bits specified by mask
+        if let Some(process) = self.state.processes.get_mut(&pid) {
+            if let Some(entry) = process.handles.get_mut(req.handle) {
+                if req.mask & 1 != 0 { // HANDLE_FLAG_INHERIT
+                    if req.flags & 1 != 0 {
+                        entry.options |= 0x02; // OBJ_INHERIT
+                    } else {
+                        entry.options &= !0x02;
+                    }
+                }
+            }
+        }
+        reply_fixed(&SetHandleInfoReply {
+            header: ReplyHeader { error: 0, reply_size: 0 },
+            old_flags,
+            _pad_0: [0; 4],
+        })
     }
 
 
@@ -127,16 +149,15 @@ impl EventLoop {
             if let Some(unix_fd) = unix_fd_opt {
                 let p = pid.unwrap_or(0);
                 let key = (p, handle);
-                if self.fd_sent.contains(&key) {
-                    self.fd_sent.remove(&key);
+                if self.side_tables.fd_sent.contains(&key) {
+                    self.side_tables.fd_sent.remove(&key);
                 }
 
-                // Diagnostic: log fd details for exe-related handles
-                {
+                if cfg!(debug_assertions) {
                     let link = format!("/proc/self/fd/{unix_fd}");
                     if let Ok(target) = std::fs::read_link(&link) {
                         let t = target.display().to_string();
-                        if t.contains(".exe") || t.contains("Balatro") {
+                        if t.contains(".exe") {
                             let mut st: libc::stat = unsafe { std::mem::zeroed() };
                             let size = if unsafe { libc::fstat(unix_fd, &mut st) } == 0 { st.st_size } else { -1 };
                             log_info!("GET_HANDLE_FD_EXE: handle={handle:#x} fd={unix_fd} size={size} type={obj_type} target=\"{t}\"");
@@ -154,7 +175,7 @@ impl EventLoop {
                     } else {
                         log_error!("PENDING_FD_DUP_FAIL: client_fd={client_fd} handle={handle:#x} errno={}", std::io::Error::last_os_error());
                     }
-                    self.fd_sent.insert(key);
+                    self.side_tables.fd_sent.insert(key);
                 } else {
                     log_error!("PENDING_FD_NO_CLIENT: client_fd={client_fd}");
                 }
@@ -371,11 +392,20 @@ impl EventLoop {
     }
 
 
-    // Object info
-    pub(crate) fn handle_get_object_info(&mut self, _client_fd: i32, _buf: &[u8]) -> Reply {
+    pub(crate) fn handle_get_object_info(&mut self, client_fd: i32, buf: &[u8]) -> Reply {
+        let req = if buf.len() >= std::mem::size_of::<GetObjectInfoRequest>() {
+            unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const GetObjectInfoRequest) }
+        } else {
+            return reply_fixed(&ReplyHeader { error: 0xC000000D, reply_size: 0 });
+        };
+        let pid = self.client_pid(client_fd as RawFd);
+        let access = self.state.processes.get(&pid)
+            .and_then(|p| p.handles.get(req.handle))
+            .map(|e| e.access)
+            .unwrap_or(0x1F0FFF);
         reply_fixed(&GetObjectInfoReply {
             header: ReplyHeader { error: 0, reply_size: 0 },
-            access: 0x1F0FFF, // GENERIC_ALL
+            access,
             ref_count: 1,
             handle_count: 1,
             _pad_0: [0; 4],
@@ -457,8 +487,25 @@ impl EventLoop {
         reply_fixed(&ReplyHeader { error: 0, reply_size: 0 })
     }
 
-    pub(crate) fn handle_compare_objects(&mut self, _client_fd: i32, _buf: &[u8]) -> Reply {
-        reply_fixed(&ReplyHeader { error: 0, reply_size: 0 })
+    pub(crate) fn handle_compare_objects(&mut self, client_fd: i32, buf: &[u8]) -> Reply {
+        let req = if buf.len() >= std::mem::size_of::<CompareObjectsRequest>() {
+            unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const CompareObjectsRequest) }
+        } else {
+            return reply_fixed(&ReplyHeader { error: 0xC000000D, reply_size: 0 });
+        };
+        let pid = self.client_pid(client_fd as RawFd);
+        let oid1 = self.state.processes.get(&pid)
+            .and_then(|p| p.handles.get(req.first))
+            .map(|e| e.object_id);
+        let oid2 = self.state.processes.get(&pid)
+            .and_then(|p| p.handles.get(req.second))
+            .map(|e| e.object_id);
+        let error = match (oid1, oid2) {
+            (Some(a), Some(b)) if a == b => 0,
+            (Some(_), Some(_)) => 0xC0000460, // STATUS_NOT_SAME_OBJECT
+            _ => 0xC0000008, // STATUS_INVALID_HANDLE
+        };
+        reply_fixed(&ReplyHeader { error, reply_size: 0 })
     }
 
     pub(crate) fn handle_get_handle_unix_name(&mut self, client_fd: i32, buf: &[u8]) -> Reply {
@@ -605,7 +652,7 @@ impl EventLoop {
         if let Some(pid) = pid {
             if !self.ntsync_objects.contains_key(&(pid, handle)) {
                 if let Some(obj) = self.get_or_create_event(true, true) {
-                    self.ntsync_objects.insert((pid, handle), (obj, 1));
+                    self.ntsync_objects.insert((pid, handle), (obj, 1)); // INTERNAL
                 }
             }
         }

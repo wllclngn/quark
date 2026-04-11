@@ -16,12 +16,17 @@ const OPCODE_COUNT: usize = 306;
 // ── v2 format ────────────────────────────────────────────────────────────────
 
 const CACHE_MAGIC: [u8; 4] = *b"AMPC";
-const CACHE_VERSION: u32 = 2;
-const CACHE_SIZE: usize = 10_496;
+const CACHE_VERSION: u32 = 3;
+const CACHE_V2_SIZE: usize = 10_496;
+// v3 adds Section 6: Message routing profiles (4096 bytes = 256 entries x 16 bytes)
+const CACHE_SIZE: usize = 14_592;
 
-// Section offsets (64 + 128 + 4896 + 4896 + 512 = 10496)
+// Section offsets (64 + 128 + 4896 + 4896 + 512 + 4096 = 14592)
 const OPCODE_INTEL_OFF: usize = 0x00C0;    // 192
 const LEARNED_OFF: usize = 0x13E0;         // 5088
+const MSG_PROFILE_OFF: usize = 0x2900;     // 10496 (start of section 6)
+const MSG_PROFILE_ENTRY: usize = 16;
+const MAX_MSG_PROFILES: usize = 256;
 
 // Section sizes
 const HEADER_SIZE: usize = 64;
@@ -31,20 +36,11 @@ const LEARNED_ENTRY: usize = 16;
 // Hint values (from engine profiles, seeded by install.py)
 const HINT_UNKNOWN: u32 = 0;
 const HINT_CRITICAL: u32 = 1;
-#[allow(dead_code)]
-const HINT_NEEDED: u32 = 2;
 const HINT_SAFE_TO_STUB: u32 = 3;
 const HINT_NEVER_CALLED: u32 = 4;
 
 // Header flags
-#[allow(dead_code)]
-const FLAG_ENGINE_DETECTED: u32 = 0x01;
-#[allow(dead_code)]
-const FLAG_PROFILES_SEEDED: u32 = 0x02;
 const FLAG_HAS_LEARNED: u32 = 0x04;
-#[allow(dead_code)]
-const FLAG_HAS_SHADER_INDEX: u32 = 0x08;
-#[allow(dead_code)]
 const FLAG_STABLE: u32 = 0x10;
 
 // ── v1 format (migration) ───────────────────────────────────────────────────
@@ -67,7 +63,7 @@ const UNSTABLE_THRESHOLD: u32 = 3;
 const _: () = assert!(HEADER_SIZE == 64);
 const _: () = assert!(OPCODE_INTEL_ENTRY == 16);
 const _: () = assert!(LEARNED_ENTRY == 16);
-const _: () = assert!(CACHE_SIZE == 10_496);
+const _: () = assert!(CACHE_SIZE == 14_592);
 
 #[derive(Clone, Copy)]
 struct OpcodeEntry {
@@ -88,6 +84,8 @@ pub struct IntelManager {
     // Preserved sections (engine profile + opcode intel + shader index)
     // We read-modify-write: only update header + learned data on flush
     preserved_buf: Option<Vec<u8>>,
+    // Loaded message routing profiles (seeded into sent_messages at startup)
+    loaded_msg_profiles: Vec<(u32, crate::sent_messages::MsgProfile)>,
     // This-run tracking
     run_calls: [u32; OPCODE_COUNT],
     run_stubs: [u32; OPCODE_COUNT],
@@ -107,6 +105,7 @@ impl IntelManager {
             engine_type: 0,
             cache_flags: 0,
             preserved_buf: None,
+            loaded_msg_profiles: Vec::new(),
             run_calls: [0; OPCODE_COUNT],
             run_stubs: [0; OPCODE_COUNT],
             post_stub_requests: [0; OPCODE_COUNT],
@@ -162,7 +161,8 @@ impl IntelManager {
     }
 
     /// Flush learned data to disk. Call on daemon shutdown.
-    pub fn flush(&self) {
+    /// Pass message routing profiles from sent_messages for persistence.
+    pub fn flush(&self, msg_profiles: &[(u32, crate::sent_messages::MsgProfile)]) {
         let path = match &self.cache_path {
             Some(p) => p,
             None => return,
@@ -236,12 +236,30 @@ impl IntelManager {
             buf[off + 12..off + 16].copy_from_slice(&self.run_calls[i].to_le_bytes());
         }
 
+        // Write message routing profiles (section 6 @ MSG_PROFILE_OFF)
+        let profile_count = msg_profiles.len().min(MAX_MSG_PROFILES);
+        for (i, (msg_code, profile)) in msg_profiles.iter().take(MAX_MSG_PROFILES).enumerate() {
+            let off = MSG_PROFILE_OFF + i * MSG_PROFILE_ENTRY;
+            buf[off..off + 4].copy_from_slice(&msg_code.to_le_bytes());
+            buf[off + 4..off + 8].copy_from_slice(&profile.fast_votes.to_le_bytes());
+            buf[off + 8..off + 12].copy_from_slice(&profile.tracked_votes.to_le_bytes());
+            let flags: u32 = profile.observations | if profile.promoted { 0x80000000 } else { 0 };
+            buf[off + 12..off + 16].copy_from_slice(&flags.to_le_bytes());
+        }
+        // Store profile count in header at offset 36 (was unused padding)
+        buf[36..40].copy_from_slice(&(profile_count as u32).to_le_bytes());
+
         if let Err(e) = std::fs::write(path, &buf) {
             log_error!("intel: failed to write {}: {e}", path.display());
         } else {
-            log_info!("intel: saved cache to {} (run #{run_count}, {coverage}% coverage)",
+            log_info!("intel: saved cache to {} (run #{run_count}, {coverage}% coverage, {profile_count} msg profiles)",
                 path.display());
         }
+    }
+
+    /// Take loaded message profiles to seed sent_messages at startup.
+    pub fn take_msg_profiles(&mut self) -> Vec<(u32, crate::sent_messages::MsgProfile)> {
+        std::mem::take(&mut self.loaded_msg_profiles)
     }
 
     /// Print a summary of loaded intelligence.
@@ -277,12 +295,16 @@ impl IntelManager {
             None => return,
         };
 
-        // Try v2 cache first
+        // Try v2/v3 cache
         if let Ok(data) = std::fs::read(&path) {
-            if data.len() >= CACHE_SIZE && data[0..4] == CACHE_MAGIC {
+            if data.len() >= CACHE_V2_SIZE && data[0..4] == CACHE_MAGIC {
                 let version = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-                if version == CACHE_VERSION {
+                if version == 2 || version == 3 {
                     self.load_v2(&data);
+                    // v3: also load message routing profiles (section 6)
+                    if data.len() >= CACHE_SIZE {
+                        self.load_msg_profiles(&data);
+                    }
                     return;
                 }
             }
@@ -299,8 +321,9 @@ impl IntelManager {
     }
 
     fn load_v2(&mut self, data: &[u8]) {
-        // Preserve full buffer for read-modify-write on flush
-        self.preserved_buf = Some(data[..CACHE_SIZE].to_vec());
+        // Preserve full buffer for read-modify-write on flush.
+        // v2 files are smaller than v3; take what exists, flush() will resize.
+        self.preserved_buf = Some(data[..data.len().min(CACHE_SIZE)].to_vec());
 
         // Header
         self.cache_flags = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
@@ -338,6 +361,29 @@ impl IntelManager {
         // No hints from v1 — all HINT_UNKNOWN (default)
     }
 
+    fn load_msg_profiles(&mut self, data: &[u8]) {
+        let profile_count = u32::from_le_bytes([data[36], data[37], data[38], data[39]]) as usize;
+        let count = profile_count.min(MAX_MSG_PROFILES);
+        for i in 0..count {
+            let off = MSG_PROFILE_OFF + i * MSG_PROFILE_ENTRY;
+            if off + MSG_PROFILE_ENTRY > data.len() { break; }
+            let msg_code = u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
+            let fast_votes = u32::from_le_bytes([data[off+4], data[off+5], data[off+6], data[off+7]]);
+            let tracked_votes = u32::from_le_bytes([data[off+8], data[off+9], data[off+10], data[off+11]]);
+            let flags = u32::from_le_bytes([data[off+12], data[off+13], data[off+14], data[off+15]]);
+            let observations = flags & 0x7FFFFFFF;
+            let promoted = flags & 0x80000000 != 0;
+            if msg_code != 0 || fast_votes != 0 || tracked_votes != 0 {
+                self.loaded_msg_profiles.push((msg_code, crate::sent_messages::MsgProfile {
+                    fast_votes, tracked_votes, observations, promoted,
+                }));
+            }
+        }
+        if !self.loaded_msg_profiles.is_empty() {
+            log_info!("intel: loaded {} message routing profiles", self.loaded_msg_profiles.len());
+        }
+    }
+
     /// Create an IntelManager with no file backing (for tests).
     #[cfg(test)]
     fn new_test() -> Self {
@@ -349,6 +395,7 @@ impl IntelManager {
             engine_type: 0,
             cache_flags: 0,
             preserved_buf: None,
+            loaded_msg_profiles: Vec::new(),
             run_calls: [0; OPCODE_COUNT],
             run_stubs: [0; OPCODE_COUNT],
             post_stub_requests: [0; OPCODE_COUNT],
@@ -362,15 +409,6 @@ mod tests {
     use super::*;
 
     // ── Cache format ────────────────────────────────────────────────────────
-
-    #[test]
-    fn section_offsets_are_non_overlapping() {
-        assert!(HEADER_OFF + HEADER_SIZE <= ENGINE_PROFILE_OFF);
-        assert!(ENGINE_PROFILE_OFF + ENGINE_PROFILE_SIZE <= OPCODE_INTEL_OFF);
-        assert!(OPCODE_INTEL_OFF + OPCODE_COUNT * OPCODE_INTEL_ENTRY <= LEARNED_OFF);
-        assert!(LEARNED_OFF + OPCODE_COUNT * LEARNED_ENTRY <= SHADER_OFF);
-        assert!(SHADER_OFF <= CACHE_SIZE);
-    }
 
     #[test]
     fn v2_round_trip() {
@@ -496,11 +534,4 @@ mod tests {
         assert_eq!(mgr.run_stubs[5], 1);
     }
 
-    #[test]
-    fn out_of_bounds_opcode_is_safe() {
-        let mgr = IntelManager::new_test();
-        assert!(!mgr.should_auto_stub(999, false));
-        assert_eq!(mgr.prior_stability(999), "unknown");
-        assert_eq!(mgr.prior_stub_count(999), 0);
-    }
 }

@@ -43,7 +43,7 @@ PROJECT_DIR = SCRIPT_DIR.parent
 RUST_DIR = PROJECT_DIR / "rust"
 
 sys.path.insert(0, str(SCRIPT_DIR))
-from util import _USER_HOME, AMP_DIR_STR
+from util import _USER_HOME, COMPAT_DIR_STR
 
 STEAM_ROOT = _USER_HOME / ".steam" / "root"
 STEAMAPPS = STEAM_ROOT / "steamapps"
@@ -210,7 +210,7 @@ def find_triskelion_pid():
     try:
         # Match triskelion by name, or wineserver scoped to quark dir.
         # Never match bare 'wineserver' -- that hits Proton's running instance.
-        for pattern in ["triskelion", f"{AMP_DIR_STR}.*wineserver"]:
+        for pattern in ["triskelion", f"{COMPAT_DIR_STR}.*wineserver"]:
             result = subprocess.run(["pgrep", "-f", pattern],
                                     capture_output=True, text=True, timeout=5)
             if result.returncode == 0 and result.stdout.strip():
@@ -390,7 +390,7 @@ def profile_game(app_id, name, duration, launch_timeout=60):
         log(f"  No wine process found after {launch_timeout}s")
         # Read-only diagnostic dump scoped to quark -- never used for kill
         try:
-            ps = subprocess.run(["pgrep", "-a", "-f", f"{AMP_DIR_STR}|triskelion"],
+            ps = subprocess.run(["pgrep", "-a", "-f", f"{COMPAT_DIR_STR}|triskelion"],
                                 capture_output=True, text=True, timeout=5)
             if ps.stdout.strip():
                 log(f"  Quark-related processes running:")
@@ -444,7 +444,7 @@ def profile_game(app_id, name, duration, launch_timeout=60):
         log(f"  {name}: processes lingered after SIGTERM, sending SIGKILL")
         # Scope straggler sweep to quark dir, with environ double-check
         try:
-            result = subprocess.run(["pgrep", "-a", "-f", AMP_DIR_STR],
+            result = subprocess.run(["pgrep", "-a", "-f", COMPAT_DIR_STR],
                                     capture_output=True, text=True, timeout=5)
             if result.returncode == 0:
                 for line in result.stdout.strip().splitlines():
