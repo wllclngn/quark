@@ -60,7 +60,7 @@ def build(skip: bool = False) -> bool:
     if result.returncode != 0:
         log_error(f"build: failed ({elapsed:.1f}s)")
         for line in result.stderr.splitlines()[-20:]:
-            print(f"  {line}")
+            log_error(f"build: {line}")
         return False
 
     warnings = sum(1 for line in result.stderr.splitlines() if "warning" in line.lower())

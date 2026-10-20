@@ -13,3 +13,18 @@ __pycache__/
 # The scoreboard run writes its table here; it is read into the README by hand
 tests/scoreboard.md
 tests/scoreboard.json
+tests/scoreboard.prom
+
+# Research / prototyping staging for the Wine-replacement trajectory lives
+# in tests/research/. It is tracked here, since this monorepo is private,
+# but it is never carved into the public quark standalone, whose tree is
+# copied by hand and omits it. Its build outputs fall under the target/ and
+# __pycache__ rules above, so only source and notes are tracked.
+#
+# The census writes to /tmp/quark/research/census/ and the DLLs it surveys
+# live in ~/.cache/quark/research/d3d64/src/, both outside the tree; the
+# ignore below catches either landing here by hand. The exhumed binaries
+# rebuild from exhumed/rust, so they are build outputs.
+tests/research/census/
+tests/research/exhumed/parallax
+tests/research/exhumed/triskelion

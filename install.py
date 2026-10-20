@@ -19,6 +19,7 @@ import sys
 import tarfile
 import threading
 import time
+import types
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from dataclasses import dataclass, field
@@ -28,7 +29,8 @@ from typing import Any
 from quark_common import (
     REPO_ROOT, RUST_DIR, STEAM_ROOT, STEAMAPPS, COMPAT_DIR, DATA_DIR, CACHE_DIR,
     LSTEAMCLIENT_CACHE, LOG_DIR, WINE_SRC_DIR, WINE_OBJ_DIR,
-    log_info, log_warn, log_error, log_debug,
+    log, log_blank, log_info, log_section, log_warn, log_error, log_debug, log_finish,
+    log_interrupted, log_intro, install_exit_guard, get_version,
     get_quark_appids, stop_prefix_wineserver, stale_wine_sockets,
     remove_stale_wine_sockets,
 )
@@ -74,16 +76,32 @@ def _derive_proton_tag() -> str:
 
 PROTON_GIT_TAG = _derive_proton_tag()
 PROTON_SOURCE_CACHE = CACHE_DIR / "proton-source" / PROTON_GIT_TAG
+# The Steam bridge's own worktree of wine-src (_bridge_worktree).
+WINE_BRIDGE_SRC = CACHE_DIR / "wine-src-bridge"
 
+def install_hint(*packages: str) -> str:
+    """The command that installs packages here: Shelly on Devario, which
+    ships no pacman, and pacman everywhere else."""
+    names = " ".join(packages)
+    if not shutil.which("pacman") and shutil.which("shelly"):
+        return f"shelly install standard {names}"
+    return f"pacman -S {names}"
+
+
+# Each tool and the package that provides it.
 REQUIRED_TOOLS: dict[str, tuple[str | None, str]] = {
-    "rustc":    ("1.85",  "pacman -S rust"),
-    "cargo":    (None,    "pacman -S rust"),
-    "clang":    (None,    "pacman -S clang"),
-    "ld.lld":   (None,    "pacman -S lld"),
-    "git":      (None,    "pacman -S git"),
-    "autoconf": (None,    "pacman -S autoconf"),
-    "make":     (None,    "pacman -S base-devel"),
-    "patch":    (None,    "pacman -S patch"),
+    "rustc":      ("1.85",  "rust"),
+    "cargo":      (None,    "rust"),
+    "cc":         (None,    "gcc"),
+    "clang":      (None,    "clang"),
+    "ld.lld":     (None,    "lld"),
+    "git":        (None,    "git"),
+    "autoconf":   (None,    "autoconf"),
+    "bison":      (None,    "bison"),
+    "flex":       (None,    "flex"),
+    "make":       (None,    "make"),
+    "patch":      (None,    "patch"),
+    "pkg-config": (None,    "pkgconf"),
 }
 
 # Known Proton appids — never touch their prefixes
@@ -105,41 +123,21 @@ ENV_CONFIG_TEMPLATE = """\
 # Variables set here override quark's built-in defaults.
 # Edit this file any time — changes apply on next game launch.
 #
-# --- Sync ---
-WINE_NTSYNC=1
-#
-# --- Heap arena placement ---
-# Confine glibc to one arena so per-thread heap arenas stop landing in the
-# high mmap band where wine section views are placed. Fixes the cross-game
-# heap corruption (#18): A wine MAP_FIXED section view was stomping a live
-# glibc per-thread arena -> sysmalloc/!prev abort. Single-arena has some
-# allocation-lock contention cost; the zero-cost replacement is the wine-side
-# map_view placement fix, after which these can be removed.
-GLIBC_TUNABLES=glibc.malloc.arena_max=1
-MALLOC_ARENA_MAX=1
-#
-# --- Logging ---
+# Logging
 # WINEDEBUG=-all
 # DXVK_LOG_LEVEL=none
 # VKD3D_DEBUG=none
+# VKD3D_SHADER_DEBUG=none
 #
-# --- Overlays ---
+# Overlays
 # MANGOHUD=1
 # DXVK_HUD=fps
 #
-# --- Performance ---
-# DXVK_ASYNC=1
+# Performance
 # mesa_glthread=true
 #
-# --- NVIDIA ---
-# PROTON_ENABLE_NVAPI=1
-# DXVK_ENABLE_NVAPI=dxgi
-#
-# --- Diagnostics (active only with the observer; --observer install) ---
-# Caller-stack capture for the 288-byte chunk double-freed in per-thread
-# GLX/window teardown (the corrupter behind the 160-byte XCreateGC victim /
-# sysmalloc/!prev abort class). Remove when that hunt closes.
-MONTAUK_HEAP_STACK_SIZE=288
+# NVIDIA
+# DXVK_ENABLE_NVAPI=1
 """
 
 
@@ -245,6 +243,41 @@ def _stamp(inputs: tuple[Any, ...]) -> str:
     return h.hexdigest()
 
 
+def _code_stamp(func: Any) -> str:
+    """A step's own code, so a step whose code changed reruns though its
+    inputs did not: Its bytecode, names and constants, nested code included,
+    and the same of every install.py function it calls, none of which carry
+    comments or line numbers. A frozenset constant hashes sorted, since its
+    order follows the run's string hashing."""
+    h = hashlib.sha256()
+    seen = {func}
+
+    def const_repr(const: Any) -> str:
+        if isinstance(const, frozenset):
+            return "frozenset" + repr(sorted(const_repr(c) for c in const))
+        if isinstance(const, tuple):
+            return "(" + ",".join(const_repr(c) for c in const) + ")"
+        return repr(const)
+
+    def walk(code: types.CodeType) -> None:
+        h.update(code.co_code)
+        h.update(repr(code.co_names).encode())
+        for const in code.co_consts:
+            if isinstance(const, types.CodeType):
+                walk(const)
+            else:
+                h.update(const_repr(const).encode() + b"\0")
+        for name in code.co_names:
+            callee = globals().get(name)
+            if (isinstance(callee, types.FunctionType) and callee.__module__ == func.__module__
+                    and callee not in seen):
+                seen.add(callee)
+                walk(callee.__code__)
+
+    walk(func.__code__)
+    return h.hexdigest()
+
+
 def _load_manifest() -> dict[str, dict[str, str]]:
     try:
         m = json.loads(INSTALL_MANIFEST.read_text())
@@ -337,16 +370,18 @@ def run_graph(steps: list[Step], workers: int) -> tuple[list[StepResult], int]:
         with lock:
             counter["n"] += 1
             k = counter["n"]
-        print()
-        log_info(f"STEP {k}/{total}: {step.name}")
+        log_section(step.name, f"step {k} of {total}")
         trace = None
         if step.inputs:
-            trace = {"inputs": _stamp(step.inputs), "outputs": _stamp(step.outputs)}
+            trace = {"inputs": _stamp(step.inputs), "code": _code_stamp(step.func),
+                     "outputs": _stamp(step.outputs)}
             recorded = manifest.get(step.name)
             if recorded == trace:
-                log_info("inputs and outputs match the last run, skipped")
+                log_info("inputs, code and outputs match the last run, skipped")
                 return StepResult(step.name, True, skipped=True)
-            if recorded and recorded.get("inputs") == trace["inputs"]:
+            if recorded and recorded.get("code") != trace["code"]:
+                log_info("the step's code changed since the last run; rerunning")
+            elif recorded and recorded.get("inputs") == trace["inputs"]:
                 log_info("inputs unchanged but an output was rewritten since the last run; rerunning")
         t0 = time.monotonic()
         result = step.func()
@@ -354,7 +389,8 @@ def run_graph(steps: list[Step], workers: int) -> tuple[list[StepResult], int]:
             result.elapsed_ms = int((time.monotonic() - t0) * 1000)
         if trace is not None and result.success and not result.skipped:
             with lock:
-                manifest[step.name] = {"inputs": trace["inputs"], "outputs": _stamp(step.outputs)}
+                manifest[step.name] = {"inputs": trace["inputs"], "code": trace["code"],
+                                       "outputs": _stamp(step.outputs)}
                 _save_manifest(manifest)
         return result
 
@@ -389,7 +425,7 @@ def run_graph(steps: list[Step], workers: int) -> tuple[list[StepResult], int]:
                     log_warn(f"Continuing despite {step.name} failure...")
                 sorter.done(step.name)
     except KeyboardInterrupt:
-        log_error("Interrupted")
+        log_interrupted()
         pool.shutdown(wait=False, cancel_futures=True)
         return [results[s.name] for s in steps if s.name in results], 130
     pool.shutdown(wait=True)
@@ -424,7 +460,7 @@ def run_cmd(
         log_error(f"{desc} failed (exit {result.returncode})")
         if capture and result.stderr:
             for line in result.stderr.strip().splitlines()[-20:]:
-                log_error(f"  {line}")
+                log_error(f"{desc}: {line}")
         raise StepFailed(desc, f"exit code {result.returncode}")
     return result
 
@@ -445,8 +481,8 @@ def _quark_write_roots() -> list[Path]:
         WINE_SRC_DIR,                     # cloned wine source for patching
         WINE_OBJ_DIR,                     # wine build artifacts
         CACHE_DIR,                        # ~/.cache/quark — provenance manifests, downloads
-        DATA_DIR,                         # ~/.local/share/quark — legacy lsteamclient cache
-        SCRIPT_DIR / "rust" / "target",   # cargo build output
+        DATA_DIR,                         # ~/.local/share/quark — lsteamclient cache, downloads, staging
+        SCRIPT_DIR / "target",            # cargo build output
         Path("/tmp"),                     # tarballs, scratch (must be under /tmp/...)
     ]
 
@@ -484,13 +520,12 @@ def assert_quark_writable(path: Path) -> None:
 
 def get_system_wine_version() -> str:
     """Read `wine --version` output (e.g. 'wine-11.6'). Returns empty string on failure."""
-    for binary in ["wine", "wine64"]:
-        try:
-            r = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=5)
-            if r.returncode == 0 and r.stdout.strip():
-                return r.stdout.strip()
-        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-            continue
+    try:
+        r = subprocess.run(["wine", "--version"], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
     return ""
 
 
@@ -631,9 +666,9 @@ def verify_system_wine_unchanged(before: dict[str, tuple[str, int, int]]) -> Non
             changed.append((f"CREATED-{kind.upper()}", path))
     if changed:
         for kind, path in changed[:20]:
-            log_error(f"  {kind}: {path}")
+            log_error(f"{kind}: {path}")
         if len(changed) > 20:
-            log_error(f"  ... and {len(changed) - 20} more")
+            log_error(f"... and {len(changed) - 20} more")
         raise StepFailed(
             "system_wine_audit",
             f"install.py modified {len(changed)} entry(ies) in /usr/lib/wine or /usr/share/wine"
@@ -650,7 +685,7 @@ def prompt_yn(question: str, auto: bool = True) -> bool:
     `auto`: Y for the questions an unattended install should agree to, N for
     a question that throws work away."""
     if _AUTO_YES:
-        print(f"{question} [Y/N] {'y' if auto else 'n'}  (--yes)")
+        log_info(f"{question} {'yes' if auto else 'no'} (--yes)")
         return auto
     while True:
         answer = input(f"{question} [Y/N] ").strip().lower()
@@ -658,15 +693,6 @@ def prompt_yn(question: str, auto: bool = True) -> bool:
             return True
         if answer == "n":
             return False
-
-
-def get_version() -> str:
-    """Read version from rust/Cargo.toml."""
-    cargo_toml = RUST_DIR / "Cargo.toml"
-    for line in cargo_toml.read_text().splitlines():
-        if line.startswith("version"):
-            return line.split('"')[1]
-    return "0.0.0"
 
 
 def cpu_count() -> int:
@@ -713,11 +739,15 @@ def step_preflight() -> StepResult:
     warnings: list[str] = []
     missing: list[str] = []
 
-    # Check all tools
-    for tool, (min_ver, install_cmd) in REQUIRED_TOOLS.items():
+    # Check all tools. Rust builds quark from a source tree; a packaged
+    # binary stands in for that build, so a package install needs no Rust.
+    packaged = prebuilt_binary() is not None
+    for tool, (min_ver, package) in REQUIRED_TOOLS.items():
+        if packaged and tool in ("rustc", "cargo"):
+            continue
         path = shutil.which(tool)
         if not path:
-            missing.append(f"  {tool:12s} — install with: {install_cmd}")
+            missing.append(f"  {tool:12s} — install with: {install_hint(package)}")
             continue
 
         if min_ver and tool == "rustc":
@@ -743,13 +773,13 @@ def step_preflight() -> StepResult:
     # Steam
     steam_root = STEAM_ROOT
     if not steam_root.exists():
-        raise StepFailed("preflight", "Steam not found (~/.steam/root) — install Steam natively")
+        raise StepFailed("preflight", f"Steam not found ({steam_root}) — install Steam natively")
     log_info("Steam: found")
 
     # System Wine
     sys_wine = Path("/usr/lib/wine/x86_64-unix")
     if not sys_wine.exists() or not shutil.which("wine"):
-        raise StepFailed("preflight", "System Wine not found — pacman -S wine")
+        raise StepFailed("preflight", f"System Wine not found — {install_hint('wine')}")
     wine_ver = subprocess.run(["wine", "--version"], capture_output=True, text=True)
     log_info(f"Wine: {wine_ver.stdout.strip() if wine_ver.returncode == 0 else 'found'}")
 
@@ -763,36 +793,34 @@ def step_preflight() -> StepResult:
         log_info(f"ntsync: /dev/ntsync opens (kernel {kver}); kernel-native NT sync in use")
     except OSError as e:
         warnings.append(f"/dev/ntsync does not open ({e.strerror}); Wine will use its own sync. "
-                        "Try: pacman -S ntsync-autoload, or modprobe ntsync")
-        log_warn(f"  {warnings[-1]}")
+                        f"Try: {install_hint('ntsync-autoload')}, or modprobe ntsync")
+        log_warn(f"{warnings[-1]}")
         log_warn("ntsync: /dev/ntsync not present — try: sudo modprobe ntsync")
 
-    # Wine Mono (required for .NET/FNA games: TMNT, Halls of Torment, etc.)
-    mono_paths = [
-        Path("/usr/share/wine/mono"),
-        Path("/usr/lib/wine/mono"),
-        Path.home() / ".local/share/wine/mono",
-    ]
-    has_mono = any(p.exists() and any(p.iterdir()) for p in mono_paths if p.exists())
+    # Wine Mono (required for .NET/FNA games: TMNT, etc.), where Wine looks
+    # for it (dlls/mscoree/metahost.c): Its build's /usr/share/wine/mono and
+    # /opt/wine/mono, a wine-mono-<version> directory in either.
+    mono_paths = [Path("/usr/share/wine/mono"), Path("/opt/wine/mono")]
+    has_mono = any(p.is_dir() and any(p.glob("wine-mono-*")) for p in mono_paths)
     if has_mono:
         log_info("wine-mono: found")
     else:
-        warnings.append("wine-mono not installed — .NET/FNA games will crash (pacman -S wine-mono)")
-        log_warn("wine-mono: NOT FOUND — .NET/FNA games (TMNT, Halls of Torment, etc.) will crash")
-        log_warn("  install with: pacman -S wine-mono")
+        warnings.append(f"wine-mono not installed — .NET/FNA games will crash ({install_hint('wine-mono')})")
+        log_warn("wine-mono: NOT FOUND — .NET/FNA games (TMNT, etc.) will crash")
+        log_warn(f"install with: {install_hint('wine-mono')}")
 
-    # WoW64 / 32-bit Wine (required for 32-bit games: Duke Nukem 3D, etc.)
-    has_i386_unix = Path("/usr/lib/wine/i386-unix").exists()
+    # 32-bit games: A WoW64 build runs them through wow64.dll on its i386 PE
+    # modules, with no 32-bit unix side; an older multilib build has an
+    # i386-unix tree instead.
     has_i386_win = Path("/usr/lib/wine/i386-windows").exists()
-    if has_i386_unix and has_i386_win:
-        log_info("wow64: 32-bit Wine libs found")
+    has_wow64 = Path("/usr/lib/wine/x86_64-windows/wow64.dll").exists()
+    has_i386_unix = Path("/usr/lib/wine/i386-unix").exists()
+    if has_i386_win and (has_wow64 or has_i386_unix):
+        log_info(f"wow64: 32-bit Wine modules found ({'WoW64' if has_wow64 else 'i386-unix'})")
     else:
-        missing_parts = []
-        if not has_i386_unix: missing_parts.append("i386-unix")
-        if not has_i386_win: missing_parts.append("i386-windows")
-        warnings.append(f"32-bit Wine libs missing ({', '.join(missing_parts)}) — 32-bit games will crash")
-        log_warn(f"wow64: 32-bit Wine libs NOT FOUND — 32-bit games (Duke Nukem 3D, etc.) will crash")
-        log_warn("  install with: pacman -S lib32-wine")
+        warnings.append("32-bit Wine modules missing — 32-bit games will not start")
+        log_warn("wow64: 32-bit Wine modules NOT FOUND — 32-bit games will not start")
+        log_warn(f"the wine package ships them (WoW64): {install_hint('wine')}")
 
     elapsed = (time.monotonic_ns() - t0) // 1_000_000
     return StepResult("Preflight", True, warnings=warnings, elapsed_ms=elapsed)
@@ -826,6 +854,8 @@ def step_clean() -> StepResult:
         found.append(("Cargo build cache", cargo_target, dir_size(cargo_target)))
     if WINE_SRC_DIR.exists():
         found.append(("Wine source clone", WINE_SRC_DIR, dir_size(WINE_SRC_DIR)))
+    if WINE_BRIDGE_SRC.exists():
+        found.append(("Steam bridge worktree", WINE_BRIDGE_SRC, dir_size(WINE_BRIDGE_SRC)))
     if WINE_OBJ_DIR.exists():
         found.append(("Wine build objects", WINE_OBJ_DIR, dir_size(WINE_OBJ_DIR)))
 
@@ -840,20 +870,14 @@ def step_clean() -> StepResult:
         return StepResult("Clean", True, skipped=True, elapsed_ms=elapsed)
 
     total = sum(size for _, _, size in found)
-    print()
-    print("  Existing quark installation detected:")
+    log_section("existing install", "found")
     for label, path, size in found:
-        size_str = fmt_size(size) if size else ""
-        if path and isinstance(path, Path):
-            line = f"    - {label}: {path}"
-        else:
-            line = f"    - {label}"
-        if size_str:
-            line += f" ({size_str})"
-        print(line)
+        line = f"{label}: {path}" if path and isinstance(path, Path) else label
+        if size:
+            line += f" ({fmt_size(size)})"
+        log_info(line)
     if total:
-        print(f"    Total: {fmt_size(total)}")
-    print()
+        log_info(f"existing install: {fmt_size(total)} total")
 
     # Not under --yes: The manifest gate discards the Wine clone and build
     # when an input changed, and every deploy step overwrites, so an
@@ -863,6 +887,16 @@ def step_clean() -> StepResult:
         elapsed = (time.monotonic_ns() - t0) // 1_000_000
         return StepResult("Clean", True, skipped=True, elapsed_ms=elapsed)
 
+    _clean_install(found, tmp_dir)
+    log_info("Clean slate — proceeding with fresh build")
+    elapsed = (time.monotonic_ns() - t0) // 1_000_000
+    return StepResult("Clean", True, elapsed_ms=elapsed)
+
+
+def _clean_install(found: list[tuple[str, Any, int]], tmp_dir: Path) -> None:
+    """The accepted clean: Quark's wineservers stopped, the runtime state and
+    every artifact found removed, and under --wipe-prefixes the quark-mapped
+    prefixes with their shader caches."""
     # Stop quark's wineservers, one prefix at a time
     quark_prefixes = _quark_prefixes()
     for _, pfx in quark_prefixes:
@@ -874,7 +908,7 @@ def step_clean() -> StepResult:
             shutil.rmtree(tmp_dir)
         except (PermissionError, OSError):
             log_warn(f"Could not fully remove {tmp_dir} (root-owned files from sudo?)")
-            log_warn("  Run: sudo rm -rf /tmp/quark")
+            log_warn("Run: sudo rm -rf /tmp/quark")
     remove_stale_wine_sockets()
 
     # Wipe Wine prefixes and shader caches for games mapped to quark, only on
@@ -888,8 +922,8 @@ def step_clean() -> StepResult:
                  "(--wipe-prefixes removes them and their shader caches)")
     elif quark_prefixes:
         log_warn(f"Wiping {len(quark_prefixes)} Wine prefix(es) for quark-mapped games")
-        log_warn("  Save data in Steam Cloud is NOT affected. Local-only saves")
-        log_warn("  in the prefix WILL be lost. Games: " +
+        log_warn("Save data in Steam Cloud is NOT affected. Local-only saves")
+        log_warn("in the prefix WILL be lost. Games: " +
                  ", ".join(a for a, _ in quark_prefixes))
         shadercache = STEAMAPPS / "shadercache"
         for appid, pfx in quark_prefixes:
@@ -911,11 +945,6 @@ def step_clean() -> StepResult:
             elif path.exists():
                 path.unlink()
                 log_info(f"Removed: {path}")
-
-    print()
-    log_info("Clean slate — proceeding with fresh build")
-    elapsed = (time.monotonic_ns() - t0) // 1_000_000
-    return StepResult("Clean", True, elapsed_ms=elapsed)
 
 
 # Step 3a: Sync wine source
@@ -945,7 +974,7 @@ def step_sync_wine_source() -> StepResult:
             for k, v in current_inputs.items():
                 old = stored_inputs.get(k, "<missing>")
                 if old != v:
-                    log_warn(f"  {k}: {old}  →  {v}")
+                    log_warn(f"{k}: {old}  →  {v}")
         else:
             log_info("No previous build manifest — clean clone")
         if WINE_OBJ_DIR.exists():
@@ -966,7 +995,7 @@ def step_sync_wine_source() -> StepResult:
         # the time, and let git's own failure end it otherwise.
         run_cmd(
             ["git", "clone", "--depth", "1", "-b", wine_tag, WINE_CLONE_URL, str(WINE_SRC_DIR)],
-            desc="clone Wine", capture=False, timeout=1800,
+            desc="clone Wine", timeout=1800,
         )
     else:
         log_info(f"Wine source present at {WINE_SRC_DIR}")
@@ -1006,15 +1035,12 @@ def step_build() -> StepResult:
         return StepResult("Build", True, artifacts=[binary], elapsed_ms=elapsed)
     log_info("Building quark...")
 
-    try:
-        subprocess.run(
-            ["cargo", "build", "--release", "-p", "quark"],
-            cwd=SCRIPT_DIR, timeout=600, check=True,
-        )
-    except subprocess.CalledProcessError as e:
-        raise StepFailed("build", f"cargo build exit {e.returncode}")
-    except subprocess.TimeoutExpired:
-        raise StepFailed("build", "cargo build timed out (600s)")
+    # Captured: A failure logs cargo's stderr tail under its name; on success
+    # cargo's own lines are DEBUG, in the install's log.
+    result = run_cmd(["cargo", "build", "--release", "-p", "quark"],
+                     desc="cargo build", cwd=SCRIPT_DIR, timeout=600)
+    for line in result.stderr.strip().splitlines():
+        log_debug(f"cargo build: {line.strip()}")
 
     target_dir = SCRIPT_DIR / "target" / "release"
     binary = target_dir / "quark"
@@ -1088,7 +1114,7 @@ def step_deploy_wine() -> StepResult:
     sys_bin = Path("/usr/bin")
 
     if not sys_unix.exists() or not (sys_bin / "wine").exists():
-        raise StepFailed("deploy wine", "system Wine not found at /usr/lib/wine/ — pacman -S wine")
+        raise StepFailed("deploy wine", f"system Wine not found at /usr/lib/wine/ — {install_hint('wine')}")
 
     # bin/ — wine loader + wineserver. The preloader is not here: Ntdll execs
     # the wine-preloader beside its own loader in lib/wine/x86_64-unix, which
@@ -1101,14 +1127,11 @@ def step_deploy_wine() -> StepResult:
         dst.unlink()
     # COPY — Wine resolves symlinks for wineserver discovery
     shutil.copy2(sys_bin / "wine", dst)
-    stale_preloader = bin_dir / "wine-preloader"
-    if stale_preloader.exists() or stale_preloader.is_symlink():
-        stale_preloader.unlink()
-
-    wine64_link = bin_dir / "wine64"
-    if wine64_link.exists() or wine64_link.is_symlink():
-        wine64_link.unlink()
-    wine64_link.symlink_to("wine")
+    # An earlier install's preloader and wine64 link; nothing runs either.
+    for stale in ("wine-preloader", "wine64"):
+        stale_path = bin_dir / stale
+        if stale_path.exists() or stale_path.is_symlink():
+            stale_path.unlink()
 
     # wineserver → system wineserver (matches the system Wine protocol)
     wineserver_link = bin_dir / "wineserver"
@@ -1146,13 +1169,23 @@ def step_deploy_wine() -> StepResult:
         if copied > 0:
             w = f"{subdir}: {copied} files COPIED (cross-device, re-run after Wine updates)"
             warnings.append(w)
-            log_warn(f"  {w}")
+            log_warn(f"{w}")
 
+    share_files = _deploy_share_wine(warnings)
+    log_info(f"System Wine deployed ({total_files} lib files, {share_files} share files)")
+    elapsed = (time.monotonic_ns() - t0) // 1_000_000
+    return StepResult("Deploy Wine", True, warnings=warnings, elapsed_ms=elapsed)
+
+
+def _deploy_share_wine(warnings: list[str]) -> int:
+    """The tree's share/wine from the system's; returns the files placed."""
     # share/wine/ — wine.inf, nls, fonts, winmd. Copies, NOT symlinks.
     # Wine resolves share/wine relative to the tree's bin/wine at launch time;
     # symlinks pointing back into /usr would hand it the system's files.
-    # mono/gecko are NOT deployed here — Wine downloads them into the prefix
-    # on first launch if they're not installed system-wide.
+    # Mono and Gecko stay where their packages put them: Wine also looks in
+    # its build's /usr/share/wine, through the prefix's Z: drive
+    # (dlls/mscoree/metahost.c, dlls/appwiz.cpl/addons.c), so a copy here
+    # would only duplicate them.
     share_wine = COMPAT_DIR / "share" / "wine"
     share_wine.mkdir(parents=True, exist_ok=True)
     sys_share = Path("/usr/share/wine")
@@ -1200,23 +1233,15 @@ def step_deploy_wine() -> StepResult:
                     shutil.copy2(f, target)
                 share_files += 1
 
-    # Wine Mono: Copy into share/wine so the tree is complete on its own; Wine
-    # finds share/wine relative to the tree's bin/wine, so an external symlink
-    # would point it back at the system's. Must be a real copy. Hardlinks work cross-device
-    # only on the same filesystem, so fall back to copy.
-    sys_mono = sys_share / "mono"
+    # An earlier install's copy of Mono goes; Wine loads the system's.
     dst_mono = share_wine / "mono"
-    if sys_mono.exists():
+    if dst_mono.is_symlink():
+        dst_mono.unlink()
+    elif dst_mono.exists():
         assert_quark_writable(dst_mono)
-        if dst_mono.is_symlink():
-            dst_mono.unlink()
-        if not dst_mono.exists():
-            shutil.copytree(sys_mono, dst_mono)
-            log_info(f"wine-mono: copied {sys_mono} -> {dst_mono}")
-
-    log_info(f"System Wine deployed ({total_files} lib files, {share_files} share files)")
-    elapsed = (time.monotonic_ns() - t0) // 1_000_000
-    return StepResult("Deploy Wine", True, warnings=warnings, elapsed_ms=elapsed)
+        shutil.rmtree(dst_mono)
+        log_info(f"wine-mono: removed the tree's copy; Wine loads {sys_share / 'mono'}")
+    return share_files
 
 
 # Step 6: Patch Wine
@@ -1263,16 +1288,16 @@ def step_patch_wine() -> StepResult:
             desc=f"check {patch.name}", cwd=src_dir, check=False,
         )
         if check_result.returncode != 0:
-            log_error(f"  Patch does NOT apply to this Wine version: {patch.name}")
+            log_error(f"Patch does NOT apply to this Wine version: {patch.name}")
             for line in (check_result.stderr or "").strip().splitlines()[-6:]:
-                log_error(f"    {line}")
+                log_error(f"{patch.name}: {line}")
             raise StepFailed(
                 "patch wine",
                 f"{patch.name} does not apply strictly to {derive_wine_tag()} — re-port it",
             )
         run_cmd(["git", "apply", str(patch)],
                 desc=f"apply {patch.name}", cwd=src_dir, check=True)
-        log_info(f"  Applied: {patch.name}")
+        log_info(f"Applied: {patch.name}")
 
     log_info(f"Applied {len(patches)}/{len(patches)} Wine patches")
 
@@ -1280,8 +1305,9 @@ def step_patch_wine() -> StepResult:
     if not (build_dir / "Makefile").exists():
         log_info("Configuring Wine build...")
         build_dir.mkdir(parents=True, exist_ok=True)
-        # Regenerate configure from the patched configure.ac (patches 004/005 add
-        # the lsteamclient + steam_helper makefiles). Use plain `autoconf`, NOT
+        # Regenerate configure from configure.ac, which a patch may touch (none
+        # does today; the Steam bridge registers lsteamclient and steam_helper
+        # in its own worktree's). Use plain `autoconf`, NOT
         # `autoreconf -f`: autoreconf pulls in aclocal/automake/libtoolize and,
         # on a newer host autoconf (2.73+), regenerates a BROKEN configure whose
         # conftest compiles all fail — surfacing as a false "pthread 64-bit
@@ -1301,13 +1327,6 @@ def step_patch_wine() -> StepResult:
     # headers for `a/dlls/<name>/` and `a/programs/<name>/` paths, then
     # build whatever PE+unix targets exist for that module. New patches
     # land automatically — no need to remember to edit this dict.
-    #
-    # kernelbase: EXCLUDED because it does not build as patched. Patches 005
-    # and 006 leave dlls/kernelbase/process.c calling GetFileVersionInfoExW
-    # and VerQueryValueA (process.c:523) with no declaration in scope: The
-    # module's PE build has no winver.h include and no version import, so
-    # make fails on process.o. Deploying it waits on the patches carrying
-    # the include and the import.
     dll_targets: dict[str, tuple] = {
         "ntdll": ("dlls/ntdll/ntdll.so", "ntdll.so",
                   "dlls/ntdll/x86_64-windows/ntdll.dll", "ntdll.dll"),
@@ -1317,9 +1336,7 @@ def step_patch_wine() -> StepResult:
         # name ("winepulse.drv.dll") from the .drv module dir and fail the make.
         "winepulse.drv": ("dlls/winepulse.drv/winepulse.so", "winepulse.so", None, None),
     }
-    excluded_modules = {"kernelbase"}
 
-    import re
     diff_path_re = re.compile(r"^[-+]{3} [ab]/(dlls|programs)/([^/]+)/")
     discovered: set[tuple[str, str]] = set()  # (kind, name)
     for patch in patches:
@@ -1329,7 +1346,7 @@ def step_patch_wine() -> StepResult:
                 discovered.add((m.group(1), m.group(2)))
 
     for kind, name in sorted(discovered):
-        if name in dll_targets or name in excluded_modules:
+        if name in dll_targets:
             continue
         if kind == "dlls":
             mk = src_dir / "dlls" / name / "Makefile.in"
@@ -1342,66 +1359,9 @@ def step_patch_wine() -> StepResult:
         else:  # programs
             dll_targets[name] = (None, None,
                                  f"programs/{name}/x86_64-windows/{name}.exe", f"{name}.exe")
-        log_info(f"  Auto-discovered patched module: {kind}/{name}")
+        log_info(f"Auto-discovered patched module: {kind}/{name}")
 
-    artifacts: list[Path] = []
-    failed: list[str] = []
-    for dll, (so_path, so_name, pe_path, pe_name) in dll_targets.items():
-        build_targets = []
-        if so_path:
-            build_targets.append(so_path)
-        if pe_path:
-            build_targets.append(pe_path)
-
-        log_info(f"  Building {dll}...")
-        result = run_cmd(
-            make_cmd() + build_targets,
-            desc=f"build {dll}", cwd=build_dir, timeout=300, check=False,
-        )
-        if result.returncode != 0:
-            log_error(f"  Build failed for {dll}")
-            if result.stderr:
-                for line in result.stderr.strip().splitlines()[-10:]:
-                    log_error(f"    {line}")
-            failed.append(dll)
-            continue
-
-        if so_path:
-            built_so = build_dir / so_path
-            if built_so.exists():
-                dst = wine_lib / "x86_64-unix" / so_name
-                if dst.exists():
-                    dst.unlink()
-                shutil.copy2(built_so, dst)
-                artifacts.append(dst)
-                log_info(f"  Deployed {so_name} ({built_so.stat().st_size // 1024}K)")
-            else:
-                log_error(f"  {so_name} not produced")
-                failed.append(dll)
-
-        if pe_path:
-            built_pe = build_dir / pe_path
-            if built_pe.exists():
-                if pe_name:
-                    # Deploy to Wine tree (normal DLLs)
-                    dst = wine_lib / "x86_64-windows" / pe_name
-                    if dst.exists():
-                        dst.unlink()
-                    shutil.copy2(built_pe, dst)
-                    artifacts.append(dst)
-                    log_info(f"  Deployed {pe_name} ({built_pe.stat().st_size // 1024}K)")
-                else:
-                    # Stash for prefix-only deployment (e.g. kernelbase)
-                    patched_dir = COMPAT_DIR / "lib" / "wine" / "patched"
-                    patched_dir.mkdir(parents=True, exist_ok=True)
-                    stash_name = Path(pe_path).name
-                    dst = patched_dir / stash_name
-                    shutil.copy2(built_pe, dst)
-                    artifacts.append(dst)
-                    log_info(f"  Stashed {stash_name} for prefix deploy ({built_pe.stat().st_size // 1024}K)")
-            else:
-                log_error(f"  {pe_name or Path(pe_path).name} not produced")
-                failed.append(dll)
+    artifacts, failed = _build_patched_modules(dll_targets, build_dir, wine_lib)
 
     # A patched module that did not build ships its unpatched system copy,
     # so the patch is silently absent; that fails the step, by name.
@@ -1418,18 +1378,72 @@ def step_patch_wine() -> StepResult:
     return StepResult("Patch Wine", True, artifacts=artifacts, elapsed_ms=elapsed)
 
 
+def _build_patched_modules(dll_targets: dict[str, tuple], build_dir: Path,
+                           wine_lib: Path) -> tuple[list[Path], list[str]]:
+    """Build each patched module's targets and copy what they produce into
+    the tree. Returns the files placed and the modules that failed."""
+    artifacts: list[Path] = []
+    failed: list[str] = []
+    for dll, (so_path, so_name, pe_path, pe_name) in dll_targets.items():
+        build_targets = []
+        if so_path:
+            build_targets.append(so_path)
+        if pe_path:
+            build_targets.append(pe_path)
+
+        log_info(f"Building {dll}...")
+        result = run_cmd(
+            make_cmd() + build_targets,
+            desc=f"build {dll}", cwd=build_dir, timeout=300, check=False,
+        )
+        if result.returncode != 0:
+            log_error(f"Build failed for {dll}")
+            if result.stderr:
+                for line in result.stderr.strip().splitlines()[-10:]:
+                    log_error(f"{dll}: {line}")
+            failed.append(dll)
+            continue
+
+        if so_path:
+            built_so = build_dir / so_path
+            if built_so.exists():
+                dst = wine_lib / "x86_64-unix" / so_name
+                if dst.exists():
+                    dst.unlink()
+                shutil.copy2(built_so, dst)
+                artifacts.append(dst)
+                log_info(f"Deployed {so_name} ({built_so.stat().st_size // 1024}K)")
+            else:
+                log_error(f"{so_name} not produced")
+                failed.append(dll)
+
+        if pe_path:
+            built_pe = build_dir / pe_path
+            if built_pe.exists():
+                dst = wine_lib / "x86_64-windows" / pe_name
+                if dst.exists():
+                    dst.unlink()
+                shutil.copy2(built_pe, dst)
+                artifacts.append(dst)
+                log_info(f"Deployed {pe_name} ({built_pe.stat().st_size // 1024}K)")
+            else:
+                log_error(f"{pe_name} not produced")
+                failed.append(dll)
+    return artifacts, failed
+
+
 # Step 6b: Bake prefix template
 
 def step_bake_prefix_template() -> StepResult:
-    """Run wineboot --init with stock wineserver to create a complete prefix template.
+    """Copy Proton's pre-baked default_pfx into the compat tree as the prefix
+    template, repairing the relative symlinks Proton's directory depth breaks.
 
-    This produces system.reg/user.reg with all COM class registrations (500+
-    CLSIDs from Wine's FakeDlls pass). Games need these for CoCreateInstance
-    to find mmdevapi, devenum, quartz, etc. Without them, audio init fails
-    and DXVK games show white windows.
+    Its system.reg/user.reg carry the COM class registrations games need for
+    CoCreateInstance to find mmdevapi, devenum, quartz, etc. Without them,
+    audio init fails and DXVK games show white windows.
 
-    The template is baked ONCE during install and copied into each game prefix
-    at launch time. This replaces the 45-second update_wineprefix call.
+    The template is copied ONCE during install and into each game prefix at
+    launch time. This replaces the 45-second update_wineprefix call.
     """
     t0 = time.monotonic_ns()
     template_dir = COMPAT_DIR / "default_pfx"
@@ -1468,7 +1482,7 @@ def step_bake_prefix_template() -> StepResult:
     # Games need Fonts, system32 DLLs, directory structure, etc.
     if template_dir.exists():
         shutil.rmtree(template_dir)
-    log_info(f"  Copying full prefix template from {source_pfx.parent.parent.name}...")
+    log_info(f"Copying full prefix template from {source_pfx.parent.parent.name}...")
     shutil.copytree(source_pfx, template_dir, symlinks=True)
 
     # Proton's default_pfx ships RELATIVE symlinks in subdirs (e.g.
@@ -1499,9 +1513,9 @@ def step_bake_prefix_template() -> StepResult:
                 shutil.copy2(replacement, link)
                 fixed += 1
             except OSError as e:
-                log_warn(f"  failed to repair {link.name}: {e}")
+                log_warn(f"failed to repair {link.name}: {e}")
     if fixed > 0:
-        log_info(f"  repaired {fixed} broken symlinks in default_pfx")
+        log_info(f"repaired {fixed} broken symlinks in default_pfx")
 
     total_size = sum(f.stat().st_size for f in template_dir.rglob("*") if f.is_file())
     log_info(f"prefix template: {total_size // 1024 // 1024}MB from Proton ({source_pfx.parent.parent.name})")
@@ -1537,9 +1551,9 @@ def step_build_stubs() -> StepResult:
         )
         if result.returncode == 0 and stub_dll.exists():
             artifacts.append(stub_dll)
-            log_info(f"  {stub_name}.dll stub deployed (64-bit)")
+            log_info(f"{stub_name}.dll stub deployed (64-bit)")
         else:
-            log_error(f"  Failed to build {stub_name}.dll")
+            log_error(f"Failed to build {stub_name}.dll")
 
     # 32-bit stubs
     i386_dir = wine_lib / "i386-windows"
@@ -1553,9 +1567,9 @@ def step_build_stubs() -> StepResult:
         )
         if result.returncode == 0 and stub_dll.exists():
             artifacts.append(stub_dll)
-            log_info(f"  {stub_name}.dll stub deployed (32-bit)")
+            log_info(f"{stub_name}.dll stub deployed (32-bit)")
         else:
-            log_error(f"  Failed to build {stub_name}.dll")
+            log_error(f"Failed to build {stub_name}.dll")
 
     # Cleanup
     stub_c.unlink(missing_ok=True)
@@ -1626,23 +1640,16 @@ def step_steam_bridge() -> StepResult:
     steam_cache = LSTEAMCLIENT_CACHE / "steam.exe"
 
     # Always rebuild. A stale cache with Proton-ABI binaries is the #1 cause
-    # of Steam auth failure. The build takes ~30s — not worth the risk.
+    # of Steam auth failure.
     if LSTEAMCLIENT_CACHE.exists():
         shutil.rmtree(LSTEAMCLIENT_CACHE)
 
     # Download Proton source (targeted — just lsteamclient + steam_helper)
     proton_src = _download_proton_source()
 
-    # Need wine-src for building
-    wine_src = WINE_SRC_DIR
-    if not wine_src.exists():
-        raise StepFailed("steam bridge", "wine-src not found — patch wine step must run first")
+    wine_src = _bridge_worktree()
 
-    # Reset configure.ac
-    run_cmd(["git", "checkout", "--", "configure.ac"],
-            desc="reset configure.ac", cwd=wine_src, check=False)
-
-    # Symlink lsteamclient into wine-src
+    # Symlink lsteamclient into the worktree
     src_ls = proton_src / "lsteamclient"
     if not src_ls.exists():
         raise StepFailed(
@@ -1655,7 +1662,7 @@ def step_steam_bridge() -> StepResult:
     if dll_link.is_symlink() or dll_link.exists():
         dll_link.unlink()
     dll_link.symlink_to(src_ls)
-    log_info("lsteamclient: symlinked into wine-src/dlls/")
+    log_info(f"lsteamclient: symlinked into {wine_src.name}/dlls/")
 
     # Register in configure.ac
     configure_ac = wine_src / "configure.ac"
@@ -1667,7 +1674,55 @@ def step_steam_bridge() -> StepResult:
         )
         configure_ac.write_text(text)
 
-    # Reset Proton source before patching
+    artifacts = _build_bridge(proton_src, wine_src, configure_ac, dll_cache, so_cache, steam_cache)
+
+    # Deploy
+    _deploy_lsteamclient(
+        dll_cache if dll_cache.exists() else None,
+        so_cache if so_cache.exists() else None,
+        steam_cache if steam_cache.exists() else None,
+        wine_lib,
+    )
+
+    elapsed = (time.monotonic_ns() - t0) // 1_000_000
+    return StepResult("Steam bridge", True, artifacts=artifacts, elapsed_ms=elapsed)
+
+
+def _bridge_worktree() -> Path:
+    """The bridge's own worktree of wine-src at wine-src's commit, reset and
+    cleaned, so the bridge's symlinks, configure.ac hunks and autoconf never
+    meet the tree Patch Wine resets, patches and builds in, and the two steps
+    run side by side. The bridge builds against stock Wine: lsteamclient
+    uses nothing the Wine patches add."""
+    if not (WINE_SRC_DIR / ".git").exists():
+        raise StepFailed("steam bridge", "wine-src not found — sync wine source must run first")
+    head = run_cmd(["git", "rev-parse", "HEAD"], desc="wine-src commit", cwd=WINE_SRC_DIR).stdout.strip()
+    # A reclone of wine-src drops the worktree's registration; the stale
+    # checkout goes and a new one is added.
+    if WINE_BRIDGE_SRC.exists():
+        valid = run_cmd(["git", "rev-parse", "--is-inside-work-tree"], desc="bridge worktree",
+                        cwd=WINE_BRIDGE_SRC, check=False).returncode == 0
+        if not valid:
+            assert_quark_writable(WINE_BRIDGE_SRC)
+            shutil.rmtree(WINE_BRIDGE_SRC)
+    run_cmd(["git", "worktree", "prune"], desc="prune wine-src worktrees", cwd=WINE_SRC_DIR, check=False)
+    if WINE_BRIDGE_SRC.exists():
+        run_cmd(["git", "checkout", "--detach", "--force", head], desc="reset the bridge worktree",
+                cwd=WINE_BRIDGE_SRC)
+        run_cmd(["git", "clean", "-fd"], desc="clean the bridge worktree", cwd=WINE_BRIDGE_SRC)
+    else:
+        assert_quark_writable(WINE_BRIDGE_SRC)
+        run_cmd(["git", "worktree", "add", "--detach", "--force", str(WINE_BRIDGE_SRC), head],
+                desc="add the bridge worktree", cwd=WINE_SRC_DIR, timeout=600)
+    return WINE_BRIDGE_SRC
+
+
+def _build_bridge(proton_src: Path, wine_src: Path, configure_ac: Path,
+                  dll_cache: Path, so_cache: Path, steam_cache: Path) -> list[Path]:
+    """steam_helper registered beside lsteamclient, the bridge's patches
+    applied, its build configured and run in /tmp, and what it produced
+    cached. Returns the cached files."""
+    # steam_helper beside lsteamclient, registered the same way
     steam_helper_src = proton_src / "steam_helper"
     if steam_helper_src.exists():
         helper_link = wine_src / "programs" / "steam_helper"
@@ -1693,15 +1748,15 @@ def step_steam_bridge() -> StepResult:
         if forward.returncode == 0:
             run_cmd(["git", "apply", str(pfile)],
                     desc=f"apply {pfile.name}", cwd=proton_src, check=True)
-            log_info(f"  Applied: {pfile.name}")
+            log_info(f"Applied: {pfile.name}")
             continue
         reverse = run_cmd(["git", "apply", "--check", "-R", str(pfile)],
                           desc=f"check {pfile.name} applied", cwd=proton_src, check=False)
         if reverse.returncode == 0:
-            log_info(f"  Already applied: {pfile.name}")
+            log_info(f"Already applied: {pfile.name}")
             continue
         for line in (forward.stderr or "").strip().splitlines()[-6:]:
-            log_error(f"    {line}")
+            log_error(f"{pfile.name}: {line}")
         raise StepFailed("steam bridge",
                          f"{pfile.name} does not apply strictly to Proton {PROTON_GIT_TAG} — re-port it")
 
@@ -1744,7 +1799,7 @@ def step_steam_bridge() -> StepResult:
     # Report sizes
     for label, path in [("lsteamclient.dll", dll_target), ("lsteamclient.so", so_target), ("steam.exe", steam_target)]:
         if path.exists():
-            log_info(f"  {label}: {path.stat().st_size // 1024}K")
+            log_info(f"{label}: {path.stat().st_size // 1024}K")
 
     # Cache
     LSTEAMCLIENT_CACHE.mkdir(parents=True, exist_ok=True)
@@ -1761,17 +1816,7 @@ def step_steam_bridge() -> StepResult:
 
     # Clean build tree
     shutil.rmtree(build_dir)
-
-    # Deploy
-    _deploy_lsteamclient(
-        dll_cache if dll_cache.exists() else None,
-        so_cache if so_cache.exists() else None,
-        steam_cache if steam_cache.exists() else None,
-        wine_lib,
-    )
-
-    elapsed = (time.monotonic_ns() - t0) // 1_000_000
-    return StepResult("Steam bridge", True, artifacts=artifacts, elapsed_ms=elapsed)
+    return artifacts
 
 
 def _deploy_lsteamclient(
@@ -1840,19 +1885,17 @@ def _deploy_lsteamclient(
 # installs without the flag leave the existing setting alone.
 
 def step_trace() -> StepResult:
-    """Pre-symbolicate patched Wine DLLs + delegate montauk setup to montauk.
+    """Pre-symbolicate patched Wine DLLs and switch the montauk observer on.
 
-    --observer is one switch. Quark only owns:
-      1. Running montauk's own install.py (montauk handles sublimation, caps,
-         ldconfig, /usr/local — its full stack, not ours to replicate)
-      2. Installing dump_syms via pacman if missing (the one piece montauk
-         doesn't own)
-      3. Symbolicating our patched Wine PE/ELF into Breakpad .sym files
-      4. Setting QUARK_TRACE=1 in env_config so launcher.rs spawns
-         montauk as a sibling watcher
-
-    If montauk's install or pacman fails, quark's install fails too — the
-    user opted in, so we owe them a working observer or a clean stop.
+    --observer is one switch; montauk is the user's to install. Quark only:
+      1. Checks montauk is on PATH; without it the observer stays off and
+         the install continues
+      2. Names dump_syms's package when it is missing; symbolication is
+         skipped without it
+      3. Restores montauk's eBPF capabilities when a reinstall stripped them
+      4. Symbolicates our patched Wine PE/ELF into Breakpad .sym files
+      5. Sets QUARK_TRACE=1 in env_config so launcher.rs spawns montauk as
+         a sibling watcher
     """
     t0 = time.monotonic_ns()
 
@@ -1872,13 +1915,12 @@ def step_trace() -> StepResult:
     montauk = shutil.which("montauk")
     dump_syms = shutil.which("dump_syms")
     if not montauk:
-        log_warn("Trace: `montauk` not on PATH. Install it once: "
-                 "cd ../montauk && python3 install.py.  Observer disabled.")
+        log_warn("Trace: `montauk` not on PATH; install it to use the observer. Observer disabled.")
         warnings.append("montauk missing")
         return StepResult("Trace", True, warnings=warnings, skipped=True,
                           elapsed_ms=(time.monotonic_ns() - t0) // 1_000_000)
     if not dump_syms:
-        log_warn("Trace: `dump_syms` not on PATH. Install: sudo pacman -S dump_syms. "
+        log_warn(f"Trace: `dump_syms` not on PATH. Install: {install_hint('dump_syms')}. "
                  "Continuing — observer will work, symbolication will be skipped.")
         warnings.append("dump_syms missing")
 
@@ -1887,13 +1929,12 @@ def step_trace() -> StepResult:
     #     header-only traces ("need root or CAP_BPF") — a recurring foot-gun.
     #     Idempotent: Only runs setcap (and prompts for sudo) when caps are
     #     actually missing, so it doesn't nag on every quark install.
-    import subprocess as _sp
     TRACE_CAPS = "cap_sys_admin,cap_bpf,cap_perfmon,cap_sys_resource,cap_dac_read_search+ep"
     _need = ["cap_bpf", "cap_perfmon", "cap_dac_read_search", "cap_sys_admin", "cap_sys_resource"]
     try:
-        _have = _sp.run(["getcap", montauk], capture_output=True, text=True).stdout
+        _have = subprocess.run(["getcap", montauk], capture_output=True, text=True).stdout
         if not all(c in _have for c in _need):
-            if _sp.run(["sudo", "setcap", TRACE_CAPS, montauk]).returncode == 0:
+            if subprocess.run(["sudo", "setcap", TRACE_CAPS, montauk]).returncode == 0:
                 log_info(f"Trace: applied eBPF trace caps to {montauk}")
             else:
                 log_warn(f"Trace: setcap failed — run: sudo setcap {TRACE_CAPS} {montauk}")
@@ -1936,11 +1977,11 @@ def step_trace() -> StepResult:
             dst.write_text(result.stdout)
             artifacts.append(dst)
             produced += 1
-            log_debug(f"  symbolicated {src.name} → {dst.name} "
+            log_debug(f"symbolicated {src.name} → {dst.name} "
                       f"({len(result.stdout) // 1024}K)")
         else:
             stderr_tail = (result.stderr or "").strip()[:80]
-            log_debug(f"  dump_syms skipped {src.name}: {stderr_tail or 'no debug info'}")
+            log_debug(f"dump_syms skipped {src.name}: {stderr_tail or 'no debug info'}")
     log_info(f"Trace: symbolicated {produced} modules into {sym_dir}")
 
     # 3. Toggle QUARK_TRACE=1 in env_config. Sticky — present-and-set means
@@ -2149,7 +2190,7 @@ def step_deploy_drivers() -> StepResult:
     log_info(f"PE drivers: {found}/{total} deployed (source: {source_name})")
     if warnings:
         for w in warnings:
-            log_warn(f"  {w}")
+            log_warn(f"{w}")
 
     elapsed = (time.monotonic_ns() - t0) // 1_000_000
     return StepResult("Deploy drivers", True, artifacts=artifacts,
@@ -2164,8 +2205,8 @@ def step_eac_runtime() -> StepResult:
 
     if not EAC_RUNTIME_DIR.exists():
         log_warn("Proton EasyAntiCheat Runtime not found")
-        log_warn("  EAC games (Elden Ring, etc.) will not work")
-        log_warn("  Install via: Steam > Library > Tools > 'Proton EasyAntiCheat Runtime'")
+        log_warn("EAC games (Elden Ring, etc.) will not work")
+        log_warn("Install via: Steam > Library > Tools > 'Proton EasyAntiCheat Runtime'")
         elapsed = (time.monotonic_ns() - t0) // 1_000_000
         return StepResult("EAC runtime", True, skipped=True,
                          warnings=["EAC runtime not installed"],
@@ -2238,7 +2279,6 @@ def step_prefix_sync() -> StepResult:
     src_64: dict[str, Path] = {}
     for d in [sys_wine_64,
               quark_wine / "x86_64-windows",
-              quark_wine / "patched",
               quark_wine / "dxvk" / "x86_64-windows",
               quark_wine / "vkd3d-proton" / "x86_64-windows"]:
         if d.exists():
@@ -2272,49 +2312,10 @@ def step_prefix_sync() -> StepResult:
         appid = entry.name
         if appid in PROTON_APPIDS or appid not in quark_appids:
             continue
-
-        sys32 = entry / "pfx/drive_c/windows/system32"
-        if not sys32.exists():
+        if not (entry / "pfx/drive_c/windows/system32").exists():
             continue
 
-        replaced = 0
-
-        # Walk system32: Replace every symlink, copy missing files
-        for target in sys32.iterdir():
-            if not target.is_file() and not target.is_symlink():
-                continue
-            name = target.name
-            if name in src_64:
-                if target.is_symlink():
-                    if _replace_file(src_64[name], target):
-                        replaced += 1
-                elif not target.exists():
-                    if _replace_file(src_64[name], target):
-                        replaced += 1
-
-        # Also deploy files that exist in source but not yet in prefix
-        for name, src in src_64.items():
-            target = sys32 / name
-            if not target.exists() and not target.is_symlink():
-                if _replace_file(src, target):
-                    replaced += 1
-
-        # syswow64 (32-bit)
-        syswow64 = entry / "pfx/drive_c/windows/syswow64"
-        if syswow64.exists() and src_32:
-            for target in syswow64.iterdir():
-                if not target.is_file() and not target.is_symlink():
-                    continue
-                name = target.name
-                if name in src_32 and target.is_symlink():
-                    if _replace_file(src_32[name], target):
-                        replaced += 1
-            for name, src in src_32.items():
-                target = syswow64 / name
-                if not target.exists() and not target.is_symlink():
-                    if _replace_file(src, target):
-                        replaced += 1
-
+        replaced = _sync_prefix(entry, src_64, src_32)
         if replaced:
             log_info(f"prefix {appid}: replaced {replaced} files")
             total_replaced += replaced
@@ -2327,6 +2328,27 @@ def step_prefix_sync() -> StepResult:
                      elapsed_ms=(time.monotonic_ns() - t0) // 1_000_000)
 
 
+def _sync_prefix(entry: Path, src_64: dict[str, Path], src_32: dict[str, Path]) -> int:
+    """One quark prefix's system32 and syswow64 against the source maps:
+    Every symlink is replaced with the file it stands for and every missing
+    file copied in. Returns how many it wrote."""
+    replaced = 0
+    for sub, src_map in (("system32", src_64), ("syswow64", src_32)):
+        win_dir = entry / "pfx/drive_c/windows" / sub
+        if not win_dir.exists() or not src_map:
+            continue
+        for target in win_dir.iterdir():
+            if target.is_symlink() and target.name in src_map:
+                if _replace_file(src_map[target.name], target):
+                    replaced += 1
+        for name, src in src_map.items():
+            target = win_dir / name
+            if not target.exists() and not target.is_symlink():
+                if _replace_file(src, target):
+                    replaced += 1
+    return replaced
+
+
 # Step 13: Finalize
 
 def step_finalize() -> StepResult:
@@ -2336,26 +2358,16 @@ def step_finalize() -> StepResult:
     # Env config
     config_file = COMPAT_DIR / "env_config"
     if config_file.exists():
-        text = config_file.read_text()
-        if "WINE_NTSYNC=1" not in text or text.count("# WINE_NTSYNC=1") > 0:
-            text = text.replace("# WINE_NTSYNC=1", "WINE_NTSYNC=1")
-            if "WINE_NTSYNC=1" not in text:
-                text += "\nWINE_NTSYNC=1\n"
-            config_file.write_text(text)
-        # #18 heap-corruption fix: Ensure the glibc arena-confinement tunables
-        # are present even in a preserved env_config (the template only covers
-        # freshly-created ones).
-        text = config_file.read_text()
-        added = False
-        if not _env_has_active_key(text, "GLIBC_TUNABLES"):
-            text = text.rstrip() + "\nGLIBC_TUNABLES=glibc.malloc.arena_max=1\n"
-            added = True
-        if not _env_has_active_key(text, "MALLOC_ARENA_MAX"):
-            text = text.rstrip() + "\nMALLOC_ARENA_MAX=1\n"
-            added = True
-        if added:
-            config_file.write_text(text)
-            log_info("Env config: added glibc arena-confinement tunables (#18 heap-corruption fix)")
+        # Lines quark wrote and has retired: WINE_NTSYNC=1, which no Wine
+        # reads, and the #18 heap-hunt knobs, which stock Wine 11.20 runs
+        # clean without.
+        retired = {"WINE_NTSYNC=1", "GLIBC_TUNABLES=glibc.malloc.arena_max=1",
+                   "MALLOC_ARENA_MAX=1", "MONTAUK_HEAP_STACK_SIZE=288"}
+        lines = config_file.read_text().splitlines(keepends=True)
+        kept = [line for line in lines if line.strip() not in retired]
+        if len(kept) != len(lines):
+            config_file.write_text("".join(kept))
+            log_info(f"Env config: removed {len(lines) - len(kept)} retired line(s)")
     else:
         config_file.write_text(ENV_CONFIG_TEMPLATE)
     # If step_trace ran before env_config existed, fold its toggle in now.
@@ -2420,7 +2432,7 @@ def step_smoke_test() -> StepResult:
 
     if r.returncode != 0:
         for line in (r.stderr or "").strip().splitlines()[-10:]:
-            log_error(f"  {line}")
+            log_error(f"wine --version: {line}")
         raise StepFailed("smoke test", f"wine --version exited {r.returncode}")
 
     reported = (r.stdout or "").strip()
@@ -2444,7 +2456,7 @@ def step_smoke_test() -> StepResult:
             f"compat wine reports {reported} but system wine is {expected} — "
             "compat tree may be ABI-mixed; re-run install.py"
         )
-        log_warn(f"  {warnings[-1]}")
+        log_warn(f"{warnings[-1]}")
 
     log_info(f"smoke test: {wine_bin.name} reports {reported}, ntdll.so from the tree")
     elapsed = (time.monotonic_ns() - t0) // 1_000_000
@@ -2457,7 +2469,7 @@ def configure_verbose(enable: bool | None) -> None:
     """Handle verbose flag. Sticky: stays enabled until explicitly disabled.
 
     The flag lives in CACHE_DIR (~/.cache/quark/) — NOT in COMPAT_DIR —
-    because step_clean wipes the compat dir on every install. Putting the flag
+    because step_clean wipes the compat dir when a clean is accepted. Putting the flag
     there meant `./install.py --verbose` wrote the flag, then step_clean
     deleted it five seconds later, and the launcher always saw verbose=false
     at game launch time. Moving it to CACHE_DIR makes it survive a clean.
@@ -2480,8 +2492,11 @@ def configure_verbose(enable: bool | None) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="quark installer")
-    parser.add_argument("--verbose", action="store_true", help="Enable verbose diagnostics")
-    parser.add_argument("--no-verbose", action="store_true", help="Disable verbose diagnostics")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Turn on the launcher's runtime diagnostics (sticky, read at game time)")
+    parser.add_argument("--no-verbose", action="store_true", help="Turn the launcher's runtime diagnostics off")
+    parser.add_argument("-v", dest="debug", action="store_true", help="DEBUG lines on the terminal too")
+    parser.add_argument("-q", dest="quiet", action="store_true", help="only WARN and ERROR on the terminal")
     parser.add_argument("--yes", "-y", action="store_true",
                         help="Auto-answer Y to all prompts (non-interactive)")
     parser.add_argument("--wipe-prefixes", action="store_true",
@@ -2501,6 +2516,9 @@ def main() -> int:
                              "(QUARK_TRACE=1 + QUARK_TRACE_OUT=1, eBPF caps, "
                              "montauk reachability) AND --verbose.")
     args = parser.parse_args()
+    install_exit_guard()
+    log.start("install", quiet=args.quiet, verbose=args.debug)
+    log_intro("install")
 
     if args.yes:
         global _AUTO_YES
@@ -2560,16 +2578,17 @@ def main() -> int:
                      + wine_patch_files),
         Step("Build stubs",      step_build_stubs, needs=("Deploy Wine",)),
         Step("Bake prefix",      step_bake_prefix_template, needs=("Patch Wine", "Build stubs")),
-        # Both Patch Wine and the bridge rewrite wine-src (git reset, patches,
-        # a dlls/ symlink, configure.ac, autoconf), so the bridge waits for it.
-        # The Proton sources are an input by directory identity only, since
-        # the bridge patches their contents and declares those as outputs.
-        Step("Steam bridge",     step_steam_bridge, needs=("Patch Wine", "Deploy Wine"),
+        # The bridge builds in its own worktree of wine-src, whose symlinks,
+        # configure.ac hunks and autoconf Patch Wine's tree never sees, so the
+        # two run side by side. The Proton sources are an input by directory
+        # identity only, since the bridge patches their contents and declares
+        # those as outputs.
+        Step("Steam bridge",     step_steam_bridge, needs=("Sync wine source", "Deploy Wine"),
              inputs=(wine_src_head, SCRIPT_DIR / "patches" / "lsteamclient",
                      _dir_listing(CACHE_DIR / "proton-source")),
              outputs=(LSTEAMCLIENT_CACHE / "lsteamclient.dll", LSTEAMCLIENT_CACHE / "lsteamclient.so",
                       LSTEAMCLIENT_CACHE / "steam.exe", unix / "lsteamclient.so",
-                      win64 / "lsteamclient.dll", WINE_SRC_DIR / "configure.ac")
+                      win64 / "lsteamclient.dll", WINE_BRIDGE_SRC / "configure.ac")
                      + bridge_patch_files),
         Step("Trace",            step_trace, needs=("Patch Wine", "Steam bridge")),
         Step("GPU translation",  step_gpu_translation, needs=("Deploy Wine",)),
@@ -2587,30 +2606,31 @@ def main() -> int:
     # after the pipeline finishes, install.py poisoned the system and we abort.
     log_info("Snapshotting system Wine state for poisoning audit...")
     system_wine_snapshot = snapshot_system_wine()
-    log_info(f"  {len(system_wine_snapshot)} system Wine files tracked")
+    log_info(f"{len(system_wine_snapshot)} system Wine files tracked")
 
     _prefixed_loggers()
+    t_graph = time.monotonic()
     results, rc = run_graph(steps, workers=min(4, cpu_count()))
+    graph_s = time.monotonic() - t_graph
     if rc:
-        _print_manifest(results, len(steps))
+        _print_manifest(results, graph_s)
         return rc
 
     # System Wine poisoning audit. Runs even if some steps failed — a partial
     # install that touched /usr is still a poisoning event we need to know about.
-    print()
-    log_info("Auditing system Wine state for unintended modifications...")
+    log_section("system Wine", "audit")
     try:
         verify_system_wine_unchanged(system_wine_snapshot)
-        log_info("  system Wine untouched — clean install")
+        log_info("system Wine untouched — clean install")
     except StepFailed as e:
         log_error(f"POISONING DETECTED: {e.detail}")
         results.append(StepResult("System Wine audit", False))
-        _print_manifest(results, len(steps))
+        _print_manifest(results, graph_s)
         return 2
 
     # Deployment manifest
-    print()
-    _print_manifest(results, len(steps))
+    log_blank()
+    _print_manifest(results, graph_s)
 
     failed = sum(1 for r in results if not r.success)
     if failed:
@@ -2618,26 +2638,26 @@ def main() -> int:
         return 1
 
     log_info("Save data protection: enabled (automatic pre-launch snapshots)")
-    print()
     return 0
 
 
-def _print_manifest(results: list[StepResult], total_steps: int) -> None:
+def _print_manifest(results: list[StepResult], graph_s: float) -> None:
     version = get_version()
     failed = [r for r in results if not r.success]
 
-    log_info(f"DEPLOYMENT COMPLETE — quark {version}")
+    log_info(f"DEPLOYMENT COMPLETE: quark {version}, the step graph in {graph_s:.1f} s")
 
-    # Only list what was deployed, with counts
+    # Only list what was deployed, with counts and each step's time
     for r in results:
         if r.skipped:
             continue
+        took = f"{r.elapsed_ms / 1000:.1f} s"
         if not r.success:
-            log_error(f"{r.name}: FAILED")
+            log_error(f"{r.name}: FAILED after {took}")
         elif r.artifacts:
-            log_info(f"{r.name}: {len(r.artifacts)} files")
+            log_info(f"{r.name}: {len(r.artifacts)} files in {took}")
         else:
-            log_info(f"{r.name}: done")
+            log_info(f"{r.name}: done in {took}")
 
     for r in results:
         for w in r.warnings:
@@ -2645,8 +2665,13 @@ def _print_manifest(results: list[StepResult], total_steps: int) -> None:
 
     if failed:
         log_error(f"{len(failed)} step(s) failed")
-    print()
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        rc = main()
+    except KeyboardInterrupt:
+        log_interrupted()
+        rc = 130
+    log_finish()
+    sys.exit(rc)

@@ -2,7 +2,7 @@
 log paths, the default game and the syscall names a snapshot prints."""
 import time
 from dataclasses import dataclass, field
-from quark_common import LOG_DIR, REPO_ROOT
+from quark_common import LOG_DIR
 
 
 def clock_raw_ns() -> int:
@@ -21,9 +21,6 @@ DEFAULT_APPID = "2379780"  # Balatro
 
 
 DEFAULT_TIMEOUT = 30
-
-
-BASELINES_PATH = REPO_ROOT / "tests" / "baselines.json"
 
 
 # x86_64 syscall numbers → names

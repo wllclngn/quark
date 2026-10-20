@@ -13,8 +13,7 @@ nothing runs in a container or a namespace.
 
 A launch ordered as a topological sort over declared nodes, the wineserver
 started as a node ahead of the first Wine process, a deploy cache keyed per
-component by one stat each, a PE import scan that runs only when the exe
-changes, Proton's steamclient trampoline ported to upstream Wine, the
+component by one stat each, Proton's steamclient trampoline ported to upstream Wine, the
 compat tree run from a copy of Wine's own loader so its patched modules
 load relative to it, a session held by the game's pidfd that ends the whole
 prefix on Steam's Stop and waits for it on a normal exit, save data
@@ -29,22 +28,59 @@ capture or the harness's own clock.
 ## Performance
 
 12 AMD Zen CPUs (Ryzen 5 3600), GeForce RTX 2060 (NVIDIA 615.78.08), kernel
-7.2.11-arch1-1, Wine 11.20, PANDEMONIUM as the scheduler.
+7.2.11-arch1-1, Wine 11.20. The scoreboard tables ran under EEVDF; the
+wineserver-node timings, near 3.6 s to the game's process, are the
+PANDEMONIUM scheduler's.
 
 Games are launched through `tests/run.py launch`. A cold launch starts with
 no wineserver for the prefix. A Proton run gets its own prefix beside
 quark's, so neither tool touches the other's.
 
-### Launch to the Game's Process (cold server, Balatro)
+### Launch to the Game's Process (scoreboard, median of three)
 
-| | Proton Experimental | quark |
-|---|---|---|
-| ms | 4,067 to 4,123 | **3,554 to 3,586** |
+| Game | Proton 11 | Proton Experimental | quark |
+|---|---|---|---|
+| Hollow Knight | 1,574 ms | 1,637 ms | **723 ms** |
+| Balatro | 1,654 ms | 1,657 ms | **1,319 ms** |
+| DOOM (2016) | 1,559 ms | 1,572 ms | **789 ms** |
+| TMNT: Shredder's Revenge | 1,505 ms | 1,502 ms | **671 ms** |
+| Wedding Witch | 1,499 ms | 1,504 ms | **671 ms** |
+| Halls of Torment | 1,562 ms | 1,566 ms | **723 ms** |
 
-Both tools on the same box in the same minute. The harness also times the
-game's first window, but that number does not compare across tools: Proton
-names every window of the session `steam_app_<appid>`, steam.exe's
-included, so its first match is not the game's.
+`tests/run.py scoreboard --tools proton-exp,proton11`, three runs a cell
+on warm prefixes, 30 s each. The harness also times the game's first
+window, but that number does not compare across tools: Proton names every
+window of the session `steam_app_<appid>`, steam.exe's included, so its
+first match is not the game's.
+
+### Launch to the First Frame (scoreboard, median of three)
+
+| Game | Proton 11 | Proton Experimental | quark |
+|---|---|---|---|
+| Hollow Knight | 3,899 ms | 5,484 ms | **2,608 ms** |
+| Balatro | 2,988 ms | 3,018 ms | **2,661 ms** |
+| DOOM (2016) | none in 30 s | none in 30 s | **3,594 ms** |
+| TMNT: Shredder's Revenge | none in 30 s | none in 30 s | **4,642 ms** |
+| Wedding Witch | 3,297 ms | 9,576 ms | **2,239 ms** |
+| Halls of Torment | 2,901 ms | 10,908 ms | **2,583 ms** |
+
+The first montauk snapshot that attributes GPU to the game's own
+processes. Under either Proton, neither it nor MangoHud read a frame from
+DOOM or TMNT within the cell.
+
+### Frame Times (scoreboard, MangoHud, median of three)
+
+| Game | Proton 11 | Proton Experimental | quark |
+|---|---|---|---|
+| Hollow Knight, p99 | 17.4 ms | 19.4 ms | 18.7 ms |
+| Halls of Torment, p99 | 18.8 ms | 19.0 ms | 19.5 ms |
+| DOOM (2016), p99 | none | none | 17.5 ms |
+| TMNT: Shredder's Revenge, p99 | none | none | 19.5 ms |
+
+Once a game draws, its frames pace alike under all three. Balatro draws
+through OpenGL, and the harness turns on MangoHud's Vulkan layer alone;
+Wedding Witch reads a p99 near 1 s and a 1% low of 1 under every tool,
+over the intro its 30 s cover.
 
 ### The Launcher's Own Work (cache hit)
 
@@ -74,14 +110,19 @@ the graph with its own time.
 
 `nvidia-modprobe` exec events, counted from montauk captures.
 
-### Memory (45 s into the run, every cell under the same capture)
+### Memory (scoreboard, at the cell's 30 s, median of three)
 
 | Game | Proton 11 | Proton Experimental | quark |
 |---|---|---|---|
-| Hollow Knight, resident set | 1,695 MB | 1,649 MB | **1,369 MB** |
-| Hollow Knight, processes | 13 | 13 | **11** |
-| Balatro, resident set | 1,194 MB | not run | **899 MB** |
-| Balatro, processes | 12 | not run | **10** |
+| Hollow Knight | 1,689 MB, 13 processes | 1,766 MB, 13 | **1,371 MB, 11** |
+| Balatro | 1,177 MB, 12 | 1,175 MB, 12 | **916 MB, 10** |
+| DOOM (2016) | 1,516 MB, 12 | 1,522 MB, 12 | 1,925 MB, **10** |
+| TMNT: Shredder's Revenge | 1,078 MB, 12 | 1,079 MB, 12 | 1,465 MB, **10** |
+| Wedding Witch | 1,962 MB, 13 | 1,962 MB, 13 | **1,585 MB, 11** |
+| Halls of Torment | 2,024 MB, 12 | 2,024 MB, 12 | **1,602 MB, 10** |
+
+DOOM and TMNT hold more under quark because they are drawing by then, and
+under Proton they have not drawn yet.
 
 ### ntsync on the Stock Wineserver (traced launch)
 
@@ -101,6 +142,7 @@ variable turns it on.
 
 | Event | Result |
 |---|---|
+| Steam's Stop button, launched from Steam's library | First process gone to the last in **793 ms**, nothing left |
 | Steam's Stop, SIGTERM to the launcher | Nothing left on the prefix after **1.6 s** |
 | steam.exe killed while the game runs | The game keeps running and the launcher waits |
 | The game quits | The launcher exits **4.6 s** later with nothing left |
@@ -109,13 +151,13 @@ variable turns it on.
 
 | Run | Wall time |
 |---|---|
-| As a graph, empty cache | 393 s (Patch Wine 147 s, then the Steam bridge 237 s) |
-| As a graph, every trace rebuilt, Wine object dir warm | 85 s |
-| As a graph, nothing changed | **2 s** |
+| As a graph, empty cache | **95 s** (the 7 s clone, then Patch Wine 74 s beside the Steam bridge 89 s); 130 s with the bridge after Patch Wine |
+| As a graph, every trace rebuilt, Wine object dir warm | 72 s |
+| As a graph, nothing changed | **1 s** |
 
-Patch Wine and the Steam bridge both rewrite the Wine source tree, so they
-run in series and set the cold time; every other step runs beside Patch
-Wine.
+The Steam bridge builds in its own worktree of the Wine source, so it runs
+beside Patch Wine instead of after it, and the two set the cold time
+between them; every other step runs beside them.
 
 ## Compatibility
 
@@ -126,11 +168,15 @@ Wine.
 | DOOM (2016) | id Tech 6 | Main menu, native Vulkan, Steam logged in |
 | TMNT: Shredder's Revenge | FNA/.NET | Intro cutscene |
 | Wedding Witch | Unity | Intro, skip prompt live |
-| Halls of Torment | Godot/.NET | Hero select, Steam API live |
+| Halls of Torment | Godot | Hero select, Steam API live |
 
-64-bit games; the patched modules are built for x86_64. EasyAntiCheat
-titles need the kernelbase patches deployed, which they are not yet, and
-BattlEye is not wired.
+Each launches from Steam's library through quark. "Steam API live" is
+Steam's own game process log tracking the game's process.
+
+The patched modules are built for x86_64; a 32-bit game starts under WoW64
+on Wine's own i386 modules, without the patches. EasyAntiCheat is untested:
+The kernelbase patches deploy, and no EasyAntiCheat title has run through
+quark yet. BattlEye is not wired.
 
 ## Key Features
 
@@ -145,11 +191,10 @@ and read by dependents, which always run after their producers.
 | Node | Needs | Does |
 |---|---|---|
 | **registry** | | Lays out a new prefix from the Wine tree's PE modules, seeds the template's registry and profile directories, and injects the launcher's stubs and the Steam keys after the seed, never before, since a `.reg` file that exists is never replaced. Reads neither hive when both are as its last run left them. |
-| **scan** | | Reads the game exe's import table with positional reads, never the whole file: Its render API and whether it imports `steam_api`, `nvapi` or `nvngx`. A stub with no D3D imports (the Unreal pattern) defers to the shipping binary under `Binaries/Win64`. On a cache hit the plan comes from the cache. |
-| **prefix** | registry | On a first launch, the template copy, its subdirectories on scoped threads over getdents64 and hardlinks, or `wineboot --init` without a template. On every launch, the profile directories. |
+| **prefix** | registry | On a first launch, the template copy, its subdirectories on scoped threads over getdents64 and hardlinks, or `wineboot --init` without a template. On every launch, the profile directories and `S:`, the game's Steam library, mapped as Proton maps it. |
 | **wineserver** | prefix | Starts the prefix's wineserver ahead of the session. |
-| **dxvk**, **vkd3d** | prefix, scan | DXVK (`d3d9`, `d3d10core`, `d3d11`, `dxgi`) and VKD3D-Proton (`d3d12`, `d3d12core`) into `system32`, unconditionally: Many games find D3D12 through DXGI at run time. |
-| **nvapi**, **dlss** | prefix, scan | dxvk-nvapi on every NVIDIA box, nvapi64 and nvofapi64 to `system32` and the 32-bit nvapi to `syswow64`; the DLSS modules when the game imports them. |
+| **dxvk**, **vkd3d** | prefix | DXVK (`d3d9`, `d3d10core`, `d3d11`, `dxgi`) and VKD3D-Proton (`d3d12`, `d3d12core`) into `system32`, unconditionally: Many games find D3D12 through DXGI at run time. |
+| **nvapi**, **dlss** | prefix | On every NVIDIA box, as Proton does: dxvk-nvapi, nvapi64 and nvofapi64 to `system32` and the 32-bit nvapi to `syswow64`, and the driver's own `nvngx` and `_nvngx` from its `nvidia/wine` directory. |
 | **bridge** | prefix | Valve's `steamclient64.dll`, `steamclient.dll`, `GameOverlayRenderer64.dll` and `Steam.dll` into `Program Files (x86)\Steam` from Steam's `legacycompat/`, and quark's `steam.exe` and `lsteamclient.dll` into `system32`. |
 
 ### Wineserver Ahead of the Session
@@ -178,10 +223,9 @@ fails unless the dynamic linker names the tree's `ntdll.so`.
 ### Deploy Cache
 
 One stat per component decides what a launch redeploys: The Wine tree at
-`lib/wine`, DXVK, VKD3D-Proton, Steam's `legacycompat/`, and the game exe
-by size and mtime. The cache file, `.quark_deployed` in the prefix, holds
-the five component hashes, the exe's stamp and the scan's plan, so a launch
-of an unchanged game does no import scan, no DLL copy and no hive read. A
+`lib/wine`, DXVK, VKD3D-Proton and Steam's `legacycompat/`. The cache file,
+`.quark_deployed` in the prefix, holds the four component hashes, so a
+launch over unchanged components does no DLL copy and no hive read. A
 redeployed launcher binary beside the tree is not a new Wine tree. The
 prefix's user comes from its registry's `ProfileList` in one byte scan of
 the 4 MB `system.reg`, 3 ms where a line-by-line read took 285 ms a call
@@ -289,7 +333,7 @@ file, fails the install by name; there is no fuzzy apply.
 | `wine/002-ntdll-export-wine-unix-call` | Exports `__wine_unix_call` from the PE ntdll, which the EasyAntiCheat bridge DLLs import. |
 | `wine/003-ntdll-eac-loadorder` | Builtin-first load order for the EasyAntiCheat bridge DLLs, so the runtime's bridge wins over the game's copy. |
 | `wine/004-ntdll-thread-stack-floor` | A floor under small explicit stack reserves of 64-bit threads; WoW64 threads keep the reserve they ask for. |
-| `wine/005-kernelbase-eac-launcher-detection` | `CreateProcess` sets `PROTON_EAC_LAUNCHER_PROCESS` only for a child whose version resource names it the EasyAntiCheat Launcher. Applies; the module is not deployed until its version.dll calls resolve at run time. |
+| `wine/005-kernelbase-eac-launcher-detection` | `CreateProcess` sets `PROTON_EAC_LAUNCHER_PROCESS` only for a child whose version resource names it the EasyAntiCheat Launcher, through kernelbase's own version-info calls. |
 | `wine/006-kernelbase-steam-openprocess-pid` | `OpenProcess` on Steam's placeholder PID opens the calling process. Deploys with 005. |
 | `wine/007-winepulse-nonblocking-timing-update` | The timer loop never blocks on a PulseAudio timing update and keeps at most one in flight. |
 | `lsteamclient/001-lsteamclient-link-stdcxx` | Links libstdc++ into the unix library. |
@@ -314,7 +358,6 @@ rust/src/quark/
                          spawn, the session and its end, save-data protection
   graph.rs             The launch graph's executor: Kahn's algorithm on scoped
                          threads, outputs keyed by node, per-node timings
-  pe_scanner.rs        The game exe's import table, read positionally
   log.rs               The [HH:MM:SS] [LEVEL] macros
 install.py             The installer: a step graph with verifying traces
 quark_common.py        Paths, logger, Steam and game discovery, Wine process
@@ -327,8 +370,8 @@ tests/
                          heap-repro
   harness/             The game harness: base, tools, procs, trace, metrics,
                          sched, baselines, launch, scoreboard
-  rust/                launcher.rs, pe_scanner.rs: the cargo tests, each
-                         compiling the source module it covers
+  rust/                launcher.rs: the cargo tests, compiling the source
+                         modules they cover
   verify_patches.py    Deployed package and patch verification
   test_package.py      The compat tool layout
   test_steam_safety.py The Steam-safe scoping gate
@@ -346,7 +389,7 @@ Steam
        ├─ locate: Wine tree, Steam, prefix, cache stats
        ├─ launch graph
        │    registry ── prefix ──┬── wineserver (ahead of the session)
-       │    scan ────────────────┼── dxvk, vkd3d, nvapi, dlss
+       │                         ├── dxvk, vkd3d, nvapi, dlss
        │                         └── bridge
        ├─ environment
        ├─ save snapshot (hardlinks)
@@ -368,13 +411,13 @@ Steam
 - Proton 11.0 installed in Steam (Library → Tools), for the prefix template
   and the lsteamclient source tag.
 - Rust 1.85+, clang and lld, llvm, git, patch, autoconf, bison, flex,
-  base-devel, rsync, and the Wine build dependencies for ntdll and
-  winepulse. `ccache` is used for the host compiler when present.
+  base-devel, and the Wine build dependencies for ntdll and winepulse.
+  `ccache` is used for the host compiler when present.
 
 ```bash
 # Arch Linux
 sudo pacman -S --needed steam wine wine-mono rust clang lld llvm git patch \
-  autoconf bison flex base-devel rsync gnutls libxslt libgphoto2 \
+  autoconf bison flex base-devel gnutls libxslt libgphoto2 \
   libpulse alsa-lib alsa-plugins openal libxcomposite libxinerama \
   libxrandr libxcursor libxi libxxf86vm libxdamage libxfixes libxkbcommon \
   wayland fontconfig freetype2 sdl2-compat v4l-utils libusb \
@@ -397,7 +440,7 @@ and FNA games run on.
 Then restart Steam fully (Steam → Exit; Steam reads
 `compatibilitytools.d` only at startup), open a game's Properties →
 Compatibility, tick "Force the use of a specific Steam Play compatibility
-tool" and pick **quark 0.2.0**. Steam fetches the Windows build of a game
+tool" and pick **quark 0.3.0**. Steam fetches the Windows build of a game
 it had installed natively.
 
 ## Usage
@@ -446,7 +489,8 @@ python3 tests/run.py launch 379720 --trace    # one game, under a montauk captur
 python3 tests/run.py launch --all             # every installed Windows game
 python3 tests/run.py qemu provision           # once: The VM image
 python3 tests/run.py qemu test                # the suite in a disposable VM
-python3 tests/run.py scoreboard               # the end-of-version table
+python3 tests/run.py scoreboard               # the going-to-PROD step
+python3 tests/run.py scoreboard --static-only # its static lane alone, no games
 ```
 
 `tests/run.py` is the one entry point; every other file under `tests/` is
@@ -456,7 +500,7 @@ its timeout, and a layer that cannot run reports SKIP, never PASS.
 
 | Layer | Covers |
 |---|---|
-| unit | The Rust tests under `tests/rust/`, each a `[[test]]` target compiling the module it covers: Environment assembly, the deploy cache, DLL deployment, registry seeding, the profile user, the driver layout, the Steam client files, save-data restore, and the PE scanner against synthetic PE32+ images |
+| unit | The Rust tests under `tests/rust/`, each a `[[test]]` target compiling the module it covers: Environment assembly, the deploy cache, DLL deployment, registry seeding, the profile user, the driver layout, the Steam client files, save-data restore and the `S:` drive |
 | gate | Steam-safe process scoping, with no install: No bare-name kill anywhere in the harness, and discovery that returns nothing with no quark running |
 | deploy | The deployed package's layout; every patch's added lines in the source, and the strings, symbols and PE exports it compiles in; the tree's loader a copy |
 | launch | Balatro through the harness |
@@ -470,11 +514,21 @@ one that ended before it, decided by Wine's own crash lines since steam.exe
 returns 0 for a game killed by signal. quark is the tool under test; a
 stock Proton exists only behind `--tool`.
 
-`scoreboard` is the sanity check at the end of a version, run by hand and
-never a layer: Every game through quark and any Proton tool named with
-`--tools` or `--all-tools`, once per scheduler with
-`--schedulers pandemonium,eevdf`, written to `tests/scoreboard.md` after
-every cell.
+`scoreboard` is the going-to-PROD step, run by hand before a release and
+never a layer. It runs montauk's static lane first: `montauk --static` over
+the launcher, the installer and the suite, read with `montauk --analyze` as
+the lexer's guards, each function's control flow graph and the static
+analyzer's reachability; a block unreachable from entry fails the step
+before any game launches. Then every game goes through quark and any Proton
+tool named with `--tools` or `--all-tools`, once per scheduler with
+`--schedulers pandemonium,eevdf`, written to `tests/scoreboard.md`,
+`tests/scoreboard.json` and `tests/scoreboard.prom` after every cell.
+Each cell runs three times by default and every run is archived under
+`~/.cache/quark/archive/`; the report's Baselines section is montauk's
+verdict over that archive by version (best, tied or not-best per cell, and
+the change-point trajectory), with `--tools proton11` beside quark as the
+arm that tells drift in the box from a change in quark. `--static-only`
+runs the static lane alone.
 
 ## Attribution
 

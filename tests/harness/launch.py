@@ -10,11 +10,12 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from quark_common import COMPAT_DIR, LOG_DIR, REPO_ROOT, STEAMAPPS, STEAM_ROOT, discover_all_games, find_game, log_error, log_info, log_warn
-from .base import BASELINES_PATH, DEFAULT_APPID, DEFAULT_TIMEOUT, LAUNCHER_STDERR_LOG, WINE_STDERR_LOG, WINE_STDOUT_LOG, clock_raw_ns, ns_to_ms
-from .baselines import compute_drift, load_baselines, result_to_baseline_entry, save_baselines
+from quark_common import (COMPAT_DIR, LOG_DIR, REPO_ROOT, STEAMAPPS, STEAM_ROOT, discover_all_games, find_game,
+                          log_debug, log_error, log_info, log_section, log_table, log_warn, register_exit_cleanup,
+                          table_header, table_row)
+from .base import DEFAULT_APPID, DEFAULT_TIMEOUT, LAUNCHER_STDERR_LOG, WINE_STDERR_LOG, WINE_STDOUT_LOG, clock_raw_ns, ns_to_ms
 from . import metrics as metrics_mod
-from .metrics import SCREENSHOT_CHECKPOINTS_S, _FirstSeen, _frametime_stats, _scheduler_label, take_screenshot
+from .metrics import SCREENSHOT_CHECKPOINTS_S, _FirstSeen, _GpuWatch, _frametime_stats, _scheduler_label, take_screenshot
 from .procs import _terminate_tree, _tree_pids, _tree_rss_mb, analyze_hang, cleanup_processes, snapshot_process, terminate_game
 from .tools import COMPAT_TOOLS, _compat_data_path, build, install, tool_bin
 from . import trace as trace_mod
@@ -24,21 +25,22 @@ from .trace import TRACE_BASE, _capture_stats, decode_trace, start_trace, stop_t
 _LAST_LAUNCH_STAMP: str = ""
 
 
-def _collect_stderr_analysis() -> str:
-    """Parse wine stderr for errors, aborts and unhandled exceptions."""
-    lines = []
-
-    if WINE_STDERR_LOG.exists():
-        try:
-            text = WINE_STDERR_LOG.read_text(errors="replace")
-            # Look for error messages, missing DLLs, assertion failures
-            for line in text.splitlines():
-                if any(s in line.lower() for s in ["error", "abort", "assertion", "unhandled exception"]):
-                    lines.append(f"  wine: {line.strip()[:200]}")
-        except OSError:
-            pass
-
-    return "\n".join(lines) if lines else ""
+def _report_stderr() -> None:
+    """Wine stderr's errors, aborts and unhandled exceptions: One summary
+    line with the count and where the log is; each line itself at DEBUG,
+    since the full log is already on disk."""
+    if not WINE_STDERR_LOG.exists():
+        return
+    try:
+        text = WINE_STDERR_LOG.read_text(errors="replace")
+    except OSError:
+        return
+    lines = [l.strip()[:200] for l in text.splitlines()
+             if any(s in l.lower() for s in ("error", "abort", "assertion", "unhandled exception"))]
+    if lines:
+        log_warn(f"wine stderr: {len(lines)} error lines in {WINE_STDERR_LOG}")
+        for line in lines:
+            log_debug(f"wine: {line}")
 
 
 CRASH_MARKERS = ("Unhandled exception", "Unhandled page fault", "page fault",
@@ -53,17 +55,48 @@ def _stderr_has_crash() -> bool:
     return any(m in text for m in CRASH_MARKERS)
 
 
-def launch_and_monitor(app_id: str, game_name: str, exe_path: str,
-                       timeout: int, compat_tool: str = "quark",
-                       trace: bool = False) -> tuple:
-    """Launch game, monitor, return (verdict, elapsed, snapshots, err, milestones)."""
-    global _LAST_LAUNCH_STAMP
-    _LAST_LAUNCH_STAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
-    log_info(f"launch: {game_name} ({app_id}) via {compat_tool}")
-    log_info(f"  exe: {exe_path}")
+SHADER_ROOT: Path | None = None  # set by --shader-cache; Steam's steamapps/shadercache otherwise
 
-    cleanup_processes()
 
+def _steam_cache_env(shader: Path) -> dict[str, str]:
+    """The cache variables a launch from Steam's library hands the tool, as
+    Steam handed them to Balatro's: Every driver's cache, DXVK's state cache,
+    Fossilize's layer and its dump path and the media caches, under the
+    game's one folder. Steam makes the folders before the launch; Fossilize
+    does not make its own."""
+    for sub in ("nvidiav1", "fozpipelinesv6", "fozmediav1", "DXVK_state_cache"):
+        (shader / sub).mkdir(parents=True, exist_ok=True)
+    s = str(shader)
+    return {
+        "STEAM_COMPAT_SHADER_PATH": s,
+        "STEAM_COMPAT_TRANSCODED_MEDIA_PATH": s,
+        "STEAM_COMPAT_MEDIA_PATH": f"{s}/fozmediav1",
+        "__GL_SHADER_DISK_CACHE": "1",
+        "__GL_SHADER_DISK_CACHE_PATH": f"{s}/nvidiav1",
+        "__GL_SHADER_DISK_CACHE_APP_NAME": "steamapp_shader_cache",
+        "__GL_SHADER_DISK_CACHE_READ_ONLY_APP_NAME": "steam_shader_cache;steamapp_merged_shader_cache",
+        "__GL_SHADER_DISK_CACHE_SKIP_CLEANUP": "1",
+        "MESA_SHADER_CACHE_DIR": s,
+        "MESA_SHADER_CACHE_MAX_SIZE": "5G",
+        "MESA_GLSL_CACHE_DIR": s,
+        "MESA_GLSL_CACHE_MAX_SIZE": "5G",
+        "MESA_DISK_CACHE_SINGLE_FILE": "1",
+        "MESA_DISK_CACHE_READ_ONLY_FOZ_DBS": "steam_cache,steam_precompiled",
+        "AMD_VK_USE_PIPELINE_CACHE": "1",
+        "AMD_VK_PIPELINE_CACHE_PATH": f"{s}/AMDv1",
+        "AMD_VK_PIPELINE_CACHE_FILENAME": "steamapp_shader_cache",
+        "DXVK_STATE_CACHE_PATH": f"{s}/DXVK_state_cache",
+        "ENABLE_VK_LAYER_VALVE_steam_fossilize_1": "1",
+        "STEAM_FOSSILIZE_DUMP_PATH": f"{s}/fozpipelinesv6/steamapprun_pipeline_cache",
+        "STEAM_FOSSILIZE_DUMP_PATH_READ_ONLY": "$bucketdir/steam_pipeline_cache.foz;$bucketdir/steamapp_pipeline_cache.foz",
+        "FOSSILIZE_APPLICATION_INFO_FILTER_PATH": str(STEAM_ROOT / "fossilize_engine_filters.json"),
+    }
+
+
+def _launch_env(app_id: str, exe_path: str, compat_tool: str, timeout: int) -> tuple[dict, Path | None]:
+    """The environment Steam gives a compatibility tool, with the session's
+    display and IPC variables and, on scoreboard runs, MangoHud's frame-time
+    log. Returns it and the frame-time directory, if any."""
     env = os.environ.copy()
 
     # Core Steam-compat vars (what Steam ALWAYS sets)
@@ -90,11 +123,8 @@ def launch_and_monitor(app_id: str, game_name: str, exe_path: str,
     env["STEAM_COMPAT_TOOL_PATHS"] = str(COMPAT_DIR)
     env["STEAM_COMPAT_MOUNTS"] = ""  # Steam sometimes sets this empty
 
-    # Shader/transcode caches (DXVK + audio video transcode)
-    shader_path = STEAM_ROOT / "steamapps" / "shadercache" / app_id
-    env["STEAM_COMPAT_SHADER_PATH"] = str(shader_path)
-    env["STEAM_COMPAT_TRANSCODED_MEDIA_PATH"] = \
-        str(STEAM_ROOT / "steamapps" / "transcoded")
+    shader_path = (SHADER_ROOT or STEAMAPPS / "shadercache") / app_id
+    env.update(_steam_cache_env(shader_path))
 
     # Proton verb hint — some downstream code branches on this even when
     # we invoke `proton run` directly (e.g., it controls whether Proton
@@ -122,9 +152,11 @@ def launch_and_monitor(app_id: str, game_name: str, exe_path: str,
     # Don't override EGL vendor — let Wine use GLX via UseEGL=N registry key
     env.pop("__EGL_VENDOR_LIBRARY_FILENAMES", None)
 
-    # Frame times: MangoHud's per-frame log, overlay hidden, on scoreboard
-    # runs only. Its CPU, GPU and thermal columns stay unused; montauk owns
-    # those. Both sides of an A/B carry the layer.
+    # Frame times: MangoHud's per-frame log, overlay transparent, on
+    # scoreboard runs only. MangoHud 0.8 logs nothing under no_display, so
+    # the HUD stays on with no text or background drawn. Its CPU, GPU and
+    # thermal columns stay unused; montauk owns those. Both sides of an A/B
+    # carry the layer.
     frametime_dir = None
     if metrics_mod.FRAMETIMES:
         if shutil.which("mangohud"):
@@ -133,10 +165,179 @@ def launch_and_monitor(app_id: str, game_name: str, exe_path: str,
             env["MANGOHUD"] = "1"
             # The log is written when its duration ends, so it ends ten seconds
             # before the cell's kill; a duration equal to the cell never writes.
-            env["MANGOHUD_CONFIG"] = (f"no_display,output_folder={frametime_dir},"
+            env["MANGOHUD_CONFIG"] = (f"alpha=0,background_alpha=0,output_folder={frametime_dir},"
                                       f"autostart_log=1,log_duration={max(5, timeout - 10)},log_interval=0")
         else:
             log_warn("frametimes: mangohud not on PATH; frame-time columns will be n/a")
+    return env, frametime_dir
+
+
+STEAM_GAME_LOG = STEAM_ROOT / "logs" / "gameprocess_log.txt"
+STEAM_SHIM = "steam.exe"  # the tool's in-prefix shim, which registers with the client on its own
+
+
+def _steam_log_end() -> int:
+    try:
+        return STEAM_GAME_LOG.stat().st_size
+    except OSError:
+        return 0
+
+
+def _steam_tracked(app_id: str, pids: set, log_from: int) -> bool:
+    """Whether Steam's client tracks a process of the game's tree, from the
+    lines its own log gained since the launch began. The tool's steam.exe
+    registers whether the game calls the Steam API or not, so it counts for
+    nothing; any other process registers only when its SteamAPI_Init reached
+    a running client."""
+    try:
+        with STEAM_GAME_LOG.open("rb") as f:
+            if f.seek(0, 2) < log_from:
+                log_from = 0  # Steam started a new log
+            f.seek(log_from)
+            text = f.read().decode(errors="replace")
+    except OSError:
+        return False
+    for m in re.finditer(rf"AppID {app_id} adding PID (\d+) as a tracked process", text):
+        pid = int(m.group(1))
+        if pid not in pids:
+            continue
+        try:
+            comm = Path(f"/proc/{pid}/comm").read_text().strip()
+        except OSError:
+            continue
+        if comm != STEAM_SHIM:
+            return True
+    return False
+
+
+def _milestones() -> list[str]:
+    """What Wine's stderr shows the game reached so far.
+
+    IMPORTANT: Every milestone here must be a TRUE positive — substring
+    matches that fire on error screens, helper windows, or unrelated
+    codepaths are misleading and have caused multiple "looks playable"
+    hallucinations. The bar:
+      - "CRASH" requires an actual exit/SIGSEGV, not "Unhandled" which
+        appears in stub fixme lines that don't crash anything
+    """
+    try:
+        stderr_text = WINE_STDERR_LOG.read_text(errors="replace") if WINE_STDERR_LOG.exists() else ""
+    except OSError:
+        return []
+    milestones = []
+    if "winex11.drv" in stderr_text:
+        milestones.append("x11drv")
+    if "XRandR" in stderr_text:
+        milestones.append("XRandR")
+    if "NO GAME" in stderr_text or "love" in stderr_text.lower():
+        milestones.append("LÖVE")
+
+    # CRASH: A real exit from the launcher with non-zero status, OR
+    # an actual SIGSEGV trace. "Unhandled" alone is too noisy.
+    if re.search(r'\[quark\] exit: [1-9]', stderr_text) or "SIGSEGV" in stderr_text:
+        milestones.append("CRASH")
+    # LOVE error screen specifically — different from a quark crash
+    if 'love "callbacks.lua"' in stderr_text or "module 'engine/object'" in stderr_text:
+        milestones.append("LOVE_ERROR")
+
+    if any(f"err:service" in l for l in stderr_text.splitlines()[-5:]):
+        milestones.append("SVC_ERR")
+    return milestones
+
+
+HANG_QUIET_MS = 10_000  # a game that rendered, then ran on no CPU this long, is hung
+
+
+def _monitor(proc, app_id: str, compat_tool: str, t0: int, timeout: int, gpu: _GpuWatch,
+             steam_log_from: int) -> tuple:
+    """Poll the launch every two seconds until the timeout: Its process tree,
+    the checkpoint screenshots, the milestones in Wine's stderr, STEAM_API
+    from Steam's own log, and RENDER and HANG from montauk's GPU
+    attribution. The launcher waits on the game,
+    so its exit with the tree empty means the game is gone, and the watch
+    ends there. Returns the launcher's exit code then, or None at the
+    timeout, the elapsed seconds and the milestones."""
+    poll_interval = 2
+    milestones_seen: set = set()
+    for _ in range(timeout // poll_interval):
+        time.sleep(poll_interval)
+        ret = proc.poll()
+        elapsed = ns_to_ms(clock_raw_ns() - t0) / 1000
+        pids = sorted(_tree_pids(app_id, compat_tool))
+        if ret is not None and not pids:
+            return ret, elapsed, milestones_seen
+
+        # Screenshot checkpoints — capture full screen at fixed elapsed times
+        # so we can see what was actually rendered without the user typing it.
+        # Files land in LOG_DIR/screenshots/ with the same {appid}_{stamp}
+        # prefix as the archived wine_stderr.log.
+        for cp in SCREENSHOT_CHECKPOINTS_S:
+            if cp <= elapsed < cp + poll_interval:
+                shot = take_screenshot(app_id, _LAST_LAUNCH_STAMP, cp)
+                if shot:
+                    log_info(f"screenshot: {shot.name}")
+                break
+
+        milestones = _milestones()
+        if "STEAM_API" in milestones_seen or _steam_tracked(app_id, set(pids), steam_log_from):
+            milestones.append("STEAM_API")
+        if gpu.render_ms is not None:
+            milestones.append("RENDER")
+        if gpu.quiet_since_ms is not None and elapsed * 1000 - gpu.quiet_since_ms >= HANG_QUIET_MS:
+            if "HANG" not in milestones_seen:
+                log_warn(f"[{elapsed:.0f}s] the game has run on no CPU for "
+                         f"{HANG_QUIET_MS // 1000} s since it rendered: hung")
+            milestones.append("HANG")
+        milestones_seen.update(milestones)
+        pid_str = f" pids={pids}" if pids else ""
+        ms_str = f" | {' '.join(milestones)}" if milestones else ""
+        log_info(f"[{elapsed:.0f}s]{pid_str}{ms_str}")
+    return None, ns_to_ms(clock_raw_ns() - t0) / 1000, milestones_seen
+
+
+def _finish_metrics(metrics: dict, watcher, gpu: _GpuWatch, pids: set, frametime_dir: Path | None) -> None:
+    """The launch's metrics once it is over: Its first exec, window and GPU
+    draw, its tree's size and memory and its frame times."""
+    watcher.stop()
+    gpu.stop()
+    metrics["exec_ms"] = watcher.exec_ms
+    metrics["window_ms"] = watcher.window_ms
+    metrics["render_ms"] = gpu.render_ms
+    metrics["procs"] = len(pids)
+    metrics["rss_mb"] = round(_tree_rss_mb(pids), 1)
+    metrics.update(_frametime_stats(frametime_dir))
+    log_info(f"metrics: exec={metrics['exec_ms']}ms window={metrics['window_ms']}ms "
+             f"render={metrics['render_ms']}ms procs={metrics['procs']} rss={metrics['rss_mb']}MB")
+
+
+def _teardown(proc, compat_tool: str, tree: set | None, trace_proc, trace_dir, metrics: dict) -> None:
+    """The launch's end: The game tree when it outlived the timeout, then the
+    trace, its report set and anything left of the session."""
+    if tree is not None:
+        if compat_tool == "quark":
+            terminate_game(proc)
+        else:
+            _terminate_tree(tree - {proc.pid})
+            proc.kill()
+            proc.wait()
+    stop_trace(trace_proc)
+    decode_trace(trace_dir)
+    metrics.update(_capture_stats(trace_dir))
+    trim_trace(trace_dir)
+    cleanup_processes()
+
+
+def launch_and_monitor(app_id: str, game_name: str, exe_path: str,
+                       timeout: int, compat_tool: str = "quark",
+                       trace: bool = False) -> tuple:
+    """Launch game, monitor, return (verdict, elapsed, snapshots, err, milestones, metrics)."""
+    global _LAST_LAUNCH_STAMP
+    _LAST_LAUNCH_STAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_info(f"launch: {game_name} ({app_id}) via {compat_tool}")
+    log_info(f"exe: {exe_path}")
+
+    cleanup_processes()
+    env, frametime_dir = _launch_env(app_id, exe_path, compat_tool, timeout)
 
     # Optional montauk trace, started before the workload so BPF programs
     # attach in time to catch early file syscalls (PHYSFS archive scan).
@@ -152,12 +353,12 @@ def launch_and_monitor(app_id: str, game_name: str, exe_path: str,
         # game's comm doesn't match the pattern until well after Mono init.
         # The launcher is exec'd through the compat dir's `proton` symlink,
         # so its comm is "proton", and montauk follows its whole tree from
-        # there; one name, because montauk's comma list honours only the
-        # first (a two-name pattern captured nothing at all).
+        # there.
         exe_name = "proton"
         trace_proc, trace_dir = start_trace(
             app_id, compat_tool, _LAST_LAUNCH_STAMP, exe_name)
 
+    steam_log_from = _steam_log_end()
     t0 = clock_raw_ns()
 
     try:
@@ -182,129 +383,28 @@ def launch_and_monitor(app_id: str, game_name: str, exe_path: str,
 
     watcher = _FirstSeen(exe_path, app_id, t0)
     watcher.start()
+    gpu = _GpuWatch(watcher, t0)
+    gpu.start()
     metrics = {"appid": app_id, "tool": compat_tool, "scheduler": _scheduler_label(),
-               "exec_ms": None, "window_ms": None, "procs": 0, "rss_mb": 0.0}
+               "exec_ms": None, "window_ms": None, "render_ms": None, "procs": 0, "rss_mb": 0.0}
+    ret, elapsed, milestones_seen = _monitor(proc, app_id, compat_tool, t0, timeout, gpu, steam_log_from)
 
-    def _finish_metrics(pids: set) -> dict:
-        watcher.stop()
-        metrics["exec_ms"] = watcher.exec_ms
-        metrics["window_ms"] = watcher.window_ms
-        metrics["procs"] = len(pids)
-        metrics["rss_mb"] = round(_tree_rss_mb(pids), 1)
-        metrics.update(_frametime_stats(frametime_dir))
-        log_info(f"metrics: exec={metrics['exec_ms']}ms window={metrics['window_ms']}ms "
-                 f"procs={metrics['procs']} rss={metrics['rss_mb']}MB")
-        return metrics
-
-    poll_interval = 2
-    ticks = timeout // poll_interval
-    milestones_seen: set = set()
-
-    for tick in range(ticks):
-        time.sleep(poll_interval)
-
-        # Check if proton launcher exited — but DON'T stop monitoring.
-        # The launcher exits quickly after spawning wine64. The game runs
-        # as a background Wine process. Keep monitoring until timeout or
-        # until all Wine processes exit.
-        ret = proc.poll()
-        if ret is not None and not hasattr(proc, '_launcher_exited'):
-            proc._launcher_exited = True  # mark but don't stop
-
-        elapsed = ns_to_ms(clock_raw_ns() - t0) / 1000
-        pids = sorted(_tree_pids(app_id, compat_tool))
-        pid_str = f" pids={[p for p in pids]}" if pids else ""
-
-        # The launcher waits on the game, so launcher exit plus an empty
-        # process tree means the game is gone before the timeout. The
-        # launcher's code alone cannot score it: steam.exe returns 0 for a
-        # game that died by signal, so Wine's own crash lines in stderr
-        # decide alongside it.
-        if ret is not None and not pids:
-            verdict = "crash" if ret != 0 or _stderr_has_crash() else "exit"
-            log_warn(f"[{elapsed:.0f}s] game tree gone, launcher exit {ret}: {verdict}")
-            stderr_report = _collect_stderr_analysis()
-            if stderr_report:
-                print(stderr_report)
-            m = _finish_metrics(set())
-            stop_trace(trace_proc)
-            decode_trace(trace_dir)
-            m.update(_capture_stats(trace_dir))
-            trim_trace(trace_dir)
-            cleanup_processes()
-            return (verdict, elapsed, [], f"launcher exit {ret}", milestones_seen, m)
-
-        # Screenshot checkpoints — capture full screen at fixed elapsed times
-        # so we can see what was actually rendered without the user typing it.
-        # Files land in LOG_DIR/screenshots/ with the same {appid}_{stamp}
-        # prefix as the archived wine_stderr.log.
-        for cp in SCREENSHOT_CHECKPOINTS_S:
-            if cp <= elapsed < cp + poll_interval:
-                shot = take_screenshot(app_id, _LAST_LAUNCH_STAMP, cp)
-                if shot:
-                    log_info(f"screenshot: {shot.name}")
-                break
-
-        # Check wine_stderr for milestones.
-        #
-        # IMPORTANT: Every milestone here must be a TRUE positive — substring
-        # matches that fire on error screens, helper windows, or unrelated
-        # codepaths are misleading and have caused multiple "looks playable"
-        # hallucinations. The bar:
-        #   - "STEAM_API" requires the bridge to actually answer, not just
-        #     for the string "steam_api64" to appear in a load message
-        #   - "CRASH" requires an actual exit/SIGSEGV, not "Unhandled" which
-        #     appears in stub fixme lines that don't crash anything
-        milestones = []
-        try:
-            stderr_text = WINE_STDERR_LOG.read_text(errors="replace") if WINE_STDERR_LOG.exists() else ""
-            if "winex11.drv" in stderr_text:
-                milestones.append("x11drv")
-            if "XRandR" in stderr_text:
-                milestones.append("XRandR")
-            if "NO GAME" in stderr_text or "love" in stderr_text.lower():
-                milestones.append("LÖVE")
-
-            # CRASH: A real exit from the launcher with non-zero status, OR
-            # an actual SIGSEGV trace. "Unhandled" alone is too noisy.
-            if re.search(r'\[quark\] exit: [1-9]', stderr_text) or "SIGSEGV" in stderr_text:
-                milestones.append("CRASH")
-            # LOVE error screen specifically — different from a quark crash
-            if 'love "callbacks.lua"' in stderr_text or "module 'engine/object'" in stderr_text:
-                milestones.append("LOVE_ERROR")
-
-            if "steam_api64" in stderr_text:
-                milestones.append("STEAM_API")
-            if any(f"err:service" in l for l in stderr_text.splitlines()[-5:]):
-                milestones.append("SVC_ERR")
-        except Exception:
-            pass
-        milestones_seen.update(milestones)
-        ms_str = f" | {' '.join(milestones)}" if milestones else ""
-
-        log_info(f"[{elapsed:.0f}s]{pid_str}{ms_str}")
-
-    # Timeout
-    elapsed_ns = clock_raw_ns() - t0
-    elapsed = ns_to_ms(elapsed_ns) / 1000
-    tree = _tree_pids(app_id, compat_tool)
-    snaps = [snapshot_process(p) for p in sorted(tree)]
-    stderr_report = _collect_stderr_analysis()
-    if stderr_report:
-        print(stderr_report)
-    m = _finish_metrics(tree)
-    if compat_tool == "quark":
-        terminate_game(proc)
+    if ret is not None:
+        # The launcher's code alone cannot score a game gone before the
+        # timeout: steam.exe returns 0 for a game that died by signal, so
+        # Wine's own crash lines in stderr decide alongside it.
+        verdict = "crash" if ret != 0 or _stderr_has_crash() else "exit"
+        log_warn(f"[{elapsed:.0f}s] game tree gone, launcher exit {ret}: {verdict}")
+        tree, snaps, err = set(), [], f"launcher exit {ret}"
     else:
-        _terminate_tree(tree - {proc.pid})
-        proc.kill()
-        proc.wait()
-    stop_trace(trace_proc)
-    decode_trace(trace_dir)
-    m.update(_capture_stats(trace_dir))
-    trim_trace(trace_dir)
-    cleanup_processes()
-    return ("timeout", elapsed, snaps, "", milestones_seen, m)
+        verdict = "timeout"
+        tree = _tree_pids(app_id, compat_tool)
+        snaps = [snapshot_process(p) for p in sorted(tree)]
+        err = ""
+    _report_stderr()
+    _finish_metrics(metrics, watcher, gpu, tree, frametime_dir)
+    _teardown(proc, compat_tool, tree if ret is None else None, trace_proc, trace_dir, metrics)
+    return (verdict, elapsed, snaps, err, milestones_seen, metrics)
 
 
 # Report
@@ -320,10 +420,9 @@ def print_report(verdict: str, elapsed: float, snapshots: list):
     if snapshots:
         analysis = analyze_hang(snapshots)
         if analysis:
-            log_info(f"hang analysis:")
             for line in analysis.split("\n"):
                 if line.strip():
-                    print(f"  {line.strip()}")
+                    log_info(f"hang: {line.strip()}")
 
 
 def run_single_game(appid, game_name, exe_path, timeout, skip_build,
@@ -345,7 +444,6 @@ def run_single_game(appid, game_name, exe_path, timeout, skip_build,
     stderr_text = ""
     if WINE_STDERR_LOG.exists():
         stderr_text = WINE_STDERR_LOG.read_text(errors="replace")
-    steam_auth_ok = "Failed to find steamclient_init_registry" not in stderr_text
     has_crash = "Unhandled page fault" in stderr_text or "page fault" in stderr_text
 
     # Archive — reuse the launch stamp so archived logs and screenshots
@@ -382,7 +480,7 @@ def run_single_game(appid, game_name, exe_path, timeout, skip_build,
         "name": game_name,
         "verdict": verdict,
         "elapsed": elapsed,
-        "steam_auth": steam_auth_ok,
+        "steam_api": "STEAM_API" in milestones,
         "crash": has_crash,
         "milestones": milestones,
         "compat_tool": compat_tool,
@@ -390,10 +488,9 @@ def run_single_game(appid, game_name, exe_path, timeout, skip_build,
     }
 
 
-def run_all_games(timeout, skip_build, update_baseline=False,
-                  compat_tool: str = "quark", trace: bool = False) -> int:
-    """Discover and test all Steam games. Print summary table.
-    Returns number of regressions (0 = clean, >0 = at least one game drifted)."""
+def run_all_games(timeout, skip_build, compat_tool: str = "quark", trace: bool = False) -> int:
+    """Discover and test all Steam games and print the summary table.
+    Returns the number that crashed."""
     games = discover_all_games()
     if not games:
         log_error("no games found")
@@ -401,8 +498,7 @@ def run_all_games(timeout, skip_build, update_baseline=False,
 
     log_info(f"found {len(games)} games to test (compat_tool={compat_tool}, trace={trace})")
     for appid, name, _ in games:
-        log_info(f"  {appid:>8}  {name}")
-    print()
+        log_info(f"game: {appid} {name}")
 
     # Build/deploy once. Stock Proton has nothing to compile or copy.
     if compat_tool == "quark":
@@ -415,64 +511,35 @@ def run_all_games(timeout, skip_build, update_baseline=False,
 
     # Verify patches only when running against quark (otherwise irrelevant).
     if compat_tool == "quark":
-        log_info("running patch verification...")
+        log_section("patches", "verify")
         r = subprocess.run([sys.executable, str(REPO_ROOT / "tests" / "verify_patches.py")],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, env=dict(os.environ, QUARK_CHILD="1"))
+        # The child's lines are already in the house format: Relay only its
+        # failures and its counting line, verbatim.
         for line in r.stdout.splitlines():
-            if "[FAIL]" in line or "RESULTS" in line:
-                print(f"  {line.strip()}")
+            if "[ERROR]" in line or "PATCHES:" in line:
+                print(line, flush=True)
         if r.returncode != 0:
             log_warn("patch verification had failures (continuing anyway for dev testing)")
-        else:
-            log_info("patch verification passed")
-        print()
-
-    baselines = load_baselines()
 
     results = []
     for i, (appid, name, exe) in enumerate(games):
-        log_info(f"GAME {i+1}/{len(games)}: {name} ({appid})")
-        res = run_single_game(appid, name, exe, timeout, skip_build=True,
-                              compat_tool=compat_tool, trace=trace)
-        res["drifts"] = compute_drift(res, baselines.get(appid, {}))
-        res["has_baseline"] = appid in baselines
-        results.append(res)
-        print()
+        log_section(name, "launch")
+        log_info(f"game {i + 1} of {len(games)}, appid {appid}")
+        results.append(run_single_game(appid, name, exe, timeout, skip_build=True,
+                                       compat_tool=compat_tool, trace=trace))
 
-    # Summary table
-    print(f"  {'Game':<40} {'Verdict':<10} {'Steam':>6} {'Crash':>6}  {'Drift':<30}")
+    widths = [10, 6, 6]
+    rows = [table_header("GAME", ["VERDICT", "STEAM", "CRASH"], col_w=widths)]
     for r in results:
-        name = r["name"][:39]
-        verdict = r["verdict"]
-        steam = "OK" if r.get("steam_auth") else "FAIL"
-        crash = "YES" if r.get("crash") else "no"
-        if not r.get("has_baseline"):
-            drift = "(no baseline)"
-        elif r.get("drifts"):
-            drift = "; ".join(r["drifts"])[:30]
-        else:
-            drift = "OK"
-        print(f"  {name:<40} {verdict:<10} {steam:>6} {crash:>6}  {drift:<30}")
-
-    regressed = [r for r in results if r.get("drifts")]
-    if regressed:
-        print("\nREGRESSIONS:")
-        for r in regressed:
-            print(f"  {r['name']} ({r['appid']}):")
-            for d in r["drifts"]:
-                print(f"    - {d}")
+        rows.append(table_row(r["name"][:28], [r["verdict"], "live" if r.get("steam_api") else "no",
+                                               "yes" if r.get("crash") else "no"], col_w=widths))
+    log_table(rows)
 
     ok = sum(1 for r in results if r["verdict"] == "timeout" and not r.get("crash"))
     crashed = sum(1 for r in results if r.get("crash"))
-    print(f"\n  {len(results)} games | {ok} running | {crashed} crashed | {len(regressed)} regressed")
-
-    if update_baseline:
-        for r in results:
-            baselines[r["appid"]] = result_to_baseline_entry(r)
-        save_baselines(baselines)
-        log_info(f"baseline: wrote {len(results)} entries to {BASELINES_PATH}")
-
-    return len(regressed)
+    (log_warn if crashed else log_info)(f"LAUNCH: {len(results)} games, {ok} running, {crashed} crashed")
+    return crashed
 
 
 # THE COMMAND LINE: tests/run.py launch
@@ -487,13 +554,16 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--exe", default=None, help="launch this exe instead of the one found for the app")
     parser.add_argument("--trace", action="store_true",
                         help="capture the launch under montauk (needs cap_bpf and cap_perfmon on it)")
+    parser.add_argument("--trace-classes", metavar="LIST",
+                        help="with --trace, capture only these event classes (montauk's --trace-classes)")
     parser.add_argument("--frametimes", action="store_true",
-                        help="log frame times through MangoHud, overlay hidden, when it is installed")
+                        help="log frame times through MangoHud, overlay transparent, when it is installed")
+    parser.add_argument("--shader-cache", metavar="DIR", default=None,
+                        help="keep the game's shader caches under DIR/<appid> instead of Steam's "
+                             "steamapps/shadercache, for a launch from an empty cache")
     parser.add_argument("--metrics-json", default=None, help="write the verdict and metrics to this file")
     parser.add_argument("--keep-trace", action="store_true",
                         help="with --trace, keep the raw 200 MB capture after its report set is written")
-    parser.add_argument("--update-baseline", action="store_true",
-                        help="record this run's milestones as the game's baseline")
     parser.add_argument("--tool", choices=list(COMPAT_TOOLS), default="quark",
                         help="the compatibility tool to launch through. quark is the tool under "
                              "test; a Proton entry is an A/B run against stock Proton and nothing "
@@ -501,15 +571,18 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def run(args: argparse.Namespace) -> int:
+    global SHADER_ROOT
+    # An interrupted or failed launch must not leave the game's tree behind.
+    register_exit_cleanup(cleanup_processes)
+    SHADER_ROOT = Path(args.shader_cache) if args.shader_cache else None
     metrics_mod.FRAMETIMES = args.frametimes
     trace_mod.KEEP_TRACE = args.keep_trace
+    trace_mod.CLASSES = args.trace_classes
     tool = args.tool
 
     if args.all:
-        regressions = run_all_games(args.timeout, args.skip_build,
-                                    update_baseline=args.update_baseline,
-                                    compat_tool=tool, trace=args.trace)
-        return 1 if regressions else 0
+        crashed = run_all_games(args.timeout, args.skip_build, compat_tool=tool, trace=args.trace)
+        return 1 if crashed else 0
 
     game_name, exe_path = find_game(args.appid)
     if args.exe:
@@ -539,25 +612,6 @@ def run(args: argparse.Namespace) -> int:
         log_error(err)
         return 1
 
-    stderr_text = WINE_STDERR_LOG.read_text(errors="replace") if WINE_STDERR_LOG.exists() else ""
-    has_crash = "Unhandled page fault" in stderr_text or "page fault" in stderr_text
-    current_result = {"appid": args.appid, "name": game_name, "milestones": milestones, "crash": has_crash}
-    baselines = load_baselines()
-    baseline = baselines.get(args.appid, {})
-    drifts = compute_drift(current_result, baseline)
-    if not baseline:
-        log_info(f"baseline: no baseline for appid={args.appid} (run --update-baseline to create)")
-    elif drifts:
-        log_warn(f"REGRESSION ({game_name}):")
-        for d in drifts:
-            print(f"  - {d}")
-    else:
-        log_info(f"baseline: no drift from {baseline.get('updated', '?')} snapshot")
-    if args.update_baseline:
-        baselines[args.appid] = result_to_baseline_entry(current_result)
-        save_baselines(baselines)
-        log_info(f"baseline: updated {args.appid} in {BASELINES_PATH}")
-
     # Archive the run's logs under the launch stamp, so logs, screenshots and
     # the capture share one {appid}_{stamp}_{tool} prefix.
     stamp = _LAST_LAUNCH_STAMP or datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -584,4 +638,4 @@ def run(args: argparse.Namespace) -> int:
                 log_warn(f"trace: archive copy failed: {e}")
     log_info(f"logs archived: {LOG_DIR}/runs/{prefix}_*")
 
-    return 1 if (verdict == "crash" or (drifts and not args.update_baseline)) else 0
+    return 1 if verdict == "crash" else 0

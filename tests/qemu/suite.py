@@ -23,7 +23,6 @@ montauk's captures land in LOG_DIR after it. guest.py copies both back.
 import argparse
 import json
 import os
-import signal
 import subprocess
 import sys
 import time
@@ -33,7 +32,7 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from quark_common import (
     STEAM_ROOT, STEAMAPPS, COMPAT_DIR, LOG_DIR, SUITE_DIR, MONTAUK_SRC, WINE_SRC_DIR,
-    log_info, log_warn, log_error, stop_prefix_wineserver,
+    log_info, log_warn, log_error, stop_observer, stop_prefix_wineserver,
 )
 
 PROBE_SRC = Path(__file__).resolve().parent / "probes"
@@ -56,6 +55,9 @@ PROBE_LIBS = {
     "audio": ["-lole32"],
     "gl_heap_stress": ["-lopengl32", "-lgdi32", "-lole32", "-lwinmm"],
 }
+# Also built for i386 and run under WoW64 as <name>32, so a prefix that
+# cannot start a 32-bit process fails the suite.
+PROBES_I386 = {"window"}
 
 
 def start_display_and_audio() -> None:
@@ -99,18 +101,21 @@ def build_probes(selector: str | None) -> list[tuple[str, Path]]:
     PROBE_BIN.mkdir(parents=True, exist_ok=True)
     built = []
     for src in sorted(PROBE_SRC.glob("*.c")):
-        name = src.stem
-        if selector and selector not in name:
-            continue
-        exe = PROBE_BIN / f"{name}.exe"
-        cmd = ["x86_64-w64-mingw32-gcc", "-O2", "-Wall", f'-DPROBE_NAME="{name}"',
-               "-o", str(exe), str(src), *PROBE_LIBS.get(name, [])]
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode != 0:
-            log_error(f"build {name}:\n{r.stderr.strip()}")
-            built.append((name, None))
-            continue
-        built.append((name, exe))
+        variants = [(src.stem, "x86_64-w64-mingw32-gcc")]
+        if src.stem in PROBES_I386:
+            variants.append((src.stem + "32", "i686-w64-mingw32-gcc"))
+        for name, cc in variants:
+            if selector and selector not in name:
+                continue
+            exe = PROBE_BIN / f"{name}.exe"
+            cmd = [cc, "-O2", "-Wall", f'-DPROBE_NAME="{name}"',
+                   "-o", str(exe), str(src), *PROBE_LIBS.get(src.stem, [])]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode != 0:
+                log_error(f"build {name}:\n{r.stderr.strip()}")
+                built.append((name, None))
+                continue
+            built.append((name, exe))
     return built
 
 
@@ -128,23 +133,6 @@ def probe_env(traced: bool) -> dict[str, str]:
         "DXVK_LOG_PATH": str(RESULTS),
     })
     return env
-
-
-def stop_observer(trace: Path) -> None:
-    """SIGINT the observer writing `trace` so it flushes and closes the
-    capture; it is matched by that path, which only this probe's has."""
-    needle = str(trace).encode()
-    for pid in filter(str.isdigit, os.listdir("/proc")):
-        try:
-            if needle not in Path(f"/proc/{pid}/cmdline").read_bytes():
-                continue
-            os.kill(int(pid), signal.SIGINT)
-        except OSError:
-            continue
-        for _ in range(100):
-            if not Path(f"/proc/{pid}").exists():
-                break
-            time.sleep(0.1)
 
 
 def analyze_capture(name: str, trace: Path) -> None:

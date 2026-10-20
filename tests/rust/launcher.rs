@@ -1,15 +1,12 @@
 // launcher against fixture trees: environment assembly, the deploy cache,
 // env_config parsing, prefix copying, registry seeding, DLL deployment, Wine
-// binary discovery and save-data protection.
+// binary discovery, the S: drive and save-data protection.
 
 // The launcher compiles whole into this crate while the tests reach part of
 // it, so the rest reads as dead code here and only here.
 #[allow(dead_code)]
 #[path = "../../rust/src/quark/log.rs"]
 mod log;
-#[allow(dead_code)]
-#[path = "../../rust/src/quark/pe_scanner.rs"]
-mod pe_scanner;
 #[allow(dead_code)]
 #[path = "../../rust/src/quark/graph.rs"]
 mod graph;
@@ -103,9 +100,14 @@ fn env_vars_share_one_definition_of_the_search_paths() {
     t.dir("lib/wine/x86_64-unix");
     t.dir("lib/wine/x86_64-windows");
     let pfx = t.dir("pfx");
-    let vars = build_env_vars(t.path(), &pfx, &["d3d11", "dxgi"], &["d3d12"], &[], &[], false);
+    let vars = build_env_vars(t.path(), &pfx, &["d3d11", "dxgi"], &["d3d12"], &[], &[]);
 
-    assert_eq!(var(&vars, "WINEDLLPATH"), Some(wine_dll_path(t.path()).as_str()));
+    // The tree's own search paths, then the EAC runtime's where it is installed.
+    let dll_path = var(&vars, "WINEDLLPATH").unwrap();
+    let rest = dll_path.strip_prefix(wine_dll_path(t.path()).as_str())
+        .expect("WINEDLLPATH starts with the tree's search paths");
+    assert!(rest.split(':').filter(|p| !p.is_empty()).all(|p| p.contains("Proton EasyAntiCheat Runtime/v2/")),
+            "WINEDLLPATH carries more than the EAC runtime after the tree: {rest}");
     assert_eq!(var(&vars, "LD_LIBRARY_PATH"), Some(wine_ld_path(t.path()).as_str()));
     assert_eq!(var(&vars, "WINESERVER"), Some(wineserver_exe(t.path()).to_str().unwrap()));
     assert_eq!(var(&vars, "WINEPREFIX"), Some(pfx.to_str().unwrap()));
@@ -115,10 +117,62 @@ fn env_vars_share_one_definition_of_the_search_paths() {
 }
 
 #[test]
+fn env_vars_set_what_proton_sets_and_nothing_wine_ignores() {
+    let t = TempDir::new("envparity");
+    let pfx = t.dir("pfx");
+    let vars = build_env_vars(t.path(), &pfx, &[], &[], &[], &[]);
+    for (key, default) in [("VKD3D_SHADER_DEBUG", "none"), ("__GLVND_DISALLOW_PATCHING", "1")] {
+        let want = std::env::var(key).unwrap_or_else(|_| default.into());
+        assert_eq!(var(&vars, key), Some(want.as_str()));
+    }
+    for key in ["WINE_NTSYNC", "WINEESYNC", "WINEFSYNC", "WINE_LARGE_ADDRESS_AWARE", "DXVK_ASYNC", "VKD3D_CONFIG"] {
+        assert_eq!(var(&vars, key), None, "{key} is set, and no Wine reads it");
+    }
+}
+
+#[test]
+fn steam_utilities_are_named_before_the_graph() {
+    use std::ffi::OsStr;
+    for exe in ["/home/u/.local/share/Steam/legacycompat/iscriptevaluator.exe",
+                "C:\\Program Files (x86)\\Steam\\d3ddriverquery64.exe"] {
+        assert!(is_steam_utility(OsStr::new(exe)), "{exe} would start a session");
+    }
+    assert!(!is_steam_utility(OsStr::new("/lib/steamapps/common/Balatro/Balatro.exe")));
+}
+
+#[test]
+fn env_vars_leave_the_shader_caches_to_steam() {
+    let t = TempDir::new("envcache");
+    let pfx = t.dir("pfx");
+    let vars = build_env_vars(t.path(), &pfx, &["d3d11"], &["d3d12"], &[], &[]);
+    for key in ["__GL_SHADER_DISK_CACHE_PATH", "MESA_SHADER_CACHE_DIR", "DXVK_STATE_CACHE_PATH",
+                "DXVK_SHADER_CACHE_PATH", "VKD3D_SHADER_CACHE_PATH", "STEAM_FOSSILIZE_DUMP_PATH"] {
+        assert_eq!(var(&vars, key), None, "{key} is set over the per-game cache Steam points it at");
+    }
+}
+
+#[test]
+fn game_drive_is_the_library_root_holding_the_install() {
+    let t = TempDir::new("gamedrive");
+    let steamapps = t.dir("lib/steamapps");
+    let other = t.dir("other/steamapps");
+    let game = t.dir("lib/steamapps/common/Game");
+    let libraries = format!("{}::{}", other.display(), steamapps.display());
+    let root = fs::canonicalize(t.path().join("lib")).unwrap();
+    assert_eq!(game_library_dir(game.to_str().unwrap(), &libraries), Some(root));
+    // A library that is not a steamapps directory maps as passed.
+    let plain = t.dir("plain");
+    let in_plain = t.dir("plain/common/Game");
+    assert_eq!(game_library_dir(in_plain.to_str().unwrap(), plain.to_str().unwrap()), Some(plain));
+    assert_eq!(game_library_dir(game.to_str().unwrap(), ""), None);
+    assert_eq!(game_library_dir(game.to_str().unwrap(), other.to_str().unwrap()), None);
+}
+
+#[test]
 fn env_vars_set_each_key_once() {
     let t = TempDir::new("envunique");
     let pfx = t.dir("pfx");
-    let vars = build_env_vars(t.path(), &pfx, &["d3d11"], &[], &["nvapi64"], &[], true);
+    let vars = build_env_vars(t.path(), &pfx, &["d3d11"], &[], &["nvapi64"], &[]);
     let mut keys: Vec<&str> = vars.iter().map(|(k, _)| *k).collect();
     keys.sort_unstable();
     let before = keys.len();
@@ -130,16 +184,18 @@ fn env_vars_set_each_key_once() {
 fn dll_overrides_mark_deployed_translation_layers_native() {
     let t = TempDir::new("overrides");
     let pfx = t.dir("pfx");
-    let vars = build_env_vars(t.path(), &pfx, &["d3d11", "dxgi"], &["d3d12"], &["nvapi64"], &[], false);
+    let vars = build_env_vars(t.path(), &pfx, &["d3d11", "dxgi"], &["d3d12"], &["nvapi64", "nvapi"], &[]);
     let overrides: Vec<&str> = var(&vars, "WINEDLLOVERRIDES").unwrap().split(';').collect();
-    for want in ["d3d11=n", "dxgi=n", "d3d12=n", "nvapi64=n", "nvcuda=b"] {
+    for want in ["d3d11=n", "dxgi=n", "d3d12=n", "nvapi64=n", "nvapi=n", "nvcuda=b"] {
         assert!(overrides.contains(&want), "missing {want}");
     }
     for (name, mode) in BASE_OVERRIDES {
         assert!(overrides.contains(&format!("{name}={mode}").as_str()));
     }
+    // Wine's own GameInput stays on; Proton disables it for one game only.
+    assert!(!overrides.iter().any(|o| o.starts_with("gameinput")));
 
-    let no_nvapi = build_env_vars(t.path(), &pfx, &[], &[], &[], &[], false);
+    let no_nvapi = build_env_vars(t.path(), &pfx, &[], &[], &[], &[]);
     assert!(!var(&no_nvapi, "WINEDLLOVERRIDES").unwrap().contains("nvcuda"));
 }
 
@@ -148,15 +204,12 @@ fn deploy_cache_round_trips_and_rejects_foreign_data() {
     let t = TempDir::new("cache");
     assert!(DeployCache::load(t.path()).is_none());
 
-    DeployCache { wine_hash: 1, dxvk_hash: 2, vkd3d_hash: 3, steam_hash: 4, scan_hash: u64::MAX,
-                  exe_stamp: 7, scan_flags: 1 }
-        .save(t.path());
+    DeployCache { wine_hash: 1, dxvk_hash: 2, vkd3d_hash: 3, steam_hash: u64::MAX }.save(t.path());
     let c = DeployCache::load(t.path()).unwrap();
-    assert_eq!((c.wine_hash, c.dxvk_hash, c.vkd3d_hash, c.steam_hash, c.scan_hash, c.exe_stamp, c.scan_flags),
-               (1, 2, 3, 4, u64::MAX, 7, 1));
+    assert_eq!((c.wine_hash, c.dxvk_hash, c.vkd3d_hash, c.steam_hash), (1, 2, 3, u64::MAX));
 
     let cache_file = fs::read_dir(t.path()).unwrap().next().unwrap().unwrap().path();
-    for garbage in ["v3:1,2,3,4,5", "v4:1,2,3,4,5", "v5:1,2,3", "v5:a,b,c,d,e,f,g", ""] {
+    for garbage in ["v5:1,2,3,4,5,6,7", "v6:1,2,3", "v6:1,2,3,4,5", "v6:a,b,c,d", ""] {
         fs::write(&cache_file, garbage).unwrap();
         assert!(DeployCache::load(t.path()).is_none(), "accepted {garbage:?}");
     }
@@ -227,8 +280,6 @@ fn wine_binary_prefers_the_loader_beside_ntdll() {
     t.file("bin/wine", "");
     assert!(has_wine_bin(t.path()));
     assert_eq!(wine_binary(t.path()), t.path().join("bin/wine"));
-    t.file("bin/wine64", "");
-    assert_eq!(wine_binary(t.path()), t.path().join("bin/wine64"));
     let unix_wine = t.file("lib/wine/x86_64-unix/wine", "");
     assert_eq!(wine_binary(t.path()), unix_wine);
 }
@@ -268,7 +319,7 @@ fn the_wine_user_is_whoever_the_prefix_registry_names() {
             \"Flags\"=dword:00000000\n\
             \"ProfileImagePath\"=\"C:\\\\users\\\\gamer\"\n");
     assert_eq!(profile_user(&pfx), "gamer");
-    let vars = build_env_vars(t.path(), &pfx, &[], &[], &[], &[], false);
+    let vars = build_env_vars(t.path(), &pfx, &[], &[], &[], &[]);
     let get = |k: &str| vars.iter().find(|(key, _)| *key == k).map(|(_, v)| v.as_str());
     assert_eq!(get("USER"), Some("gamer"), "Wine derives its user, and every profile path, from $USER");
     assert_eq!(get("USERPROFILE"), Some("C:\\users\\gamer"));
@@ -323,6 +374,30 @@ fn drivers_land_in_system32_drivers_where_their_services_point() {
     prepare_prefix_layout(&wine, &pfx);
     assert!(sys32.join("drivers/mountmgr.sys").exists());
     assert_eq!(fs::read_to_string(sys32.join("kernel32.dll")).unwrap(), "deployed over");
+}
+
+#[test]
+fn syswow64_gets_the_32_bit_builtins_a_32_bit_process_loads() {
+    let t = TempDir::new("wow64");
+    let wine = t.path().join("wine");
+    t.file("wine/lib/wine/x86_64-windows/ntdll.dll", "ntdll");
+    t.file("wine/lib/wine/i386-windows/ntdll.dll", "ntdll32");
+    t.file("wine/lib/wine/i386-windows/kernel32.dll", "kernel32_32");
+    t.file("wine/lib/wine/i386-windows/d3d11.dll", "wined3d32");
+    let pfx = t.path().join("pfx");
+    t.file("pfx/drive_c/windows/syswow64/d3d11.dll", "dxvk32");
+    let wow = pfx.join("drive_c/windows/syswow64");
+
+    prepare_prefix_layout(&wine, &pfx);
+    assert_eq!(fs::read_to_string(wow.join("kernel32.dll")).unwrap(), "kernel32_32");
+    assert!(wow.join("ntdll.dll").exists());
+    // What the prefix already holds stays: DXVK's 32-bit d3d11.dll.
+    assert_eq!(fs::read_to_string(wow.join("d3d11.dll")).unwrap(), "dxvk32");
+
+    // A prefix that has its 32-bit ntdll costs one stat and is left alone.
+    fs::remove_file(wow.join("kernel32.dll")).unwrap();
+    prepare_prefix_layout(&wine, &pfx);
+    assert!(!wow.join("kernel32.dll").exists());
 }
 
 #[test]

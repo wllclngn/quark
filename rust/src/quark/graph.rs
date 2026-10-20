@@ -10,11 +10,8 @@ use std::sync::mpsc;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use crate::launcher::DeployPlan;
-
 pub(crate) enum Out {
     Done,
-    Plan(DeployPlan),
     Dlls(Vec<&'static str>),
 }
 
@@ -40,13 +37,6 @@ pub(crate) struct Outputs {
 }
 
 impl Outputs {
-    pub(crate) fn plan(&self, name: &'static str) -> DeployPlan {
-        match self.map.lock().unwrap().get(name) {
-            Some(Out::Plan(p)) => p.clone(),
-            _ => DeployPlan::default(),
-        }
-    }
-
     pub(crate) fn dlls(&self, name: &'static str) -> Vec<&'static str> {
         match self.map.lock().unwrap().get(name) {
             Some(Out::Dlls(d)) => d.clone(),

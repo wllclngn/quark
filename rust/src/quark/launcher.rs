@@ -10,7 +10,7 @@
 
 use crate::{log_info, log_warn, log_error, log_verbose};
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
@@ -65,8 +65,8 @@ const DXVK_DLLS: &[&str] = &["d3d11", "d3d10core", "d3d9", "dxgi"];
 const VKD3D_DLLS: &[&str] = &["d3d12", "d3d12core"];
 const NVAPI_DLLS: &[&str] = &["nvapi64", "nvofapi64"];
 const NVAPI32_DLLS: &[&str] = &["nvapi"];
-/// System-installed by the NVIDIA driver, not shipped here.
-const DLSS_DLLS: &[&str] = &["nvngx", "_nvngx", "nvngx_dlssg"];
+/// The NVIDIA driver's own, from its nvidia/wine dir; the two Proton copies.
+const DLSS_DLLS: &[&str] = &["_nvngx", "nvngx"];
 
 pub(crate) const BASE_OVERRIDES: &[(&str, &str)] = &[
     ("lsteamclient", "b"),  // builtin: Wine bridge to native Steam client (built from Proton source)
@@ -92,60 +92,7 @@ pub(crate) const BASE_OVERRIDES: &[(&str, &str)] = &[
     ("vrclient_x64", "d"),
     // OpenCL: Disabled for most games (Proton compat)
     ("opencl", "n,d"),
-    // gameinput: Crashes in some games (CW Bug 26376)
-    ("gameinput", "d"),
 ];
-
-// Adaptive deployment plan, built from the PE scan or rebuilt from the
-// deploy cache when the exe is unchanged.
-#[derive(Clone, Default)]
-pub(crate) struct DeployPlan {
-    pub(crate) needs_nvapi: bool,
-    pub(crate) needs_dlss: bool,
-    pub(crate) scan_hash: u64,
-}
-
-impl DeployPlan {
-    fn from_scan(scan: Option<&crate::pe_scanner::PeScanResult>) -> Self {
-        let Some(scan) = scan else {
-            // No scan (non-game verb, missing exe): DXVK and VKD3D deploy defensively below
-            return Self { needs_nvapi: false, needs_dlss: false, scan_hash: 0 };
-        };
-
-        let is_nvidia = std::path::Path::new("/proc/driver/nvidia/version").exists();
-
-        // DXVK and VKD3D-Proton are always deployed (unconditionally below). Many
-        // games discover D3D12 at runtime via DXGI (no direct d3d12.dll import), and
-        // launcher stubs often have zero D3D imports. The translation layers are
-        // harmless when unused; they only activate on actual API calls.
-        // Proton deploys nvapi on every NVIDIA launch; a game can load it
-        // late through a plugin the import scan never sees.
-        let needs_nvapi = is_nvidia;
-        let needs_dlss = is_nvidia && scan.imports.iter().any(|s| s.contains("nvngx"));
-
-        // Hash for cache: If imports change, re-deploy
-        use std::hash::{Hash, Hasher};
-        use std::collections::hash_map::DefaultHasher;
-        let mut h = DefaultHasher::new();
-        scan.render_api.hash(&mut h);
-        scan.imports.len().hash(&mut h);
-        for imp in &scan.imports { imp.hash(&mut h); }
-        let scan_hash = h.finish();
-
-        Self { needs_nvapi, needs_dlss, scan_hash }
-    }
-
-    /// The plan the last launch of this exe recorded; valid while the exe's
-    /// size and mtime match, so the scan is skipped on a cache hit.
-    fn from_cache(c: &DeployCache) -> Self {
-        let is_nvidia = std::path::Path::new("/proc/driver/nvidia/version").exists();
-        Self { needs_nvapi: is_nvidia, needs_dlss: c.scan_flags & 1 != 0, scan_hash: c.scan_hash }
-    }
-
-    fn flags(&self) -> u64 {
-        u64::from(self.needs_dlss)
-    }
-}
 
 /// Size and mtime of a file folded into one stamp; 0 when it is missing.
 pub(crate) fn file_stamp(path: &Path) -> u64 {
@@ -213,6 +160,23 @@ pub fn run(verb: &str, args: &[OsString]) -> i32 {
         Err(code) => return code,
     };
 
+    // What the call runs is settled before anything starts: The graph below
+    // starts the prefix's wineserver ahead of the session, a server no
+    // client ever connects to never exits, and Steam's reaper waits on every
+    // process under it, so an exit after the graph holds Steam's launch open.
+    if !launches_game(verb) {
+        log_error!("Unknown verb: {verb}");
+        return 1;
+    }
+    let Some(game_exe) = args.first() else {
+        log_error!("No executable specified");
+        return 1;
+    };
+    if is_steam_utility(game_exe) {
+        log_verbose!("skipping Steam utility: {}", game_exe.to_string_lossy());
+        return 0;
+    }
+
     let self_exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
@@ -228,24 +192,18 @@ pub fn run(verb: &str, args: &[OsString]) -> i32 {
 
     // Per-component cache: One stat per component, never a walk. The Wine
     // tree hashes at lib/wine, so a redeployed launcher binary beside it is
-    // not a new tree; the game's exe hashes by size and mtime, so the PE
-    // scan runs only when the exe changed.
+    // not a new tree.
     let cache = DeployCache::load(&pfx);
     let wine_hash = dir_hash(&wine_dir.join("lib/wine"));
     let dxvk_hash = dir_hash(&dxvk_src_dir.join("lib/wine/dxvk"));
     let vkd3d_hash = dir_hash(&dxvk_src_dir.join("lib/wine/vkd3d-proton"));
     let steam_hash = dir_hash(&steam_dir.join("legacycompat"));
-    let game_exe = if launches_game(verb) { args.first().map(PathBuf::from) } else { None };
-    let exe_stamp = game_exe.as_deref().map(file_stamp).unwrap_or(0);
 
     let wine_valid = cache.as_ref().is_some_and(|c| c.wine_hash == wine_hash);
     let dxvk_valid = cache.as_ref().is_some_and(|c| c.dxvk_hash == dxvk_hash);
     let vkd3d_valid = cache.as_ref().is_some_and(|c| c.vkd3d_hash == vkd3d_hash);
     let steam_valid = cache.as_ref().is_some_and(|c| c.steam_hash == steam_hash);
-    let cached_scan_hash = cache.as_ref().map(|c| c.scan_hash).unwrap_or(0);
-    let scan_cached: Option<DeployPlan> = cache.as_ref()
-        .filter(|c| exe_stamp != 0 && c.exe_stamp == exe_stamp)
-        .map(DeployPlan::from_cache);
+    let is_nvidia = Path::new("/proc/driver/nvidia/version").exists();
 
     // Phase 2: The launch graph. Every node names what it needs and the
     // executor in graph.rs runs the ready set on scoped threads in Kahn's
@@ -255,8 +213,6 @@ pub fn run(verb: &str, args: &[OsString]) -> i32 {
     // by the first Wine process.
     let t2 = Instant::now();
     let wineserver = wineserver_exe(&wine_dir);
-    let scan_cached_ref = scan_cached.as_ref();
-    let game_exe_ref = game_exe.as_deref();
     let nodes: Vec<crate::graph::Node> = vec![
         crate::graph::Node::new("registry", &[], |_| {
             prepare_prefix_layout(&wine_dir, &pfx);
@@ -264,19 +220,6 @@ pub fn run(verb: &str, args: &[OsString]) -> i32 {
             ensure_registry_stubs(&pfx);
             inject_registry_keys(&pfx);
             crate::graph::Out::Done
-        }),
-        crate::graph::Node::new("scan", &[], move |_| {
-            crate::graph::Out::Plan(match scan_cached_ref {
-                Some(plan) => plan.clone(),
-                None => {
-                    let scan = game_exe_ref.and_then(scan_game);
-                    if let Some(sc) = &scan {
-                        log_verbose!("PE scan: {:?} | imports steam_api={} nvapi={} | imports={}",
-                            sc.render_api, sc.needs_steam_api, sc.needs_nvapi, sc.imports.len());
-                    }
-                    DeployPlan::from_scan(scan.as_ref())
-                }
-            })
         }),
         crate::graph::Node::new("prefix", &["registry"], |_| {
             if !wine_valid {
@@ -288,33 +231,29 @@ pub fn run(verb: &str, args: &[OsString]) -> i32 {
                 setup_prefix(&wine_dir, &pfx, &wine64, &self_exe);
             }
             ensure_user_profile_dirs(&pfx);
+            map_game_drive(&pfx);
             crate::graph::Out::Done
         }),
         crate::graph::Node::new("wineserver", &["prefix"], |_| {
             prestart_wineserver(&wineserver, &pfx);
             crate::graph::Out::Done
         }),
-        crate::graph::Node::new("dxvk", &["prefix", "scan"], |o| {
-            let plan = o.plan("scan");
-            crate::graph::Out::Dlls(if dxvk_valid && plan.scan_hash == cached_scan_hash {
-                DXVK_DLLS.to_vec()
-            } else {
-                deploy_dxvk(&dxvk_src_dir, &pfx)
-            })
+        // DXVK and VKD3D-Proton deploy for every game: Many discover D3D12 at
+        // runtime through DXGI with no d3d12.dll import, launcher stubs
+        // import no D3D at all, and the layers only act on an API call.
+        crate::graph::Node::new("dxvk", &["prefix"], |_| {
+            crate::graph::Out::Dlls(if dxvk_valid { DXVK_DLLS.to_vec() } else { deploy_dxvk(&dxvk_src_dir, &pfx) })
         }),
-        crate::graph::Node::new("vkd3d", &["prefix", "scan"], |o| {
-            let plan = o.plan("scan");
-            crate::graph::Out::Dlls(if vkd3d_valid && plan.scan_hash == cached_scan_hash {
-                VKD3D_DLLS.to_vec()
-            } else {
-                deploy_vkd3d(&dxvk_src_dir, &pfx)
-            })
+        crate::graph::Node::new("vkd3d", &["prefix"], |_| {
+            crate::graph::Out::Dlls(if vkd3d_valid { VKD3D_DLLS.to_vec() } else { deploy_vkd3d(&dxvk_src_dir, &pfx) })
         }),
-        crate::graph::Node::new("nvapi", &["prefix", "scan"], |o| {
-            crate::graph::Out::Dlls(if o.plan("scan").needs_nvapi { deploy_nvapi(&wine_dir, &pfx) } else { vec![] })
+        // On every NVIDIA launch, as Proton does: A game can load nvapi late
+        // through a plugin, and NGX finds the driver's nvngx itself.
+        crate::graph::Node::new("nvapi", &["prefix"], |_| {
+            crate::graph::Out::Dlls(if is_nvidia { deploy_nvapi(&wine_dir, &pfx) } else { vec![] })
         }),
-        crate::graph::Node::new("dlss", &["prefix", "scan"], |o| {
-            crate::graph::Out::Dlls(if o.plan("scan").needs_dlss { deploy_dlss(&pfx) } else { vec![] })
+        crate::graph::Node::new("dlss", &["prefix"], |_| {
+            crate::graph::Out::Dlls(if is_nvidia { deploy_dlss(&pfx) } else { vec![] })
         }),
         // Every launch: file_matches makes each a stat per file, and a prefix
         // that holds the bridge under Valve's names is repaired rather than
@@ -330,34 +269,23 @@ pub fn run(verb: &str, args: &[OsString]) -> i32 {
     ];
     let (outputs, node_timings) = crate::graph::run(nodes);
     let t_graph = t2.elapsed();
-    let plan = outputs.plan("scan");
-    let scan_valid = plan.scan_hash == cached_scan_hash;
     let dxvk_deployed = outputs.dlls("dxvk");
     let vkd3d_deployed = outputs.dlls("vkd3d");
     let nvapi_deployed = outputs.dlls("nvapi");
     let dlss_deployed = outputs.dlls("dlss");
-    log_verbose!("PE scan: {} | nvapi={} dlss={}",
-        if scan_cached.is_some() { "cached" } else { "read" }, plan.needs_nvapi, plan.needs_dlss);
 
     // Save cache if anything changed
-    let all_valid = wine_valid && dxvk_valid && vkd3d_valid && steam_valid && scan_valid
-        && scan_cached.is_some();
-    if !all_valid {
-        DeployCache { wine_hash, dxvk_hash, vkd3d_hash, steam_hash, scan_hash: plan.scan_hash,
-                      exe_stamp, scan_flags: plan.flags() }.save(&pfx);
+    if !(wine_valid && dxvk_valid && vkd3d_valid && steam_valid) {
+        DeployCache { wine_hash, dxvk_hash, vkd3d_hash, steam_hash }.save(&pfx);
         log_verbose!("deployment cache written");
     } else {
-        log_verbose!("cache hit: every component current, scan from the cache");
+        log_verbose!("cache hit: every component current");
     }
 
     // Phase 5: Build environment
     let log_dir = Path::new(crate::log::LOG_DIR);
     let trace = std::env::var("QUARK_TRACE_OPCODES").is_ok()
         || log_dir.join("TRACE_OPCODES").exists();
-
-    let shader_cache_enabled = self_exe.parent()
-        .map(|dir| dir.join("shader_cache_enabled").exists())
-        .unwrap_or(false);
 
     // Parse env_config FIRST so launcher-affecting env vars (WINEDEBUG and
     // friends) are in place before build_env_vars and resolve_winedebug read them.
@@ -369,7 +297,6 @@ pub fn run(verb: &str, args: &[OsString]) -> i32 {
     let env_vars = build_env_vars(
         &wine_dir, &pfx,
         &dxvk_deployed, &vkd3d_deployed, &nvapi_deployed, &dlss_deployed,
-        shader_cache_enabled,
     );
 
     // Resolve WINEDEBUG once. Priority:
@@ -387,22 +314,27 @@ pub fn run(verb: &str, args: &[OsString]) -> i32 {
     // Phase 6: Launch
     remove_stale_wine_servers();
 
-    if launches_game(verb) {
-        let launch = Launch {
-            wine_dir: &wine_dir,
-            wine64: &wine64,
-            pfx: &pfx,
-            env_vars: &env_vars,
-            custom_env: &custom_env,
-            winedebug: &winedebug,
-            log_dir,
-            started: t_start,
-        };
-        return launch_game(&launch, args);
-    }
+    let launch = Launch {
+        wine_dir: &wine_dir,
+        wine64: &wine64,
+        pfx: &pfx,
+        env_vars: &env_vars,
+        custom_env: &custom_env,
+        winedebug: &winedebug,
+        log_dir,
+        started: t_start,
+    };
+    launch_game(&launch, game_exe, &args[1..])
+}
 
-    log_error!("Unknown verb: {verb}");
-    1
+/// Steam runs utility exes that need no Wine session, and quark answers 0
+/// for them, which tells Steam the tool is healthy: iscriptevaluator.exe
+/// runs the DirectX and vcredist install scripts, whose runtimes Wine
+/// provides, and d3ddriverquery64.exe probes the GPU, which fails without
+/// a full display driver.
+pub(crate) fn is_steam_utility(exe: &OsStr) -> bool {
+    let exe = exe.to_string_lossy().to_ascii_lowercase();
+    ["iscriptevaluator", "d3ddriverquery"].iter().any(|pat| exe.contains(pat))
 }
 
 /// getcompatpath / getnativepath: echo the path back, raw bytes intact.
@@ -521,6 +453,29 @@ pub(crate) fn prepare_prefix_layout(wine_dir: &Path, pfx: &Path) {
             log_verbose!("Synced {copied} PE files to prefix system32");
         }
     }
+    // 32-bit processes load their builtins from syswow64, where wineboot
+    // would have put them; without them a 32-bit game fails on kernel32. A
+    // prefix with no 32-bit ntdll there gets only what it is missing, so
+    // DXVK's 32-bit DLLs stay.
+    let syswow64 = win.join("syswow64");
+    let src32 = wine_dir.join("lib/wine/i386-windows");
+    if src32.join("ntdll.dll").exists() && !syswow64.join("ntdll.dll").exists() {
+        let mut copied = 0u32;
+        if let Ok(entries) = std::fs::read_dir(&src32) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if !matches!(ext, "dll" | "exe" | "drv" | "ocx" | "cpl" | "acm" | "ax") {
+                    continue;
+                }
+                let target = syswow64.join(entry.file_name());
+                if !target.exists() && std::fs::copy(&path, &target).is_ok() {
+                    copied += 1;
+                }
+            }
+        }
+        log_verbose!("Synced {copied} 32-bit PE files to prefix syswow64");
+    }
 }
 
 /// Ensure pfx dir and stub .reg files exist BEFORE wineboot starts the
@@ -539,35 +494,6 @@ fn ensure_registry_stubs(pfx: &Path) {
             let _ = std::fs::write(&reg_path, header);
         }
     }
-}
-
-/// Scan the game's imports. Some games (UE5) use a launcher stub that
-/// imports nothing — the real binary is in Binaries/Win64/, so a stub with
-/// no D3D imports defers to that child.
-fn scan_game(exe: &Path) -> Option<crate::pe_scanner::PeScanResult> {
-    let primary = if exe.exists() { crate::pe_scanner::scan_pe(exe) } else { None };
-    let dominated = primary.as_ref().is_some_and(|s| s.imports.is_empty()
-        || !s.imports.iter().any(|i| i.contains("d3d")));
-    if !dominated {
-        return primary;
-    }
-    match ue_shipping_exe(exe).and_then(|p| crate::pe_scanner::scan_pe(&p).map(|s| (p, s))) {
-        Some((p, child_scan)) => {
-            log_verbose!("PE scan: using UE child {}", p.display());
-            Some(child_scan)
-        }
-        None => primary,
-    }
-}
-
-/// UE pattern: <Game>/<Project>/Binaries/Win64/<Project>-Win64-Shipping.exe
-fn ue_shipping_exe(exe: &Path) -> Option<PathBuf> {
-    let stem = exe.file_stem()?.to_str()?;
-    let ue_bin = exe.parent()?.join(stem).join("Binaries/Win64");
-    let pattern = format!("{stem}-Win64-Shipping.exe");
-    std::fs::read_dir(&ue_bin).ok()?.flatten()
-        .map(|e| e.path())
-        .find(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.eq_ignore_ascii_case(&pattern)))
 }
 
 /// Clean stale wineserver sockets from previous runs.
@@ -607,25 +533,8 @@ struct Launch<'a> {
     started: Instant,
 }
 
-fn launch_game(l: &Launch, args: &[OsString]) -> i32 {
-    let game_exe = match args.first() {
-        Some(exe) => exe,
-        None => {
-            log_error!("No executable specified");
-            return 1;
-        }
-    };
+fn launch_game(l: &Launch, game_exe: &OsString, game_args: &[OsString]) -> i32 {
     let game_exe_str = game_exe.to_string_lossy();
-
-    // Steam runs utility exes that don't need a full Wine session:
-    // - iscriptevaluator.exe: DirectX/vcredist install scripts (Wine provides these)
-    // - d3ddriverquery64.exe: GPU capability probe (fails without full display driver)
-    // Skip them — returning 0 tells Steam the compat tool is healthy.
-    let dominated_exes = ["iscriptevaluator", "d3ddriverquery"];
-    if dominated_exes.iter().any(|pat| game_exe_str.to_ascii_lowercase().contains(pat)) {
-        log_verbose!("skipping Steam utility: {game_exe_str}");
-        return 0;
-    }
 
     // Sanity check: Does the game exe exist?
     let game_path = Path::new(game_exe);
@@ -661,7 +570,7 @@ fn launch_game(l: &Launch, args: &[OsString]) -> i32 {
     // Save data protection: Snapshot before launch
     let save_backup = snapshot_save_data(l.pfx);
 
-    let mut cmd = game_command(l, game_exe, &args[1..]);
+    let mut cmd = game_command(l, game_exe, game_args);
     // The launcher survives Steam's Stop and forwards it to the game. A
     // caught signal resets to default across exec, so the game gets its own
     // default dispositions regardless.
@@ -684,7 +593,7 @@ fn launch_game(l: &Launch, args: &[OsString]) -> i32 {
     let stderr_log_path = redirect_game_output(&mut cmd, l.log_dir);
 
     // User overrides win. Applied LAST so any cmd.env hardcoded above
-    // (e.g. WINE_NTSYNC=1) yields to env_config when the user explicitly
+    // (e.g. WINEDEBUG) yields to env_config when the user explicitly
     // sets a different value. Comment-out in env_config is now meaningful
     // for any var quark hardcodes — uncomment + change to override.
     for (k, v) in l.custom_env {
@@ -692,13 +601,26 @@ fn launch_game(l: &Launch, args: &[OsString]) -> i32 {
     }
 
     log_verbose!("timing: spawn at {}ms after the launcher started", l.started.elapsed().as_millis());
-    let mut child = cmd.spawn().unwrap_or_else(|e| {
+    let child = cmd.spawn().unwrap_or_else(|e| {
         log_error!("Failed to exec wine64: {e}");
         std::process::exit(1);
     });
 
     let incident_game_stderr = spawn_observer(l, game_path);
+    end_session(l, child, stderr_log_path, incident_game_stderr, save_backup)
+}
 
+/// The session's end, once the game is spawned: Wait for it through a pidfd,
+/// end the prefix's session (killing it on Stop or when the server outlives
+/// its grace), record the exit and restore any saves that went missing. The
+/// launcher exits with the game's code.
+fn end_session(
+    l: &Launch,
+    mut child: std::process::Child,
+    stderr_log_path: Option<PathBuf>,
+    incident_game_stderr: Option<PathBuf>,
+    save_backup: Option<PathBuf>,
+) -> i32 {
     // Now wait for the game to exit; wait() retries on EINTR, so a forwarded
     // Stop returns here only once the game is gone.
     let child_pid = child.id() as i32;
@@ -771,15 +693,11 @@ fn game_command(l: &Launch, game_exe: &OsString, game_args: &[OsString]) -> Comm
     }
     // Order: Quark defaults → quark hardcoded essentials → user's
     // env_config (last write wins, so user overrides reach the game).
-    // Previously custom_env was applied BEFORE the cmd.env("WINE_NTSYNC",
-    // "1") below, which meant any attempt to disable ntsync via
-    // env_config was silently overridden. Now custom_env wins.
     for (k, v) in l.env_vars {
         cmd.env(k, v);
     }
     cmd.env("WINEPREFIX", l.pfx);
     cmd.env("WINESERVER", wineserver_exe(l.wine_dir));
-    cmd.env("WINE_NTSYNC", "1");
     // Windows TEMP/TMP: Stock prefixes get these via shell32
     // create_extra_folders writing HKCU\Environment; that chain never
     // runs under quark, so NO Windows process had TEMP — wine-mono fed
@@ -1046,29 +964,23 @@ pub(crate) struct DeployCache {
     pub(crate) dxvk_hash: u64,
     pub(crate) vkd3d_hash: u64,
     pub(crate) steam_hash: u64,
-    pub(crate) scan_hash: u64,
-    pub(crate) exe_stamp: u64,
-    pub(crate) scan_flags: u64,
 }
 
 impl DeployCache {
     pub(crate) fn load(pfx: &Path) -> Option<Self> {
         let data = std::fs::read_to_string(pfx.join(CACHE_FILE)).ok()?;
-        let parts: Vec<&str> = data.strip_prefix("v5:")?.trim().split(',').collect();
-        if parts.len() != 7 { return None; }
-        let mut v = [0u64; 7];
+        let parts: Vec<&str> = data.strip_prefix("v6:")?.trim().split(',').collect();
+        if parts.len() != 4 { return None; }
+        let mut v = [0u64; 4];
         for (slot, part) in v.iter_mut().zip(parts) {
             *slot = part.parse().ok()?;
         }
-        Some(DeployCache {
-            wine_hash: v[0], dxvk_hash: v[1], vkd3d_hash: v[2], steam_hash: v[3],
-            scan_hash: v[4], exe_stamp: v[5], scan_flags: v[6],
-        })
+        Some(DeployCache { wine_hash: v[0], dxvk_hash: v[1], vkd3d_hash: v[2], steam_hash: v[3] })
     }
 
     pub(crate) fn save(&self, pfx: &Path) {
-        let data = format!("v5:{},{},{},{},{},{},{}", self.wine_hash, self.dxvk_hash,
-            self.vkd3d_hash, self.steam_hash, self.scan_hash, self.exe_stamp, self.scan_flags);
+        let data = format!("v6:{},{},{},{}", self.wine_hash, self.dxvk_hash,
+            self.vkd3d_hash, self.steam_hash);
         if let Err(e) = std::fs::write(pfx.join(CACHE_FILE), data) {
             log_warn!("Cannot write deployment cache: {e}; next launch will re-deploy");
         }
@@ -1166,6 +1078,49 @@ fn setup_prefix_with_wineboot(wine_dir: &Path, pfx: &Path, wine64: &Path, self_e
         seed_from_quark_template(self_exe, pfx);
     } else {
         run_wineboot_init(wine_dir, pfx, wine64, self_exe);
+    }
+}
+
+/// The Steam library holding the game, which Proton maps to S:: Of the
+/// library paths Steam passes, the one the install path lies under.
+pub(crate) fn game_library_dir(install_path: &str, library_paths: &str) -> Option<PathBuf> {
+    let library = library_paths.split(':').find(|p| !p.is_empty() && install_path.contains(p))?;
+    Some(steamapps_parent(Path::new(library)).unwrap_or_else(|| PathBuf::from(library)))
+}
+
+/// A steamapps directory's parent, the library's root, when that is
+/// writable and on the same filesystem; Proton keeps the path as passed
+/// otherwise.
+fn steamapps_parent(library: &Path) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    let steamapps = std::fs::canonicalize(library).ok()?;
+    if !steamapps.is_dir() || steamapps.file_name()? != "steamapps" {
+        return None;
+    }
+    let parent = steamapps.parent()?;
+    let c_parent = std::ffi::CString::new(parent.as_os_str().as_bytes()).ok()?;
+    let writable = unsafe { libc::access(c_parent.as_ptr(), libc::W_OK) } == 0;
+    let same_fs = std::fs::metadata(parent).ok()?.dev() == std::fs::metadata(&steamapps).ok()?.dev();
+    (writable && same_fs).then(|| parent.to_path_buf())
+}
+
+/// S: follows the game's library each launch, and goes when Steam names none.
+fn map_game_drive(pfx: &Path) {
+    let link = pfx.join("dosdevices/s:");
+    let install = std::env::var("STEAM_COMPAT_INSTALL_PATH").unwrap_or_default();
+    let libraries = std::env::var("STEAM_COMPAT_LIBRARY_PATHS").unwrap_or_default();
+    match game_library_dir(&install, &libraries) {
+        Some(dir) if std::fs::read_link(&link).ok().as_deref() == Some(dir.as_path()) => {}
+        Some(dir) => {
+            let _ = std::fs::remove_file(&link);
+            if let Err(e) = std::os::unix::fs::symlink(&dir, &link) {
+                log_warn!("Cannot map S: to {}: {e}", dir.display());
+            }
+        }
+        None => {
+            let _ = std::fs::remove_file(&link);
+        }
     }
 }
 
@@ -1279,8 +1234,6 @@ fn run_wineboot_init(wine_dir: &Path, pfx: &Path, wine64: &Path, self_exe: &Path
     let dll_dir = format!("\\??\\Z:{}", wine_dir.join("lib/wine").display());
     cmd.env("WINEDLLDIR0", &dll_dir);
     cmd.env("WINEDEBUG", resolve_winedebug(false));
-    // No fsync/esync — system Wine uses ntsync inproc sync.
-    cmd.env("WINEESYNC", "0");
     // Preload assertion suppressor: Converts assert() failures in Wine's
     // ntdll unix layer to warnings. Targets add_fd_to_cache collision
     // and user_check_not_lock race during display driver init.
@@ -1587,15 +1540,25 @@ fn deploy_nvapi(wine_dir: &Path, pfx: &Path) -> Vec<&'static str> {
     let src32 = wine_dir.join("lib/wine/dxvk-nvapi/i386-windows");
     let sys32 = pfx.join("drive_c/windows/system32");
     let syswow64 = pfx.join("drive_c/windows/syswow64");
-    let deployed = deploy_dlls(&src64, &sys32, NVAPI_DLLS, "NVAPI");
-    deploy_dlls(&src32, &syswow64, NVAPI32_DLLS, "NVAPI-32");
+    let mut deployed = deploy_dlls(&src64, &sys32, NVAPI_DLLS, "NVAPI");
+    deployed.extend(deploy_dlls(&src32, &syswow64, NVAPI32_DLLS, "NVAPI-32"));
     deployed
 }
 
 fn deploy_dlss(pfx: &Path) -> Vec<&'static str> {
-    let src = PathBuf::from("/usr/lib/nvidia/wine");
+    let Some(src) = nvidia_wine_dll_dir() else { return vec![] };
     let sys32 = pfx.join("drive_c/windows/system32");
     deploy_dlls(&src, &sys32, DLSS_DLLS, "DLSS")
+}
+
+/// The NVIDIA driver's Wine DLLs, where Proton finds them: The nvidia/wine
+/// directory beside the real libGLX_nvidia, when it holds nvngx.dll. The
+/// library is looked up in the loader's standard directories, never loaded.
+pub(crate) fn nvidia_wine_dll_dir() -> Option<PathBuf> {
+    let lib = ["/usr/lib", "/usr/lib64", "/usr/lib/x86_64-linux-gnu"].iter()
+        .find_map(|dir| std::fs::canonicalize(Path::new(dir).join("libGLX_nvidia.so.0")).ok())?;
+    let dir = lib.parent()?.join("nvidia/wine");
+    dir.join("nvngx.dll").exists().then_some(dir)
 }
 
 pub(crate) fn deploy_dlls(
@@ -1802,7 +1765,6 @@ pub(crate) fn wine_ld_path(wine_dir: &Path) -> String {
 pub(crate) fn build_env_vars(
     wine_dir: &Path, pfx: &Path,
     dxvk: &[&str], vkd3d: &[&str], nvapi: &[&str], dlss: &[&str],
-    shader_cache_enabled: bool,
 ) -> Vec<(&'static str, String)> {
     let cur_path = std::env::var("PATH").unwrap_or_default();
     let wine_bin = wine_dir.join("bin");
@@ -1817,6 +1779,11 @@ pub(crate) fn build_env_vars(
     for name in nvapi { overrides.push(format!("{name}=n")); }
     for name in dlss { overrides.push(format!("{name}=n")); }
     if !nvapi.is_empty() { overrides.push("nvcuda=b".into()); }
+    // GameInput crashes one game (CW Bug 26376); Proton disables it there
+    // and nowhere else.
+    if std::env::var("SteamGameId").is_ok_and(|id| id == "1928420") {
+        overrides.push("gameinput=d".into());
+    }
     let dll_overrides = overrides.join(";");
 
     // WINELOADER: Wine child processes re-exec via this path. Without it,
@@ -1853,11 +1820,13 @@ pub(crate) fn build_env_vars(
         ("PATH", format!("{}:{}", wine_bin.display(), cur_path)),
         ("LD_LIBRARY_PATH", wine_ld_path(wine_dir)),
         ("WINEDLLOVERRIDES", dll_overrides),
-        ("DXVK_LOG_LEVEL", std::env::var("DXVK_LOG_LEVEL").unwrap_or_else(|_| "none".into())),
-        ("VKD3D_DEBUG", "none".into()),
-        ("WINE_LARGE_ADDRESS_AWARE", "1".into()),
+        // As Proton sets them, unless the environment already does:
+        // Translation-layer logging off, and GLVND's entry-point patching off.
+        ("DXVK_LOG_LEVEL", env_or("DXVK_LOG_LEVEL", "none")),
+        ("VKD3D_DEBUG", env_or("VKD3D_DEBUG", "none")),
+        ("VKD3D_SHADER_DEBUG", env_or("VKD3D_SHADER_DEBUG", "none")),
+        ("__GLVND_DISALLOW_PATCHING", env_or("__GLVND_DISALLOW_PATCHING", "1")),
         ("PROTON_VERSION", format!("quark {}", env!("CARGO_PKG_VERSION"))),
-
     ];
 
     // EAC runtime: Its v2 lib dirs hold the builtin bridge DLLs, searched
@@ -1886,23 +1855,26 @@ pub(crate) fn build_env_vars(
     vars.push(("ALLUSERSPROFILE", "C:\\ProgramData".into()));
     vars.push(("ProgramData", "C:\\ProgramData".into()));
 
-    // Async shader compilation
-    vars.push(("DXVK_ASYNC", "1".into()));
-    vars.push(("VKD3D_CONFIG", "shader_cache".into()));
+    vars.extend(host_env_vars());
+    vars
+}
 
-    // Sync: Ntsync inproc — send device fd via init_first_thread.
-    // Client does all sync in-process via /dev/ntsync ioctl.
-    // Server-side ntsync used for Select waits that need cross-process coordination.
-    
-    if std::path::Path::new("/dev/ntsync").exists() {
-        vars.push(("WINE_NTSYNC", "1".into()));
-    }
-    vars.push(("WINEESYNC", "0".into()));
-    vars.push(("WINEFSYNC", "0".into()));
+/// What the host brings to the session: The GPU driver's settings, the
+/// locale and library path Steam hands over and Steam Input's gamepads. The
+/// shader caches are Steam's: It points each driver's cache at the game's
+/// `steamapps/shadercache/<appid>` before the tool starts, as it does for
+/// Proton, and nothing here moves them.
+fn host_env_vars() -> Vec<(&'static str, String)> {
+    let mut vars = Vec::new();
+    let is_nvidia = Path::new("/proc/driver/nvidia/version").exists();
 
-    // NVIDIA: DXVK NVAPI support for DLSS/NGX
-    if std::path::Path::new("/proc/driver/nvidia/version").exists() {
+    // NVIDIA: DXVK NVAPI support for DLSS/NGX. NGX looks for its DLLs in
+    // the driver store, which NVIDIA_WINE_DLL_DIR stands in for.
+    if is_nvidia {
         vars.push(("DXVK_ENABLE_NVAPI", "1".into()));
+        if let Some(dir) = nvidia_wine_dll_dir() {
+            vars.push(("NVIDIA_WINE_DLL_DIR", dir.display().to_string()));
+        }
         // NVIDIA EGL/GLX — force NVIDIA's implementations, not mesa's
         let nvidia_egl = "/usr/share/glvnd/egl_vendor.d/10_nvidia.json";
         if std::path::Path::new(nvidia_egl).exists() {
@@ -1935,7 +1907,6 @@ pub(crate) fn build_env_vars(
             std::env::var("LD_LIBRARY_PATH").unwrap_or_default()));
     }
 
-
     // Steam Input: SDL 2.30+ reads SteamVirtualGamepadInfo to configure
     // virtual gamepads. Steam sets SteamVirtualGamepadInfo_Proton before
     // launching compat tools — Proton copies it to SteamVirtualGamepadInfo.
@@ -1946,46 +1917,12 @@ pub(crate) fn build_env_vars(
 
     // Display driver: Always winex11.drv + GLX over XWayland.
 
-    // Shader cache optimization — opt-in via install.py prompt.
-    if shader_cache_enabled {
-        let shader_cache = pfx.join("shader_cache");
-        if let Err(e) = std::fs::create_dir_all(&shader_cache) {
-            log_warn!("Cannot create shader cache dir: {e}");
-        }
-        let shader_cache_str = shader_cache.display().to_string();
-
-        // DXVK: Compiled SPIR-V cache (DXBC/DXSO → SPIR-V translation results)
-        vars.push(("DXVK_SHADER_CACHE_PATH", shader_cache_str.clone()));
-        // VKD3D-Proton: Compiled SPIR-V cache (DXBC/DXIL → SPIR-V translation results)
-        vars.push(("VKD3D_SHADER_CACHE_PATH", shader_cache_str.clone()));
-
-        // Detect GPU vendor for vendor-specific cache tuning.
-        let is_nvidia = Path::new("/proc/driver/nvidia/version").exists();
-
-        if is_nvidia {
-            // NVIDIA: Driver compiles SPIR-V → GPU ISA, caches in GLCache.
-            // Default was 128 MB, recently raised to 1 GB — still too small for
-            // AAA games with 5,000+ pipelines. 10 GB prevents eviction.
-            vars.push(("__GL_SHADER_DISK_CACHE", "1".into()));
-            vars.push(("__GL_SHADER_DISK_CACHE_PATH", shader_cache_str.clone()));
-            vars.push(("__GL_SHADER_DISK_CACHE_SIZE", "10737418240".into())); // 10 GB
-            vars.push(("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP", "1".into()));
-        } else {
-            // Mesa/RADV (AMD, Intel): Driver compiles SPIR-V → GPU ISA, caches
-            // in mesa_shader_cache. Default size is small. 10 GB prevents eviction
-            // across sessions. Single-file mode is Fossilize-compatible and has
-            // less disk overhead than multi-file mode.
-            vars.push(("MESA_SHADER_CACHE_DIR", shader_cache_str.clone()));
-            vars.push(("MESA_SHADER_CACHE_MAX_SIZE", "10G".into()));
-            vars.push(("MESA_DISK_CACHE_SINGLE_FILE", "1".into()));
-            // RADV: Graphics Pipeline Library — allows partial pipeline
-            // pre-compilation so full pipeline assembly at draw time is
-            // near-instant instead of compiling from scratch.
-            vars.push(("RADV_PERFTEST", "gpl".into()));
-        }
-    }
-
     vars
+}
+
+/// The environment's value for `key`, or `default` when it has none.
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.into())
 }
 
 /// Parse user-supplied environment variables from env_config file.
@@ -2046,11 +1983,8 @@ fn resolve_winedebug(trace: bool) -> String {
 // Discovery
 
 /// Check if a Wine directory has a usable Wine binary.
-/// Wine 10.0+ unified to just "wine"; older builds use "wine64".
 pub(crate) fn has_wine_bin(dir: &Path) -> bool {
-    dir.join("lib/wine/x86_64-unix/wine").exists()
-        || dir.join("bin/wine64").exists()
-        || dir.join("bin/wine").exists()
+    dir.join("lib/wine/x86_64-unix/wine").exists() || dir.join("bin/wine").exists()
 }
 
 /// Get the Wine binary path from a Wine directory.
@@ -2059,30 +1993,14 @@ pub(crate) fn has_wine_bin(dir: &Path) -> bool {
 /// directory as ntdll.so for our patched ntdll.dll to be loaded.
 pub(crate) fn wine_binary(dir: &Path) -> PathBuf {
     let unix_wine = dir.join("lib/wine/x86_64-unix/wine");
-    if unix_wine.exists() { return unix_wine; }
-    let w64 = dir.join("bin/wine64");
-    if w64.exists() { w64 } else { dir.join("bin/wine") }
+    if unix_wine.exists() { unix_wine } else { dir.join("bin/wine") }
 }
 
-/// Build a Command that runs `wine_bin` inside a bwrap mount namespace where
-/// `/usr/lib/wine` and `/usr/share/wine` are bind-mounted from quark's tree.
-///
-/// This is the architectural fix for "patched DLLs got poisoned in /usr."
-/// Wine's loader has /usr/lib/wine baked in at compile time and ignores most
-/// override knobs for the early bootstrap (ntdll.so, win32u.so). bwrap solves
-/// it at the kernel level: Inside the namespace, /usr/lib/wine *is* quark's
-/// tree, so the unmodified system Wine binary loads quark's patched DLLs
-/// without ever touching the real /usr.
-///
-/// Falls back to direct exec (no bwrap) if:
-///   - bwrap is not installed
-///   - quark's lib/wine or share/wine tree is missing (install.py never ran)
-///
-/// In the fallback case the user runs against unpatched system Wine, which
-/// is ugly but not poisonous.
+/// A Command running `wine_bin` straight from quark's tree, with a warning
+/// when the tree install.py lays out is incomplete.
 fn build_wine_command(wine_bin: &Path, wine_dir: &Path) -> Command {
-    // The tree is Wine's own install layout: Bin/wine is a copy of the
-    // system loader, so /proc/self/exe puts it under quark's bin, and Wine
+    // The tree is Wine's own install layout: Its loader is a copy of the
+    // system's, so /proc/self/exe puts it inside quark's tree, and Wine
     // resolves lib/wine and share/wine relative to that. No namespace: A
     // user namespace unmaps root, the NVIDIA driver then sees its device
     // nodes owned by nobody and fork-execs nvidia-modprobe on every GPU

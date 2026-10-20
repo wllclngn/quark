@@ -16,7 +16,7 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from quark_common import COMPAT_DIR
+from quark_common import COMPAT_DIR, Checks, log_error, log_section
 
 BIN_DIR = COMPAT_DIR / "bin"
 LIB_WIN = COMPAT_DIR / "lib" / "wine" / "x86_64-windows"
@@ -24,39 +24,11 @@ LIB_UNIX = COMPAT_DIR / "lib" / "wine" / "x86_64-unix"
 SHARE_DIR = COMPAT_DIR / "share" / "wine"
 
 
-# TEST INFRASTRUCTURE
-
-class TestResult:
-    def __init__(self):
-        self.passed = 0
-        self.failed = 0
-        self.errors = []
-
-    def ok(self, name: str):
-        self.passed += 1
-        print(f"  PASS  {name}")
-
-    def fail(self, name: str, reason: str):
-        self.failed += 1
-        self.errors.append((name, reason))
-        print(f"  FAIL  {name}: {reason}")
-
-    def summary(self) -> int:
-        total = self.passed + self.failed
-        print()
-        print(f"  {self.passed}/{total} passed")
-        if self.errors:
-            print()
-            for name, reason in self.errors:
-                print(f"  FAIL  {name}: {reason}")
-        print()
-        return 0 if self.failed == 0 else 1
-
-
 # STRUCTURAL TESTS
 
-def test_structure(r: TestResult):
+def test_structure(r: Checks):
     """Verify the package directory layout is what Steam expects."""
+    log_section("structure", "verify")
 
     # Top-level files
     for name in ("compatibilitytool.vdf", "toolmanifest.vdf", "proton", "quark"):
@@ -77,26 +49,26 @@ def test_structure(r: TestResult):
         else:
             r.fail("proton is ELF binary", f"got magic {magic!r}, expected ELF")
 
-    # bin/: wine is copied from system Wine; wine64 and wineserver are links
-    # (to wine and to the system wineserver). ntdll execs the preloader beside
-    # its own loader in lib/wine/x86_64-unix, so that is where it must be.
-    for rel in ("bin/wine", "bin/wine64", "bin/wineserver",
+    # bin/: wine is copied from system Wine; wineserver is a link to the
+    # system wineserver. ntdll execs the preloader beside its own loader in
+    # lib/wine/x86_64-unix, so that is where it must be.
+    for rel in ("bin/wine", "bin/wineserver",
                 "lib/wine/x86_64-unix/wine", "lib/wine/x86_64-unix/wine-preloader"):
         path = COMPAT_DIR / rel
         if path.exists() and path.stat().st_mode & 0o111:
             r.ok(rel)
         else:
             r.fail(rel, "missing or not executable")
-    for link, target in (("wine64", "wine"), ("wineserver", "/usr/bin/wineserver")):
-        path = BIN_DIR / link
-        if path.is_symlink() and os.readlink(path) == target:
-            r.ok(f"bin/{link} -> {target}")
-        else:
-            r.fail(f"bin/{link} -> {target}", "not a link to the expected target")
+    wineserver = BIN_DIR / "wineserver"
+    if wineserver.is_symlink() and os.readlink(wineserver) == "/usr/bin/wineserver":
+        r.ok("bin/wineserver -> /usr/bin/wineserver")
+    else:
+        r.fail("bin/wineserver -> /usr/bin/wineserver", "not a link to the expected target")
 
 
-def test_dlls(r: TestResult):
+def test_dlls(r: Checks):
     """Verify core gaming DLLs are present."""
+    log_section("DLLs", "verify")
     critical_dlls = [
         "ntdll.dll", "kernel32.dll", "kernelbase.dll",
         "user32.dll", "gdi32.dll", "win32u.dll",
@@ -116,8 +88,9 @@ def test_dlls(r: TestResult):
             r.fail(f"dll: {dll}", "missing")
 
 
-def test_programs(r: TestResult):
+def test_programs(r: Checks):
     """Verify essential Wine programs are present."""
+    log_section("programs", "verify")
     critical_progs = [
         "wineboot.exe", "winedevice.exe", "explorer.exe",
         "services.exe", "rpcss.exe", "plugplay.exe",
@@ -131,8 +104,9 @@ def test_programs(r: TestResult):
             r.fail(f"prog: {prog}", "missing")
 
 
-def test_drivers(r: TestResult):
+def test_drivers(r: Checks):
     """Verify Unix-side driver .so files are present."""
+    log_section("drivers", "verify")
     critical_drivers = [
         "ntdll.so", "win32u.so", "opengl32.so",
         "winevulkan.so",
@@ -145,8 +119,9 @@ def test_drivers(r: TestResult):
             r.fail(f"driver: {drv}", "missing")
 
 
-def test_nls(r: TestResult):
+def test_nls(r: Checks):
     """Verify locale/NLS data is present."""
+    log_section("NLS", "verify")
     nls_dir = SHARE_DIR / "nls"
     if nls_dir.exists():
         nls_count = len(list(nls_dir.glob("*.nls")))
@@ -158,8 +133,9 @@ def test_nls(r: TestResult):
         r.fail("nls", "share/wine/nls/ missing")
 
 
-def test_vdf_contents(r: TestResult):
+def test_vdf_contents(r: Checks):
     """Verify VDF files have correct content."""
+    log_section("VDF", "verify")
     compat_vdf = COMPAT_DIR / "compatibilitytool.vdf"
     if compat_vdf.exists():
         text = compat_vdf.read_text()
@@ -183,8 +159,9 @@ def test_vdf_contents(r: TestResult):
 
 # PREFIX INIT TEST
 
-def test_prefix_init(r: TestResult):
+def test_prefix_init(r: Checks):
     """Test that Wine can initialize a fresh prefix using the deployed tree."""
+    log_section("prefix", "init")
     wine = BIN_DIR / "wine"
     if not wine.exists():
         r.fail("prefix init", "bin/wine not found")
@@ -224,16 +201,11 @@ def test_prefix_init(r: TestResult):
 # MAIN
 
 def run_tests() -> int:
-    r = TestResult()
+    r = Checks("package")
 
     if not COMPAT_DIR.exists():
-        print(f"Package not found at {COMPAT_DIR}")
-        print("Run: ./install.py")
+        log_error(f"package: not found at {COMPAT_DIR}; run ./install.py")
         return 1
-
-    print()
-    print("  quark package tests")
-    print()
 
     test_structure(r)
     test_dlls(r)

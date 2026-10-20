@@ -6,7 +6,6 @@ mod log;
 mod cli;
 mod graph;
 mod launcher;
-mod pe_scanner;
 
 fn main() {
     let (verb, args) = cli::parse_args();

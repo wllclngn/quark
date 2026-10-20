@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """Fast local repro loop for the #18 heap corruption — no Steam, no game.
 
-Cross-compiles repro.exe (mingw), launches it under quark's proton entrypoint
-directly with the montauk observer armed, waits for crash/exit, and runs the
-abortpm report. Seconds per iteration vs a 10-minute Steam game run.
+Cross-compiles repro.exe (mingw) under /tmp/quark, launches it under quark's
+proton entrypoint directly with the montauk observer armed, waits for
+crash/exit, and writes montauk's abortpm report. Seconds per iteration vs a
+10-minute Steam game run.
 
-    python3 tests/heap_repro/run.py            # build + run once
-    python3 tests/heap_repro/run.py --runs 5   # run N times (it's racy)
-    python3 tests/heap_repro/run.py --no-build  # skip recompile
+    python3 tests/run.py heap-repro             # build + run once
+    python3 tests/run.py heap-repro --runs 5    # run N times (it's racy)
+    python3 tests/run.py heap-repro --no-build  # skip recompile
 """
 
 import argparse
+import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -21,16 +24,22 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent.parent))
 from quark_common import (
-    REPO_ROOT, STEAM_ROOT, STEAMAPPS, COMPAT_DIR, log_info, log_warn, log_error,
+    CACHE_DIR, COMPAT_DIR, LOG_DIR, STEAM_ROOT, SUITE_DIR,
+    log_info, log_warn, log_error, log_interrupted, stop_observer, stop_prefix_wineserver,
 )
 
-MONTAUK_BUILD = (REPO_ROOT / "../montauk/build").resolve()
 PROTON = COMPAT_DIR / "proton"
 PROBE_SRC = HERE.parent / "qemu" / "probes" / "gl_heap_stress.c"
-EXE = HERE / "repro.exe"
-# A throwaway prefix so we never touch a real game's compatdata.
-PFX = STEAMAPPS / "compatdata/heaprepro"
-TRACE_OUT = "/tmp/quark/incidents/repro-io.bin"
+WORK = LOG_DIR / "heaprepro"
+EXE = WORK / "repro.exe"
+# A throwaway prefix outside Steam's compatdata, on the compat tree's disk
+# rather than the tmpfs under /tmp.
+PFX = CACHE_DIR / "heaprepro"
+# The probe writes its verdict to VERDICT, the launcher sends the game's
+# stderr to GAME_STDERR, and the observer names its capture after the exe.
+VERDICT = SUITE_DIR / "probe-results" / "gl_heap_stress.txt"
+GAME_STDERR = LOG_DIR / "wine_stderr.log"
+TRACE = LOG_DIR / "incidents" / "repro-io.bin"
 
 
 class _Stop(Exception):
@@ -38,13 +47,14 @@ class _Stop(Exception):
 
 
 def build() -> bool:
-    log_info("building repro.exe (mingw)")
-    rc = subprocess.run([
+    log_info(f"building {EXE} (mingw)")
+    WORK.mkdir(parents=True, exist_ok=True)
+    r = subprocess.run([
         "x86_64-w64-mingw32-gcc", "-O2", '-DPROBE_NAME="gl_heap_stress"', "-o", str(EXE), str(PROBE_SRC),
         "-lopengl32", "-lgdi32", "-luser32", "-lole32", "-lwinmm",
-    ]).returncode
-    if rc != 0:
-        log_error(f"mingw build failed rc={rc}")
+    ], capture_output=True, text=True)
+    if r.returncode != 0:
+        log_error(f"mingw build failed rc={r.returncode}: {r.stderr.strip()[-400:]}")
         return False
     return True
 
@@ -79,8 +89,11 @@ def _kill_by_prefix_env(prefix_path: str) -> int:
 
 
 def teardown(proc) -> None:
-    """Reap the whole launch — including the detached, lingering wineserver."""
-    # 1. Kill the launcher's own session group (wine64 + non-detached children).
+    """Reap the whole launch: The observer first, so its capture is closed
+    rather than cut, then the launcher's group, the prefix's wineserver and
+    anything else still bound to the throwaway prefix."""
+    stop_observer(TRACE)
+    # The launcher's own session group (wine and its non-detached children).
     if proc is not None and proc.poll() is None:
         for sig in (signal.SIGTERM, signal.SIGKILL):
             try:
@@ -92,41 +105,37 @@ def teardown(proc) -> None:
                 break
             except subprocess.TimeoutExpired:
                 continue
-    # 2. The reliable layer: Reap anything (detached wineserver, montauk, wine)
-    #    still bound to the throwaway prefix.
+    stop_prefix_wineserver(PFX / "pfx")
+    # The reliable layer: Anything (a detached wineserver, wine) still bound
+    # to the throwaway prefix.
     n = _kill_by_prefix_env(str(PFX))
     if n:
         log_info(f"teardown: reaped {n} lingering process(es) bound to {PFX.name}")
-    # 3. Belt-and-suspenders: A montauk observer still streaming our trace.
-    subprocess.run(["pkill", "-KILL", "-f", f"trace-out {TRACE_OUT}"],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def run_once(idx: int, timeout_s: int) -> str:
     """Launch repro.exe under quark; return 'CRASH', 'CLEAN', 'STALL' or
     'UNKNOWN'. Always reaps the spawned tree, even on stall/timeout/signal."""
     PFX.mkdir(parents=True, exist_ok=True)
+    VERDICT.parent.mkdir(parents=True, exist_ok=True)
+    VERDICT.unlink(missing_ok=True)
+    TRACE.unlink(missing_ok=True)
     env = os.environ.copy()
     env["STEAM_COMPAT_DATA_PATH"] = str(PFX)
     env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = str(STEAM_ROOT)
     env["STEAM_COMPAT_APP_ID"] = "0"
     env["SteamAppId"] = "0"
     env["PROTON_VERB"] = "waitforexitandrun"
-    env["WINE_NTSYNC"] = "1"
-    env["QUARK_OBSERVER"] = "1"
-    env["QUARK_OBSERVER_TRACE_OUT"] = "1"
+    env["QUARK_TRACE"] = "1"
+    env["QUARK_TRACE_OUT"] = "1"
     env["MONTAUK_HEAP_STACK_SIZE"] = "288"
-    for v in ("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR"):
-        if v in os.environ:
-            env[v] = os.environ[v]
 
-    stderr_log = f"/tmp/quark/heaprepro-{idx}-stderr.log"
-    Path("/tmp/quark").mkdir(parents=True, exist_ok=True)
+    launcher_log = WORK / f"run-{idx}-launcher.log"
     log_info(f"run {idx}: launching repro.exe under quark (timeout {timeout_s}s)")
     t0 = time.monotonic()
     stalled = False
     proc = None
-    with open(stderr_log, "w") as ef:
+    with open(launcher_log, "w") as ef:
         # start_new_session: The launcher leads its own session/pgroup so the
         # whole non-detached tree is killable together and a SIGTERM to this
         # script does not race-kill half of it.
@@ -142,11 +151,11 @@ def run_once(idx: int, timeout_s: int) -> str:
             teardown(proc)
 
     dt = time.monotonic() - t0
-    txt = Path(stderr_log).read_text(errors="replace")
+    txt = GAME_STDERR.read_text(errors="replace") if GAME_STDERR.exists() else ""
     crashed = any(s in txt for s in (
         "sysmalloc", "double free or corruption", "!prev",
         "Assertion", "free_dce"))
-    clean = "repro: completed without crash" in txt
+    clean = VERDICT.exists() and VERDICT.read_text(errors="replace").startswith("PASS ")
     if crashed:
         verdict = "CRASH"
     elif stalled:
@@ -160,34 +169,46 @@ def run_once(idx: int, timeout_s: int) -> str:
     return verdict
 
 
-def analyze():
-    """Run abortpm on the freshest repro trace, if montauk produced one."""
-    inc = Path("/tmp/quark/incidents")
-    traces = sorted(inc.glob("*.bin"), key=lambda p: p.stat().st_mtime) if inc.exists() else []
-    if not traces:
-        log_warn("no montauk trace produced (observer may not have attached)")
+def analyze() -> None:
+    """montauk's abortpm report over the run's capture, as JSON beside it."""
+    if not TRACE.exists():
+        log_warn(f"no capture at {TRACE} (the observer did not attach)")
         return
-    trace = traces[-1]
-    analyzer = MONTAUK_BUILD / "montauk_analyze"
-    if not analyzer.exists():
-        log_warn(f"montauk_analyze not at {analyzer}")
+    montauk = shutil.which("montauk")
+    if not montauk:
+        log_warn("montauk not on PATH; no report")
         return
-    log_info(f"abortpm on {trace.name}")
-    subprocess.run([str(analyzer), str(trace), "--report", "abortpm"])
+    out = WORK / "abortpm.json"
+    with out.open("w") as f:
+        r = subprocess.run([montauk, "--analyze", str(TRACE), "--report", "abortpm", "--json"],
+                           stdout=f, stderr=subprocess.PIPE, text=True)
+    if r.returncode != 0:
+        log_warn(f"montauk --analyze exited {r.returncode}: {r.stderr.strip()[-400:]}")
+        return
+    try:
+        reports = json.loads(out.read_text()).get("reports", [])
+    except ValueError:
+        reports = []
+    for report in reports:
+        log_info(f"{report.get('name')}: {report.get('verdict')}")
+    log_info(f"abortpm report: {out}")
 
 
-def main(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="tests/run.py heap-repro")
-    ap.add_argument("--runs", type=int, default=1)
-    ap.add_argument("--no-build", action="store_true")
-    ap.add_argument("--timeout", type=int, default=120,
-                    help="per-run wall-clock limit (s); exceeding it is a STALL")
-    args = ap.parse_args(argv)
+def add_arguments(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--runs", type=int, default=1, help="run up to N times (it's racy); a hit stops the loop")
+    p.add_argument("--no-build", action="store_true", help="launch the repro.exe already built")
+    p.add_argument("--timeout", type=int, default=120,
+                   help="per-run wall-clock limit (s); exceeding it is a STALL")
 
+
+def run(args: argparse.Namespace) -> int:
     if not PROTON.exists():
         log_error(f"{PROTON} missing — install quark first")
         return 1
     if not args.no_build and not build():
+        return 1
+    if not EXE.exists():
+        log_error(f"{EXE} missing — run once without --no-build")
         return 1
 
     # Turn SIGTERM/SIGINT (from a `timeout` wrapper or Ctrl-C) into an exception
@@ -202,7 +223,7 @@ def main(argv: list[str]) -> int:
         try:
             verdict = run_once(i, args.timeout)
         except _Stop:
-            log_warn(f"run {i}: interrupted — tree reaped, stopping")
+            log_interrupted()
             break
         # A crash or a stall is a #18 hit worth analyzing; both stop the loop.
         if verdict in ("CRASH", "STALL"):

@@ -12,6 +12,7 @@ MONTAUK_BIN = shutil.which("montauk") or "/usr/local/bin/montauk"
 
 
 TRACE_BASE = LOG_DIR / "trace"
+CLASSES: str | None = None  # set by --trace-classes; montauk's own list, every class otherwise
 
 
 def start_trace(appid: str, tool: str, ts_prefix: str, pattern: str) -> tuple:
@@ -22,16 +23,14 @@ def start_trace(appid: str, tool: str, ts_prefix: str, pattern: str) -> tuple:
         return (None, None)
     log_dir = TRACE_BASE / f"{appid}_{ts_prefix}_{tool}"
     log_dir.mkdir(parents=True, exist_ok=True)
-    # --trace-out: Raw binary event stream (every syscall, IO, ntsync, sched).
-    # Required for the Family-2 heap-corruption bisect: Counters in --log
-    # tell us frequency, but only the raw stream lets us walk back from the
-    # libc abort write to find the corrupting pattern. Decode after the run
-    # with: /usr/local/bin/montauk_trace_decode trace.bin > trace.txt
+    # --trace-out: Raw binary event stream, every class unless CLASSES names
+    # some, read back through montauk --analyze (decode_trace).
     trace_out = log_dir / "trace.bin"
+    classes = ["--trace-classes", CLASSES] if CLASSES else []
     try:
         proc = subprocess.Popen(
             [MONTAUK_BIN, "--trace", pattern,
-             "--trace-out", str(trace_out),
+             "--trace-out", str(trace_out), *classes,
              "--log", str(log_dir), "--log-interval-ms", "500",
              "--headless"],
             stdout=subprocess.DEVNULL,

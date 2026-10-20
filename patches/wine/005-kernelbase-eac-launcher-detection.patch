@@ -15,15 +15,22 @@ diff --git a/dlls/kernelbase/process.c b/dlls/kernelbase/process.c
 index ae9a7d6..757f5e3 100644
 --- a/dlls/kernelbase/process.c
 +++ b/dlls/kernelbase/process.c
-@@ -19,6 +19,7 @@
+@@ -19,12 +19,14 @@
   */
- 
+
  #include <stdarg.h>
 +#include <stdio.h>
  #include <string.h>
- 
+
  #include "ntstatus.h"
-@@ -502,6 +503,37 @@ done:
+ #include "windef.h"
+ #include "winbase.h"
+ #include "winnls.h"
++#include "winver.h"
+ #include "wincontypes.h"
+ #include "winternl.h"
+ #include "processsnapshot.h"
+@@ -502,6 +504,37 @@ done:
      return ret;
  }
  
@@ -61,7 +68,7 @@ index ae9a7d6..757f5e3 100644
  /**********************************************************************
   *           CreateProcessInternalW   (kernelbase.@)
   */
-@@ -521,6 +553,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR
+@@ -521,6 +554,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR
      ULONG nt_flags = 0;
      USHORT machine = 0;
      NTSTATUS status;
@@ -69,7 +76,7 @@ index ae9a7d6..757f5e3 100644
  
      /* Process the AppName and/or CmdLine to get module name and path */
  
-@@ -568,6 +601,44 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR
+@@ -568,6 +602,44 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR
          goto done;
      }
  

@@ -190,10 +190,5 @@ class TestQuarkPidScoping(unittest.TestCase):
 
 
 def run_tests():
-    loader = unittest.TestLoader()
-    suite = unittest.TestSuite()
-    suite.addTests(loader.loadTestsFromTestCase(TestNoBarePkillPatterns))
-    suite.addTests(loader.loadTestsFromTestCase(TestQuarkPidScoping))
-    runner = unittest.TextTestRunner(verbosity=2)
-    result = runner.run(suite)
-    return 0 if result.wasSuccessful() else 1
+    from quark_common import run_unittests
+    return run_unittests("steam safety", TestNoBarePkillPatterns, TestQuarkPidScoping)

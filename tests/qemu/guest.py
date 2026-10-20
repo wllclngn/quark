@@ -49,7 +49,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from quark_common import (
-    REPO_ROOT, MONTAUK_SRC, LOG_DIR, SUITE_DIR, WINE_SRC_DIR, QEMU_CACHE as CACHE, QEMU_READY,
+    REPO_ROOT, MONTAUK_SRC, LOG_DIR, SUITE_DIR, QEMU_CACHE as CACHE, QEMU_READY,
     log_info, log_error,
 )
 
@@ -65,14 +65,16 @@ SERIAL_LOG = CACHE / "serial.log"
 GUEST_USER = "arch"
 GUEST_REPO = "quark"  # under the guest user's home
 GUEST_MONTAUK = "montauk"  # beside it, where quark_common.MONTAUK_SRC resolves
-GUEST_BUILD_DIR = str(WINE_SRC_DIR.parent)  # the build-cache disk's mount point
+# The build-cache disk's mount point: The guest user's own ~/.cache/quark,
+# where the guest's install keeps wine-src and wine-obj.
+GUEST_BUILD_DIR = f"/home/{GUEST_USER}/.cache/quark"
 
 PACKAGES = [
     # quark build and install.py
     "base-devel", "git", "python", "rust", "clang", "lld", "llvm", "autoconf",
-    "bison", "flex", "mingw-w64-gcc", "rsync",
-    # system Wine and what the launcher runs it in
-    "wine", "wine-mono", "bubblewrap",
+    "bison", "flex", "mingw-w64-gcc",
+    # system Wine and its .NET runtime
+    "wine", "wine-mono",
     # Wine build dependencies (install.py compiles the patched modules)
     "gnutls", "libxslt", "libgphoto2", "libpulse", "alsa-lib", "alsa-plugins",
     "openal", "libxcomposite", "libxinerama", "libxrandr", "libxcursor", "libxi",
@@ -322,10 +324,16 @@ def run_tests(selector: str | None) -> int:
     with tempfile.TemporaryDirectory(prefix="quark-push-") as tmp:
         tar_path = repo_tarball(Path(tmp))
         with Guest(RUN) as g:
+            # An image provisioned before the mount point was the guest user's
+            # mounts the cache elsewhere; mount it where the install looks.
+            g.ssh(f"mountpoint -q {GUEST_BUILD_DIR} || {{ sudo mkdir -p {GUEST_BUILD_DIR}"
+                  f" && sudo mount -L quarkcache {GUEST_BUILD_DIR} && sudo chown {GUEST_USER}: {GUEST_BUILD_DIR}; }}")
             g.push(tar_path, "/tmp/quark.tar")
             g.ssh(f"rm -rf ~/{GUEST_REPO} ~/{GUEST_MONTAUK} && tar -xf /tmp/quark.tar -C ~ && rm /tmp/quark.tar")
             args = f" -k {selector}" if selector else ""
-            rc = g.ssh(f"cd ~/{GUEST_REPO} && python3 tests/qemu/suite.py{args}", check=False).returncode
+            # The guest's suite reports inside the host's run: A child, no INTRO.
+            rc = g.ssh(f"cd ~/{GUEST_REPO} && QUARK_CHILD=1 python3 tests/qemu/suite.py{args}",
+                       check=False).returncode
             g.pull(f"{LOG_DIR}/.", out / "quark")
             g.pull(f"{SUITE_DIR}/.", out / "suite")
     log_info(f"suite exited {rc}; guest logs and verdict in {out}")

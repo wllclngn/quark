@@ -8,7 +8,7 @@
 # ~/.local/share/Steam/compatibilitytools.d/quark. That is why the Wine
 # build toolchain is a runtime dependency of this package.
 pkgname=quark
-pkgver=0.2.0
+pkgver=0.3.0
 pkgrel=1
 epoch=1
 pkgdesc="Proton replacement launcher on the stock Wine wineserver, for Steam"
@@ -17,21 +17,22 @@ url="https://github.com/wllclngn/quark"
 license=('GPL-2.0-only')
 depends=(
     'wine'
-    'wine-mono'
-    'bubblewrap'
     'steam'
     'python'
     'git'
-    'rsync'
     # quark-install builds the tier0/vstdlib stubs and the patched Wine
-    # modules on the user's machine.
+    # modules on the user's machine: The host side with gcc, the PE side
+    # with clang and lld.
+    'gcc'
+    'make'
+    'patch'
+    'pkgconf'
     'clang'
     'lld'
     'llvm'
     'autoconf'
     'bison'
     'flex'
-    'base-devel'
     'gnutls'
     'libxslt'
     'libgphoto2'
@@ -60,17 +61,19 @@ depends=(
     'lib32-vulkan-icd-loader'
 )
 makedepends=(
-    'rust'
     'cargo'
 )
 optdepends=(
+    'wine-mono: the runtime .NET and FNA games run on; quark-install warns without it'
     'lib32-vulkan-driver: 32-bit Vulkan for the GPU (lib32-nvidia-utils, lib32-vulkan-radeon, lib32-vulkan-intel)'
     'lib32-libpulse: 32-bit audio through PulseAudio or pipewire-pulse'
     'montauk: the launch observer (QUARK_TRACE=1) and the eBPF captures the test harness reads'
 )
-provides=('quark')
 source=("git+https://github.com/wllclngn/quark.git#tag=v${pkgver}")
 sha256sums=('SKIP')
+# The release profile strips the binary itself (Cargo.toml), so a split
+# debug package would hold nothing.
+options=('!debug')
 
 prepare() {
     cd "${srcdir}/${pkgname}"

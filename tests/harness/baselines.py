@@ -1,54 +1,69 @@
-"""Per-game regression baselines: the milestones a game reached last time,
-and the drift between runs."""
-import json
-from datetime import datetime
-from .base import BASELINES_PATH
+"""The scoreboard's archive and montauk's verdict over it.
+
+Every going-to-PROD run leaves one .prom per run in ARCHIVE_DIR, each holding
+that run's raw value for every cell, so montauk counts runs, not medians.
+montauk judges the archive: `--pairs vs-best` calls each version best,
+tied or not-best per cell, and `--trajectory` scans the version order for a
+slow decline. Its report goes into scoreboard.md as it is; the Proton cells
+sit beside quark's, so a box that drifted reads as drift. quark judges
+nothing itself.
+"""
+
+import subprocess
+
+from quark_common import CACHE_DIR, PrometheusBuilder
+
+ARCHIVE_DIR = CACHE_DIR / "archive"
+
+# A rate reads better higher, so montauk judges it in its own pass.
+RATES = {"fps_1pct_low"}
 
 
-# Milestones that indicate healthy progress — losing one = regression.
-GOOD_MILESTONES = {"x11drv", "XRandR", "LÖVE", "STEAM_API"}
+def metric_name(column: str) -> str:
+    return f"rate_{column}" if column in RATES else f"cell_{column}"
 
 
-# Milestones that indicate failure — gaining one we didn't have = regression.
-BAD_MILESTONES = {"CRASH", "LOVE_ERROR", "SVC_ERR"}
+def archive_runs(cell_runs: dict, columns, helps: dict, version: str, commit: str, stamp: str) -> list:
+    """One .prom per run index: Run k of every cell, labelled by game, tool
+    and scheduler. `cell_runs` maps (appid, tool, scheduler) to its runs."""
+    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    written = []
+    for k in range(max((len(r) for r in cell_runs.values()), default=0)):
+        pb = PrometheusBuilder("scoreboard")
+        pb.info(version=version, git_commit=commit.removesuffix("-dirty"),
+                git_dirty=commit.endswith("-dirty"))
+        for (appid, tool, sched), runs in cell_runs.items():
+            if k >= len(runs):
+                continue
+            labels = {"game": appid, "tool": tool, "scheduler": sched}
+            for c in columns:
+                if runs[k].get(c) is not None:
+                    pb.gauge(metric_name(c), runs[k][c], help=helps[c], labels=labels)
+        path = ARCHIVE_DIR / f"{version}-{stamp}-{k + 1}.prom"
+        path.write_text(pb.render())
+        written.append(path)
+    return written
 
 
-def load_baselines() -> dict:
-    if not BASELINES_PATH.exists():
-        return {}
-    try:
-        return json.loads(BASELINES_PATH.read_text())
-    except (OSError, ValueError):
-        return {}
+def _analyze(*args: str) -> str:
+    r = subprocess.run(["montauk", "--analyze", str(ARCHIVE_DIR), "--by", "version", "--no-emit", *args],
+                       capture_output=True, text=True)
+    return (r.stderr + r.stdout).strip()
 
 
-def save_baselines(baselines: dict) -> None:
-    BASELINES_PATH.parent.mkdir(parents=True, exist_ok=True)
-    BASELINES_PATH.write_text(json.dumps(baselines, indent=2, sort_keys=True) + "\n")
-
-
-def compute_drift(current: dict, baseline: dict) -> list:
-    """Return list of drift messages. Empty = no regression."""
-    if not baseline:
-        return []
-    drifts = []
-    base_ms = set(baseline.get("milestones", []))
-    cur_ms = set(current.get("milestones", []))
-    # Good milestones present before and gone now = regression
-    for m in sorted((base_ms - cur_ms) & GOOD_MILESTONES):
-        drifts.append(f"lost {m}")
-    # Bad milestones absent before and present now = regression
-    for m in sorted((cur_ms - base_ms) & BAD_MILESTONES):
-        drifts.append(f"new {m}")
-    if current.get("crash") and not baseline.get("crash", False):
-        drifts.append("new crash")
-    return drifts
-
-
-def result_to_baseline_entry(result: dict) -> dict:
-    return {
-        "name": result.get("name", "?"),
-        "milestones": sorted(result.get("milestones", [])),
-        "crash": result.get("crash", False),
-        "updated": datetime.now().strftime("%Y-%m-%d"),
-    }
+def render_md(rates: bool) -> str:
+    """montauk's verdicts over the archive, verbatim; the rates pass only when
+    the runs carried a rate (frame times)."""
+    out = ["## Baselines", "",
+           f"montauk over every archived run in `{ARCHIVE_DIR}`, by version: Each version "
+           "best, tied or not-best per cell (vs-best), then the version-ordered "
+           "change-point scan (trajectory). Read a quark cell beside its Proton cell; "
+           "both moving together is the box, not quark.", ""]
+    passes = [("Against the best version", ("--metric", "scoreboard_cell_", "--pairs", "vs-best"))]
+    if rates:
+        passes.append(("Rates, higher better",
+                       ("--metric", "scoreboard_rate_", "--pairs", "vs-best", "--higher-better")))
+    passes.append(("Trajectory", ("--metric", "scoreboard_cell_", "--trajectory")))
+    for title, args in passes:
+        out += [f"### {title}", "", "```", _analyze(*args), "```", ""]
+    return "\n".join(out) + "\n"
